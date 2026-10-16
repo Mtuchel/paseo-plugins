@@ -4317,9 +4317,14 @@ Candidates live in `$PASEO_HOME/linear-tickets/deputy/candidates.json` (director
    Specifically approved consequential workflow changes require `specific` authority, so they
    cannot use the standing-only activation shortcut. Missing/unknown outcome scope abstains;
    a new unapproved workflow choice remains an owner boundary.
-   This includes the eventual effects of referenced PRs/stacks bundled with a technical retry,
-   publish or enqueue. A PR number, green check or unchanged patch is not evidence of authorized
-   scope. Known authorized technical delivery remains delegated through its required gates.
+   Ordinary model selection, described technical corrections, review repairs and resuming delegated
+   work do not require the complete historical plan or every future review finding. This is not
+   permission to release a hold or invent an approved baseline.
+   Substantive commitments still include the eventual effects of referenced PRs/stacks bundled
+   with a technical retry, publish or enqueue, and literal plan/amendment adoption. A PR number,
+   green check, unchanged patch or commitment shared by every offered alternative is not evidence
+   of authorized scope. Known authorized technical delivery remains delegated through its gates;
+   private reasoning cannot turn a delivered plan approval into preparation or a release into a hold.
    V3 additionally requires `integrity.preservation`, `.ownerArtifacts`, `.acceptance` and `.gates`
    for **each** selected part. Each includes a reason and primitive string state: `not-implicated` (no affected
    requirement/material prerequisite), `satisfied`, `unknown` or `violated`. Missing, unknown or
@@ -4331,6 +4336,13 @@ Candidates live in `$PASEO_HOME/linear-tickets/deputy/candidates.json` (director
    or a gate exception. These are checked source
    bindings, not a claim that JSON assertions mechanically prove their semantic truth; isolated
    evaluator review and current-policy boundary replay remain required.
+   `guarded` additionally permits an explicitly conditional factual prerequisite for preservation,
+   acceptance or gates, never owner artifacts. Its `guard.question` and/or `guard.effect` must equal
+   the complete current question/selected description; no other guard fields or source/quote proof
+   are accepted. Unknown prerequisites stay unknown: safe investigation may proceed, but the
+   conditional operation remains prohibited until positively established. Other states cannot carry
+   a guard. Anchoring checks provenance, not semantic sufficiency. Guards cannot approve unknown
+   workflow or delivery scope, invent consent, waive holds or rewrite a release/acceptance requirement.
    Preservation also covers shared non-Git artifacts: “unused” does not establish ownership or
    recoverability. Conditional factual reporting may proceed after collecting the required
    evidence; that authorization neither invents present measurements nor claims acceptance.
@@ -4347,11 +4359,15 @@ Candidates live in `$PASEO_HOME/linear-tickets/deputy/candidates.json` (director
    Temporarily holding unapproved planning is not cancellation and needs no personal cancellation
    instruction. It authorizes no abandonment of approved work, business choice or unknown delivery;
    offered bounded investigation, nonbinding preparation and prerequisite coordination may continue.
-   Historical deadline validity stays unknown without an authoritative evaluation clock;
-   today's date or another monitor's expiration cannot prove it. Actual live deadlines still bind.
+   Historical deadline/process eligibility stays unknown without authoritative timing and process
+   evidence, including immediate actions that depend on a still-waiting job. Today's date or another
+   monitor's expiration cannot prove it. Actual live deadlines still bind.
    Task/component ownership is not inherently human: an otherwise explicit agent action is not
-   contradicted by an ambiguous "existing owner" role. Actual human assignments and personal
-   approval boundaries still bind; actor interpretation supplies no missing task authority.
+   contradicted by an ambiguous "existing owner" role. Reporting or asking a later technical
+   question through the same answer channel is agent work, not inherently human execution.
+   An ambiguous "you" or missing tool proves neither a human recipient nor a capable parent agent.
+   Actual human assignments and personal approval boundaries still bind; actor interpretation
+   supplies no missing task authority.
    Fully described bounded UI state/navigation and regression corrections remain technical when
    they change no material permission, business validation/value or record-creation policy.
    Separate workflow-baseline proof applies to material boundaries, not every UI transition;
@@ -4363,7 +4379,7 @@ block, without Paseo, Linear or GitHub credentials in its environment. A tool ev
 unreadable/oversized answer, abstention or failed check refuses the whole request. Citations
 retain source ID, revision and quote.
 
-Evidence is versioned as `deputy-14-dependency-holds/owner-autonomy-2026-10-15-v3/<model>/high`.
+Evidence is versioned as `deputy-15-material-commitments/owner-autonomy-2026-10-15-v3/<model>/high`.
 Old-policy predictions never satisfy current empirical readiness. On restart, an old-version
 refusal/prediction is reevaluated only after the exact unanswered request is freshly verified;
 old selections, citations, intent and grace are discarded. An equivalent new request ID retires

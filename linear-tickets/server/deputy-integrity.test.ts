@@ -142,3 +142,37 @@ test("a prerequisite cited only for another selected part cannot prove this part
   response.citations.push({ part: "Second", source: proof.id, quote: proof.text });
   assert.equal(checkVerdict(JSON.stringify(response), selected, [...authority, proof]).ok, true);
 });
+
+test("an exact selected preservation guard authorizes investigation without inventing present proof", () => {
+  const effect = "Investigate checkout ownership; refresh only after it is proven safe and automation-owned. Otherwise leave it unchanged.";
+  const selected = { ...part, effects: { "Agent proceeds": effect } };
+  const guarded = { state: "guarded", reason: "Ownership remains unknown; investigation is permitted but refresh is prohibited until safe ownership is proven.", guard: { effect } };
+  assert.equal(assess({ ...intact, preservation: guarded }, [], [citation], selected).ok, true);
+  assert.equal(assess({ ...intact, preservation: { state: "unknown", reason: guarded.reason } }, [], [citation], selected).ok, false);
+});
+
+test("guard anchoring is local, complete and cannot impersonate prerequisite proof or owner consent", () => {
+  const selected: Part = {
+    ...part, question: "Investigate first; mutate only after ownership is established?",
+    effects: { "Agent proceeds": "Refresh only a proven-safe automation-owned checkout.", "Agent investigates": "Inventory all shared checkouts without changing them." },
+  };
+  const reason = "The factual prerequisite remains unresolved and mutation is prohibited until proven.";
+  for (const guard of [{ question: selected.question }, { effect: selected.effects["Agent proceeds"] }, { question: selected.question, effect: selected.effects["Agent proceeds"] }]) {
+    for (const key of ["preservation", "acceptance", "gates"]) {
+      assert.equal(assess({ ...intact, [key]: { state: "guarded", reason, guard } }, [], [citation], selected).ok, true);
+    }
+  }
+  for (const guard of [undefined, null, "", [], {}, { effect: ["Refresh"] }, { effect: "" }, { effect: "proven-safe" }, { effect: selected.effects["Agent investigates"] }, { question: "Another part's question" }, { effect: selected.effects["Agent proceeds"], invented: true }]) {
+    assert.equal(assess({ ...intact, preservation: { state: "guarded", reason, guard } }, [], [citation], selected).ok, false);
+  }
+  const guarded = { state: "guarded", reason, guard: { effect: selected.effects["Agent proceeds"] } };
+  for (const extra of [{ source: engineering.id }, { quote: engineering.text }]) {
+    assert.equal(assess({ ...intact, preservation: { ...guarded, ...extra } }, [], [citation], selected).ok, false);
+  }
+  assert.equal(assess({ ...intact, ownerArtifacts: guarded }, [], [citation], selected).ok, false);
+  for (const state of ["not-implicated", "satisfied", "unknown", "violated"]) {
+    assert.equal(assess({ ...intact, preservation: { ...guarded, state } }, [], [citation], selected).ok, false);
+  }
+  assert.equal(assess({ ...intact, preservation: guarded }, [], [citation], selected, "owner").ok, false);
+  assert.equal(assess({ ...intact, preservation: guarded, gates: { state: "unknown", reason: "Required exception is unavailable" } }, [], [citation], selected).ok, false);
+});
