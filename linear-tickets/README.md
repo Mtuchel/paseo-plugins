@@ -4346,6 +4346,9 @@ Candidates live in `$PASEO_HOME/linear-tickets/deputy/candidates.json` (director
    implementation. Safe preparation/deferral is not whole-ticket completion or owner approval.
    Historical deadline validity stays unknown without an authoritative evaluation clock;
    today's date or another monitor's expiration cannot prove it. Actual live deadlines still bind.
+   Task/component ownership is not inherently human: an otherwise explicit agent action is not
+   contradicted by an ambiguous "existing owner" role. Actual human assignments and personal
+   approval boundaries still bind; actor interpretation supplies no missing task authority.
 
 The evaluator has no tools, MCP servers, extensions, skills, rules, memory or saved session. It
 runs from an empty directory with private isolated configuration and the owner's `auth:` broker
@@ -4353,7 +4356,7 @@ block, without Paseo, Linear or GitHub credentials in its environment. A tool ev
 unreadable/oversized answer, abstention or failed check refuses the whole request. Citations
 retain source ID, revision and quote.
 
-Evidence is versioned as `deputy-11-temporal-evidence/owner-autonomy-2026-10-15-v3/<model>/high`.
+Evidence is versioned as `deputy-12-actor-roles/owner-autonomy-2026-10-15-v3/<model>/high`.
 Old-policy predictions never satisfy current empirical readiness. On restart, an old-version
 refusal/prediction is reevaluated only after the exact unanswered request is freshly verified;
 old selections, citations, intent and grace are discarded. An equivalent new request ID retires
