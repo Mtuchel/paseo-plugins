@@ -282,12 +282,14 @@ export class PermissionReplies implements PermissionArbiter {
       let current = (await sdk.agents.ref(record.agentId).refresh())?.agent.pendingPermissions?.find((request) => request.id === requestId);
       if (!current || !record.fingerprint || fingerprint(current) !== record.fingerprint || !record.response) return this.save({ ...record, status: "gone" });
       await this.deps.beforeSubmit?.(record);
-      // An unbound owner may have started during refresh or the test pause. Finish its
-      // admission, then refresh again; an old replay releases admission without claiming Q2.
-      while (record.responder.kind === "deputy" && this.admissions.get(record.agentId)?.size) {
-        await this.admitted(record.agentId);
-        current = (await sdk.agents.ref(record.agentId).refresh())?.agent.pendingPermissions?.find((request) => request.id === requestId);
-        if (!current || fingerprint(current) !== record.fingerprint) return this.save({ ...record, status: "gone" });
+      // The hook and owner admissions can suspend after the first refresh.
+      // Refresh once more at the final deputy boundary, including provider metadata.
+      if (record.responder.kind === "deputy") {
+        do {
+          await this.admitted(record.agentId);
+          current = (await sdk.agents.ref(record.agentId).refresh())?.agent.pendingPermissions?.find((request) => request.id === requestId);
+          if (!current || fingerprint(current) !== record.fingerprint) return this.save({ ...record, status: "gone" });
+        } while (this.admissions.get(record.agentId)?.size);
       }
       if (this.stopped) throw new Error("the plugin unloaded before submitting the answer");
       if (record.responder.kind === "deputy" && ((this.owners.get(key) ?? 0) > 0 || this.holds.has(key))) return this.save({ ...record, status: "owner-first" });

@@ -9,6 +9,7 @@ import { strictRecordProvenance } from "./agent-records";
 import type { LinearService, TicketComment } from "./linear";
 import type { Citation, CitationKind, DecisionLog, LogEntry } from "./owner-decisions";
 import { answerText, normalize } from "./owner-decisions";
+import { TECHNICAL_CONTINUATION } from "./deputy-continuation";
 
 // Standing delegation, complete approved-plan/local-rule constraints, and relevant
 // register/README/history excerpts. Missing configured evidence fails closed;
@@ -236,7 +237,7 @@ export async function gatherSources(readers: SourceReaders, question: Question, 
     sources.push({ id: `owner-override:${entry.id}:${entry.key}`, kind: "owner-answer", title: `Owner override (${entry.via})`, revision: entry.at, text: entry.text, decisive: true });
   }
   const answered = entries.flatMap((entry) => {
-    const asking = entry.kind === "owner-answer" && entry.userId && entry.id !== question.id ? asked.get(entry.id) : undefined;
+    const asking = entry.kind === "owner-answer" && entry.answers.Response !== TECHNICAL_CONTINUATION && entry.userId && entry.id !== question.id ? asked.get(entry.id) : undefined;
     if (!asking || entry.kind !== "owner-answer") return [];
     const body = asking.questions.map((item) => [`Question: ${item.question}`, item.options.length ? `Options: ${item.options.join(" / ")}` : "", `Owner answered: ${entry.answers[item.key] || "(nothing)"}`].filter(Boolean).join("\n")).join("\n\n");
     return [{ entry, asking, body }];
@@ -269,9 +270,9 @@ export async function gatherSources(readers: SourceReaders, question: Question, 
   // (`owner-answer`, in the same convention as deputy-evidence.ts and deputy-report.ts): the
   // `answer` entry of that id is the daemon's echo of the same resolution and already evidence of
   // its own kind, so re-reading it would let the deputy's own answer write its own constraint.
-  const resolved = new Set(entries.flatMap((entry) => entry.kind === "deputy-answer" || (entry.kind === "owner-answer" && entry.userId.trim()) ? [entry.id] : []));
+  const resolved = new Set(entries.flatMap((entry) => entry.kind === "deputy-answer" || entry.kind === "deputy-continuation" || (entry.kind === "owner-answer" && entry.userId.trim()) ? [entry.id] : []));
   for (const entry of entries) {
-    if (entry.kind !== "answer" || entry.id === question.id || resolved.has(entry.id) || !onTicket(entry.id)) continue;
+    if (entry.kind !== "answer" || entry.answers?.Response === TECHNICAL_CONTINUATION || entry.id === question.id || resolved.has(entry.id) || !onTicket(entry.id)) continue;
     const asking = asked.get(entry.id);
     const text = asking ? answerText(asking, entry) : [
       "The question this resolution answered is no longer in the log; the daemon recorded:",

@@ -10,6 +10,7 @@ import { record } from "./context";
 import { CREATE_COMMENT_QUERY, CREATE_ISSUE_QUERY, UPDATE_ISSUE_STATE_QUERY, type IssueLink, type LinearService, type MentioningIssue } from "./linear";
 import { questionKey, questionsOf } from "./relay";
 import { paseoHome } from "./ticket-mcp";
+import { TECHNICAL_CONTINUATION, type TechnicalContinuation } from "./deputy-continuation";
 
 // Decision candidates (README, "Decision candidates"): what the owner decided outside plans —
 // plan review feedback, answers to agents' questions, comments on tickets an agent worked on — is
@@ -85,14 +86,15 @@ export type LogEntry =
   | { kind: "question"; id: string; at: string; identifier: string; issueId: string; questions: LoggedQuestion[] }
   | { kind: "answer"; id: string; at: string; answers?: Record<string, string>; denyMessage?: string }
   | { kind: "owner-answer"; id: string; at: string; key: string; via: "linear-comment" | "linear-session" | "menu-bar"; userId: string; answers: Record<string, string> }
-  | { kind: "deputy-prediction"; id: string; at: string; identifier: string; issueId: string; version: string; mode: DeputyMode; selections: Record<string, string>; citations: Citation[]; key?: string; standing?: boolean }
+  | { kind: "deputy-prediction"; id: string; at: string; identifier: string; issueId: string; version: string; mode: DeputyMode; selections: Record<string, string>; citations: Citation[]; key?: string; standing?: boolean; continuation?: TechnicalContinuation }
   | { kind: "deputy-refusal"; id: string; at: string; identifier: string; issueId: string; version: string; mode: DeputyMode; reason: string; category?: string; key?: string }
   | { kind: "deputy-answer"; id: string; at: string; identifier: string; issueId: string; version: string; key: string; answers: Record<string, string>; citations: Citation[]; activation?: string }
+  | { kind: "deputy-continuation"; id: string; at: string; identifier: string; issueId: string; version: string; key: string; fingerprint: string; directive: string; continuation: TechnicalContinuation; citations: Citation[]; activation?: string }
   | { kind: "deputy-outcome"; id: string; at: string; key: "blocked" | "canceled" | "owner-won" | "unknown"; reason: string }
   | { kind: "deputy-activation"; id: string; at: string; key: string; policy: string | null; via: "settings-rpc"; mode: DeputyMode | "off" }
   | { kind: "deputy-override"; id: string; at: string; key: string; via: "linear-comment" | "linear-session" | "menu-bar"; userId: string; text: string; disposition: "delivered" | "failed"; detail?: string };
 
-const KINDS: LogEntry["kind"][] = ["plan-feedback", "question", "answer", "owner-answer", "deputy-prediction", "deputy-refusal", "deputy-answer", "deputy-outcome", "deputy-override", "deputy-activation"];
+const KINDS: LogEntry["kind"][] = ["plan-feedback", "question", "answer", "owner-answer", "deputy-prediction", "deputy-refusal", "deputy-answer", "deputy-continuation", "deputy-outcome", "deputy-override", "deputy-activation"];
 const entryKey = (entry: LogEntry) => `${entry.kind}\n${entry.id}\n${"key" in entry ? entry.key : ""}`;
 
 function validEntry(value: unknown): value is LogEntry {
@@ -274,12 +276,13 @@ export async function collectOwnerDecisions(sources: CollectSources, window: { s
   const feedback = entries.filter((entry): entry is Extract<LogEntry, { kind: "plan-feedback" }> => entry.kind === "plan-feedback" && inWindow(entry.at));
   // A resolution the deputy caused is not the owner's answer, whatever the daemon reports.
   const deputyAnswers = new Map(entries.flatMap((entry) => entry.kind === "deputy-answer" ? [[entry.id, entry] as const] : []));
+  const continuations = new Map(entries.flatMap((entry) => entry.kind === "deputy-continuation" ? [[entry.id, entry] as const] : []));
   const answers = entries.flatMap((entry) => {
-    const question = entry.kind === "answer" && inWindow(entry.at) && !deputyAnswers.has(entry.id) ? questions.get(entry.id) : undefined;
+    const question = entry.kind === "answer" && entry.answers?.Response !== TECHNICAL_CONTINUATION && inWindow(entry.at) && !deputyAnswers.has(entry.id) && !continuations.has(entry.id) ? questions.get(entry.id) : undefined;
     return entry.kind === "answer" && question ? [{ answer: entry, question }] : [];
   });
   const deputyEntries = entries.filter((entry): entry is Extract<LogEntry, { kind: "deputy-answer" | "deputy-override" }> => (entry.kind === "deputy-answer" || entry.kind === "deputy-override") && inWindow(entry.at));
-  const deputyIssue = (entry: { id: string }) => questions.get(entry.id)?.issueId ?? deputyAnswers.get(entry.id)?.issueId ?? null;
+  const deputyIssue = (entry: { id: string }) => questions.get(entry.id)?.issueId ?? deputyAnswers.get(entry.id)?.issueId ?? continuations.get(entry.id)?.issueId ?? null;
   const overrideComments = new Set(deputyEntries.flatMap((entry) => entry.kind === "deputy-override" && entry.via === "linear-comment" ? [entry.key] : []));
   const links = await linear.issueLinks([...feedback.map((entry) => entry.issueId), ...answers.map(({ question }) => question.issueId), ...deputyEntries.flatMap((entry) => deputyIssue(entry) ?? [])]);
   const allowed = (issueId: string) => !sources.excluded.has(issueId);
@@ -318,7 +321,7 @@ export async function collectOwnerDecisions(sources: CollectSources, window: { s
     if (!link || !issueId || !allowed(issueId)) return [];
     if (entry.kind === "deputy-answer") return [item("deputy-answer", `log:deputy-answer:${entry.id}`, entry.at, link, link.url, deputyAnswerText(questions.get(entry.id), entry), "")];
     const answered = deputyAnswers.get(entry.id);
-    const body = [`The owner overrode the deputy's answer${answered ? ` (${Object.values(answered.answers).filter(Boolean).join(" / ")})` : ""}:`, entry.text, `Correction ${entry.disposition === "delivered" ? "delivered to the agent" : `not delivered: ${entry.detail ?? "unknown reason"}`}.`, ...(answered ? ["Deputy sources:", citationLines(answered.citations)] : [])].join("\n\n");
+    const body = [continuations.has(entry.id) ? "The owner corrected the deputy's technical instruction (not an owner approval):" : `The owner overrode the deputy's answer${answered ? ` (${Object.values(answered.answers).filter(Boolean).join(" / ")})` : ""}:`, entry.text, `Correction ${entry.disposition === "delivered" ? "delivered to the agent" : `not delivered: ${entry.detail ?? "unknown reason"}`}.`, ...(answered ? ["Deputy sources:", citationLines(answered.citations)] : [])].join("\n\n");
     return [item("deputy-override", `log:deputy-override:${entry.id}:${entry.key}`, entry.at, link, link.url, body, entry.text)];
   });
 

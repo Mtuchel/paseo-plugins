@@ -10,6 +10,7 @@ import {
   AppOnlyToken, AppWriter, candidateKey, collectOwnerDecisions, collectWindow, DecisionLog, documentFeedback, InvalidInput, isoWeek, runCollect, runFile,
   sentBackFeedback, verbatim, withLock, type Batch, type FileWriter, type Item,
 } from "./owner-decisions";
+import { TECHNICAL_CONTINUATION, TECHNICAL_CONTINUATION_TEMPLATE } from "./deputy-continuation";
 
 const DAY = 24 * 60 * 60 * 1000;
 // Monday 2026-10-05 07:00 UTC: ISO week 41.
@@ -557,5 +558,29 @@ test("the log: duplicates once, only answers to logged questions, private files,
     assert.deepEqual(entries[1], { kind: "answer", id: "a:q1", at: new Date(NOW).toISOString(), answers: { q0: "B" } });
     assert.equal((await stat(join(home, "log", "log.jsonl"))).mode & 0o777, 0o600);
     assert.equal((await stat(join(home, "log"))).mode & 0o777, 0o700);
+  } finally { await rm(home, { recursive: true, force: true }); }
+});
+
+test("custom technical instruction echoes never become owner decisions, including before receipt settlement", async () => {
+  const home = await temporary();
+  try {
+    const log = new DecisionLog(join(home, "owner-decisions"), () => NOW);
+    const world = new World();
+    const sources = { log, linear: world, recorded: new Set<string>(), agentTickets: new Set(["issue-1"]), excluded: new Set<string>() };
+    const window = { since: ago(7), until: ago(0) };
+    await log.append({ kind: "question", id: "a:q", at: ago(2), issueId: "issue-1", identifier: "ISSUE-1",
+      questions: [{ key: "Response", question: "Ship unknown release or owner review?", options: ["Ship", "Owner reviews"] }] });
+    await log.answer("a:q", { behavior: "allow", updatedInput: { answers: { Response: TECHNICAL_CONTINUATION } } }, ago(1));
+    assert.deepEqual(await collectOwnerDecisions(sources, window), []);
+    await log.append({ kind: "deputy-continuation", id: "a:q", key: "checked-intent", at: ago(1), issueId: "issue-1", identifier: "ISSUE-1", version: "version",
+      fingerprint: "request", directive: TECHNICAL_CONTINUATION, citations: [],
+      continuation: { template: TECHNICAL_CONTINUATION_TEMPLATE, step: "Read existing diff.", whyNoSafeOption: "Release not authorized; owner actor is not agent work." } });
+    assert.deepEqual(await collectOwnerDecisions(sources, window), []);
+    await log.append({ kind: "deputy-override", id: "a:q", key: "correction", at: ago(0, 1), via: "menu-bar", userId: "owner",
+      text: "Do not review the canceled work.", disposition: "delivered" });
+    const items = await collectOwnerDecisions(sources, window);
+    assert.deepEqual(items.map(item => [item.kind, item.words]), [["deputy-override", "Do not review the canceled work."]]);
+    assert.match(items[0].text, /corrected.*technical instruction/);
+    assert.doesNotMatch(items[0].text, /overrode the deputy's answer/);
   } finally { await rm(home, { recursive: true, force: true }); }
 });

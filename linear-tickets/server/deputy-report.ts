@@ -1,6 +1,7 @@
 import type { Candidate } from "./deputy";
 import { LIVE_MIN_AGREEMENT, LIVE_MIN_CASES, shadowEvidence, type Evidence } from "./deputy-evidence";
 import type { LogEntry } from "./owner-decisions";
+import { TECHNICAL_CONTINUATION } from "./deputy-continuation";
 
 // The deputy's outcome report (README, "Deputy for agent questions"), read-only: the shadow
 // evidence for one evaluator version, what the deputy refused and answered, the owner's overrides,
@@ -35,8 +36,12 @@ function median(values: number[]): number | null {
 // did not cause.
 export function waitStats(entries: LogEntry[], window: Window, mergedPullRequests: number | null): WaitStats {
   const ends = new Map<string, { at: string; deputy: boolean }>();
+  // The daemon echoes the initial Other response, not substantive completion.
+  const continued = new Set(entries.flatMap(entry => entry.kind === "deputy-continuation" ? [entry.id] : []));
   for (const entry of entries) {
     if (entry.kind !== "answer" && entry.kind !== "owner-answer" && entry.kind !== "deputy-answer") continue;
+    if (entry.answers?.Response === TECHNICAL_CONTINUATION) continue;
+    if (continued.has(entry.id) && entry.kind !== "owner-answer") continue;
     const known = ends.get(entry.id);
     if (!known || entry.at < known.at) ends.set(entry.id, { at: entry.at, deputy: entry.kind === "deputy-answer" });
   }
@@ -52,7 +57,7 @@ export function waitStats(entries: LogEntry[], window: Window, mergedPullRequest
     waits.push((Date.parse(end.at) - Date.parse(at)) / 60_000);
     if (end.deputy) byDeputy++;
   }
-  const ownerAnswers = new Set(entries.flatMap((entry) => (entry.kind === "answer" || entry.kind === "owner-answer") && inWindow(entry.at, window) && !deputyAnswered.has(entry.id) ? [entry.id] : [])).size;
+  const ownerAnswers = new Set(entries.flatMap((entry) => (entry.kind === "answer" || entry.kind === "owner-answer") && entry.answers?.Response !== TECHNICAL_CONTINUATION && inWindow(entry.at, window) && !deputyAnswered.has(entry.id) && (entry.kind === "owner-answer" || !continued.has(entry.id)) ? [entry.id] : [])).size;
   return {
     window,
     questions: asked.size,
@@ -127,7 +132,8 @@ export function renderReport(input: { entries: LogEntry[]; candidates: Candidate
   if (version) lines.push(...evidenceLines(shadowEvidence(entries, version)));
   else lines.push("No evaluator model is configured (deputy.model): there is no version to report evidence for.", "");
   const answers = entries.filter((entry): entry is Extract<LogEntry, { kind: "deputy-answer" }> => entry.kind === "deputy-answer");
-  const overrides = entries.filter((entry): entry is Extract<LogEntry, { kind: "deputy-override" }> => entry.kind === "deputy-override");
+  const continuedIds = new Set(entries.flatMap(entry => entry.kind === "deputy-continuation" ? [entry.id] : []));
+  const overrides = entries.filter((entry): entry is Extract<LogEntry, { kind: "deputy-override" }> => entry.kind === "deputy-override" && !continuedIds.has(entry.id));
   const outcomes = entries.filter((entry): entry is Extract<LogEntry, { kind: "deputy-outcome" }> => entry.kind === "deputy-outcome");
   lines.push("## Live answers", "", `- Answered by the deputy: ${answers.length}; overridden by the owner: ${new Set(overrides.map((entry) => entry.id)).size} (corrections delivered ${overrides.filter((entry) => entry.disposition === "delivered").length}, failed ${overrides.filter((entry) => entry.disposition === "failed").length})`);
   const byOutcome = new Map<string, number>();
@@ -138,6 +144,10 @@ export function renderReport(input: { entries: LogEntry[]; candidates: Candidate
     lines.push(`- ${entry.identifier} \`${entry.id}\` ${entry.at}: ${JSON.stringify(entry.answers)}; sources ${entry.citations.map((citation) => `${citation.sourceId}@${citation.revision}`).join(", ")}${overridden.length ? `; overridden: ${overridden.map((override) => JSON.stringify(override.text)).join(", ")}` : ""}`);
   }
   if (answers.length) lines.push("");
+  const continuations = entries.filter((entry): entry is Extract<LogEntry, { kind: "deputy-continuation" }> => entry.kind === "deputy-continuation");
+  lines.push("## Bounded technical continuations", "", `- Checked technical instructions submitted: ${continuations.length}; later editor consumption and agent execution unobserved. Not substantive answers, owner approvals or empirical calibration.`, "");
+  for (const entry of continuations) lines.push(`- ${entry.identifier} \`${entry.id}\` ${entry.at}: intent \`${entry.key}\`, fingerprint \`${entry.fingerprint}\`, template \`${entry.continuation.template}\`; intended directive ${JSON.stringify(entry.directive)}; assessed step ${JSON.stringify(entry.continuation.step)}; sources ${entry.citations.map(citation => `${citation.sourceId}@${citation.revision}`).join(", ")}`);
+  if (continuations.length) lines.push("");
   const refusals = new Map<string, Extract<LogEntry, { kind: "deputy-refusal" }>>();
   for (const entry of entries) if (entry.kind === "deputy-refusal" && entry.version === version) refusals.set(entry.id, entry);
   const predicted = new Set(entries.flatMap((entry) => entry.kind === "deputy-prediction" && entry.version === version ? [entry.id] : []));

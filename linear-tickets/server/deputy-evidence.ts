@@ -1,5 +1,6 @@
 import type { LogEntry } from "./owner-decisions";
 import { normalize } from "./owner-decisions";
+import { TECHNICAL_CONTINUATION } from "./deputy-continuation";
 
 // Prove it before trusting it (README, "Deputy for agent questions"): live answers need at least
 // LIVE_MIN_CASES real questions where the deputy's prediction, recorded before anyone answered,
@@ -40,12 +41,13 @@ export function shadowEvidence(entries: LogEntry[], version: string): Evidence {
   const owners = new Map<string, Extract<LogEntry, { kind: "owner-answer" }>>();
   for (const entry of entries) if (entry.kind === "owner-answer" && entry.userId.trim() && !owners.has(entry.id)) owners.set(entry.id, entry);
   const applied = by("deputy-answer");
+  const continued = by("deputy-continuation");
   const evidence: Evidence = { version, pairs: [], matches: 0, agreement: null, unknown: [], late: [], unpaired: [], refusals: {}, ready: false };
   const predictions = new Map<string, Extract<LogEntry, { kind: "deputy-prediction" }>>();
   const refusals = new Map<string, Extract<LogEntry, { kind: "deputy-refusal" }>>();
   for (const entry of entries) {
     if (entry.kind === "deputy-refusal" && entry.version === version) refusals.set(entry.id, entry);
-    if (entry.kind === "deputy-prediction" && entry.version === version && entry.mode === "shadow" && !predictions.has(entry.id)) predictions.set(entry.id, entry);
+    if (entry.kind === "deputy-prediction" && !entry.continuation && entry.version === version && entry.mode === "shadow" && !predictions.has(entry.id)) predictions.set(entry.id, entry);
   }
   // Coverage counts questions, not retry attempts. A recovered refusal that now has a
   // prediction is predicted coverage, not a second question seen.
@@ -53,10 +55,11 @@ export function shadowEvidence(entries: LogEntry[], version: string): Evidence {
     if (!predictions.has(refusal.id)) evidence.refusals[refusal.category ?? "no-knowledge"] = (evidence.refusals[refusal.category ?? "no-knowledge"] ?? 0) + 1;
   }
   for (const prediction of predictions.values()) {
-    if (applied.has(prediction.id)) continue;
+    if (applied.has(prediction.id) || continued.has(prediction.id) || prediction.selections.Response === TECHNICAL_CONTINUATION) continue;
     const predictedAt = Date.parse(prediction.at);
     const resolved = resolutions.get(prediction.id);
     const owner = owners.get(prediction.id);
+    if (owner?.answers.Response === TECHNICAL_CONTINUATION) continue;
     if ((resolved && Date.parse(resolved.at) <= predictedAt) || (owner && Date.parse(owner.at) <= predictedAt)) { evidence.late.push(prediction.id); continue; }
     if (!owner) { evidence.unpaired.push(prediction.id); continue; }
     const missing = Object.keys(prediction.selections).find((key) => !owner.answers[key]?.trim());
