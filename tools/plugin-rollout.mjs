@@ -6,8 +6,9 @@
 //
 // One rollout per host at a time (a kernel flock on $PASEO_HOME/plugin-rollout.lock, held by
 // tools/flock.py and passed on to every child), within one 15-minute deadline:
-//  1. target: the daemon runs the Paseo the build check uses; the plugin is installed from
-//     <plugin-dir> and enabled;
+//  1. target: the Paseo the daemon runs (tools/paseo-build.mjs resolves it — PASEO_SERVER_DIR,
+//     PASEO_BIN, the daemon's own command line, PASEO_CLI, `paseo` on PATH) builds the plugin
+//     and runs every `paseo` call below; the plugin is installed from <plugin-dir> and enabled;
 //  2. waits until no plugin loaded from this checkout is loading (never pulls during a load);
 //  3. resolves the receipt a killed rollout left `pending`;
 //  4. refuses a dirty checkout, `git pull --ff-only`;
@@ -29,9 +30,9 @@
 // Exit 0: ready or already loaded. 1: failed, refused or gave up (nothing reloaded unless it says
 // so). 2: cannot tell which code runs; --force decides.
 //
-// Overrides (tests): PASEO_BIN (the paseo executable), NPM_BIN, PASEO_SERVER_DIR (see
-// paseo-build.mjs), PASEO_HOME, PLUGIN_ROLLOUT_DEADLINE_MS, PLUGIN_ROLLOUT_POLL_MS,
-// PLUGIN_ROLLOUT_RELOAD_TIMEOUT_MS.
+// Overrides: PASEO_BIN (the paseo executable), PASEO_SERVER_DIR and PASEO_CLI (see
+// paseo-build.mjs), PASEO_HOME, NPM_BIN. Tests also use PLUGIN_ROLLOUT_DEADLINE_MS,
+// PLUGIN_ROLLOUT_POLL_MS, PLUGIN_ROLLOUT_RELOAD_TIMEOUT_MS.
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
@@ -63,7 +64,6 @@ function numberSetting(value, fallback) {
 
 export function settingsFrom(env) {
   return {
-    paseoBin: env.PASEO_BIN || "paseo",
     npmBin: env.NPM_BIN || "npm",
     home: resolve(env.PASEO_HOME || join(homedir(), ".paseo")),
     deadlineMs: numberSetting(env.PLUGIN_ROLLOUT_DEADLINE_MS, 15 * MINUTE),
@@ -334,8 +334,19 @@ async function steps({ pluginArg, force, deadline, env }, { run }) {
   const id = pluginId(pluginDir);
   const say = (line) => console.log(`${id}: ${line}`);
 
+  // 1. Target: the Paseo the daemon runs. The build check (step 6) and every `paseo` call below
+  // use that one install, so a rollout cannot build with one Paseo and reload through another
+  // (a host whose `paseo` on PATH is another version: the daemon's own CLI wins).
+  let target;
+  try {
+    target = locatePaseoServer(env);
+  } catch (error) {
+    throw new Fail(`cannot find the Paseo the daemon runs: ${error.message}`);
+  }
+  const paseoBin = target.cli || "paseo";
+
   const paseo = async (args) => {
-    const result = await run(settings.paseoBin, args, { timeoutMs: TIMEOUTS.paseo, bounded: false });
+    const result = await run(paseoBin, args, { timeoutMs: TIMEOUTS.paseo, bounded: false });
     if (result.code !== 0) throw new Fail(`paseo ${args.join(" ")} failed (${describeRun(result)})`);
     try {
       return JSON.parse(result.stdout);
@@ -356,19 +367,12 @@ async function steps({ pluginArg, force, deadline, env }, { run }) {
     return result.stdout.trim();
   };
 
-  // 1. Target.
-  let server;
-  try {
-    server = locatePaseoServer(env);
-  } catch (error) {
-    throw new Fail(`cannot find the Paseo the build check uses: ${error.message}`);
-  }
   const daemon = await daemonStatus();
   if (!daemon.daemonVersion || typeof daemon.pid !== "number" || !daemon.startedAt) {
     throw new Fail(`paseo daemon status shows no running daemon (local daemon: ${daemon.localDaemon ?? "unknown"}); nothing done`);
   }
-  if (daemon.daemonVersion !== server.version) {
-    throw new Fail(`the daemon runs Paseo ${daemon.daemonVersion}, the build check uses ${server.version} (${server.dir}); nothing done`);
+  if (daemon.daemonVersion !== target.version) {
+    throw new Fail(`the daemon runs Paseo ${daemon.daemonVersion}, the build check uses ${target.version} (${target.dir}); nothing done`);
   }
   const listed = (await listPlugins()).find((entry) => entry.id === id);
   if (!listed) throw new Fail(`Paseo has no plugin ${id} installed; nothing done`);
@@ -471,7 +475,7 @@ async function steps({ pluginArg, force, deadline, env }, { run }) {
   };
   writeAtomically(receiptFile, `${JSON.stringify(pending, null, 2)}\n`);
   say(`reloading ${revision.slice(0, 7)} (${decision.why})`);
-  const reload = await run(settings.paseoBin, ["plugin", "reload", id], { timeoutMs: settings.reloadTimeoutMs });
+  const reload = await run(paseoBin, ["plugin", "reload", id], { timeoutMs: settings.reloadTimeoutMs });
   const cliTimeout = /Timeout waiting for message/.test(`${reload.stdout}\n${reload.stderr}`);
   if (reload.code !== 0 && !cliTimeout) {
     const started = lifecycle(await readLogs(id)).some((event) => event.kind === "loading" && event.sequence > afterSequence);

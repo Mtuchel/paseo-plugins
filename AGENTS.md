@@ -14,10 +14,16 @@ npm test
 node ../tools/paseo-build.mjs .
 ```
 
-The last line runs Paseo's own plugin build (the one the daemon runs on load) with the Paseo
-installed on the host. A plugin whose manifest excludes the host's Paseo (peer-agents today) is
-checked against a Paseo version it supports: `npm pack @getpaseo/server@<version>` in a temp dir,
-unpack it, `npm install --omit=dev --ignore-scripts` in the unpacked `package/`, then
+The last line runs Paseo's own plugin build (the one the daemon runs on load) with the Paseo the
+running daemon runs: the install its own command line names (`~/.paseo/runtime-patches/<commit>` on
+both rollout hosts), not the `paseo` on PATH (a mise 0.10.3 CLI on server087, the Paseo.app bundle
+on the laptop). With no daemon running it takes `PASEO_CLI` (the CLI a host's daemon runner hands
+its children), then `paseo` on PATH. `PASEO_BIN` (the `paseo` executable to use) and
+`PASEO_SERVER_DIR` (the server directory) override that and are never silently replaced; an
+unusable `PASEO_BIN` fails the check. A plugin whose manifest excludes the host's Paseo
+(peer-agents today) is checked against a Paseo version it supports: `npm pack
+@getpaseo/server@<version>` in a temp dir, unpack it, `npm install --omit=dev --ignore-scripts` in
+the unpacked `package/`, then
 `PASEO_SERVER_DIR=<that dir> node ../tools/paseo-build.mjs .`. Also run it once without
 `PASEO_SERVER_DIR` and put the host's refusal in the PR body. Never widen the plugin's Paseo range
 or skip the check to pass. A change under `tools/` also runs `node --test tools/` at the repository
@@ -43,9 +49,10 @@ There is no GitHub CI: these local checks are the merge gate.
 - A merge changes no running host. Roll out on each host that runs the plugin (the laptop and server087) with
   `node ~/dev/paseo-plugins/tools/plugin-rollout.mjs ~/dev/paseo-plugins/<id>` and nothing else: no `git pull`, no
   Settings reload, no `paseo plugin reload` by hand. The tool pulls, installs when the lockfile changed, runs the
-  build check, and reloads only when it is needed, one rollout at a time. Use `--force` for a config-only reload,
-  and after exit 2 ("cannot tell which code runs") read the reason; if the plugin should run the checkout's code,
-  rerun with `--force`.
+  build check, and reloads only when it is needed, one rollout at a time; it resolves the daemon's own Paseo like
+  the build check does (above) and drives the reload with that CLI, so no PATH setup is needed. Use `--force` for a
+  config-only reload, and after exit 2 ("cannot tell which code runs") read the reason; if the plugin should run
+  the checkout's code, rerun with `--force`.
   - Reading state: a load can take several minutes. A 60 s CLI timeout
     (`Timeout waiting for message (60000ms)`) does not cancel it. Older daemons also
     report `failed` while loading; that status alone is not a terminal failure.
