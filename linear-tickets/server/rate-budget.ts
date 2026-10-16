@@ -7,7 +7,10 @@ export type Pool = "key" | "app";
 export type Priority = "owner" | "interactive" | "background";
 
 const PERIOD_MS = 60 * 60 * 1000;
-export const RESERVES: Record<Priority, number> = { background: 0.20, interactive: 0.05, owner: 0 };
+// Background work stops at 10% of an hour's allowance. At 20% (until 2026-10-16) the hosts'
+// background traffic held both pools at that line, so auto-dispatch launched nothing for hours
+// while 15% of each pool stayed unused above the interactive reserve.
+export const RESERVES: Record<Priority, number> = { background: 0.10, interactive: 0.05, owner: 0 };
 const MIN_BLOCK_MS = 60 * 1000;
 const MAX_BACKOFF_MS = 15 * 60 * 1000;
 const PROBE_WAIT_MS = 10 * 1000;

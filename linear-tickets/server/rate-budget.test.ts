@@ -34,8 +34,8 @@ function points(remaining: number): Headers {
 
 test("both reserves use the lower dimension, while unknown points do not restrict", () => {
   const { time, budget } = clock();
-  budget.acquire("app").done(points(380_000), false);
-  const until = time.now + Math.ceil((400_000 + 100 - 380_000) * HOUR / 2_000_000);
+  budget.acquire("app").done(points(180_000), false);
+  const until = time.now + Math.ceil((200_000 + 100 - 180_000) * HOUR / 2_000_000);
   assert.equal(budget.pausedUntil("app", "background"), until);
   assert.throws(() => budget.acquire("app", "background"), (error: unknown) => error instanceof RateLimitedError && error.reason === "reserve" && error.resumeAt === until);
   budget.acquire("app", "interactive").done(null, false);
@@ -62,7 +62,7 @@ test("requests and points reserve the last five percent for owner operations", (
 
 test("concurrent requests reserve their estimated in-flight costs atomically", async () => {
   const { budget } = clock();
-  budget.acquire("app").done(points(400_000 + 5 * 100), false);
+  budget.acquire("app").done(points(200_000 + 5 * 100), false);
   const tickets = await Promise.all(Array.from({ length: 20 }, () => withPriority("background", "test poll", async () => {
     try { return budget.acquire("app"); } catch { return null; }
   })));

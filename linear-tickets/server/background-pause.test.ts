@@ -28,10 +28,10 @@ const ID_A = "3b241101-e2bb-4255-8caf-4136c566a962";
 const ID_B = "c7d3f6b0-6a41-4f2e-9b8d-2f5c1a0e77c4";
 const REQUESTS_LIMIT = 5_000;
 const POINTS_LIMIT = 2_000_000;
-// The budget every background fixture runs against: 19% of the points budget is below the 20%
-// background reserve, so nothing goes out; 21% is above it, so the poller's own request is sent.
-const LOW_POINTS = Math.floor(POINTS_LIMIT * 0.19);
-const HIGH_POINTS = Math.ceil(POINTS_LIMIT * 0.21);
+// The budget every background fixture runs against: 9% of the points budget is below the 10%
+// background reserve, so nothing goes out; 11% is above it, so the poller's own request is sent.
+const LOW_POINTS = Math.floor(POINTS_LIMIT * 0.09);
+const HIGH_POINTS = Math.ceil(POINTS_LIMIT * 0.11);
 const PLENTY_REQUESTS = Math.ceil(REQUESTS_LIMIT * 0.95);
 
 type Call = { pool: Pool; operation: string };
@@ -94,7 +94,7 @@ function fixture(t: TestContext, reply: (call: Call, variables: Record<string, u
   }), false);
   return { clock, now, calls, refusals, budget, linear, post, sample };
 }
-// Both pools at 19% (`LOW_POINTS`) or 21% (`HIGH_POINTS`) of their points: with equal room a
+// Both pools at 9% (`LOW_POINTS`) or 11% (`HIGH_POINTS`) of their points: with equal room a
 // background read goes to the key first (LinearService.read), so a poller pauses only when both are
 // at their reserve, and then on the app's.
 function bothAt(f: Fixture, points: number): void {
@@ -144,11 +144,11 @@ function assertSent(f: Fixture, pool: Pool = "app"): void {
   assert.equal(f.calls[0]?.pool, pool, `first request is on the ${pool} pool`);
 }
 
-// AC-2: the dispatch poll pauses with both pools at 19% of the points budget, and sends at 21%.
+// AC-2: the dispatch poll pauses with both pools at 9% of the points budget, and sends at 11%.
 // The mock clock keeps the timer `attach` arms from polling a second time behind the explicit tick.
 // A paused poll's one outgoing request is the queue-blocker read (README, "Auto-dispatch"): it is
 // admitted at interactive priority and its empty reply starts nothing.
-test("the dispatch poll pauses at 19% of the points budget and sends only the queue-blocker read; at 21% it reads the full one", async (t) => {
+test("the dispatch poll pauses at 9% of the points budget and sends only the queue-blocker read; at 11% it reads the full one", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
   const low = fixture(t, () => ({ issues: { nodes: [] } }));
   bothAt(low, LOW_POINTS);
@@ -257,7 +257,7 @@ test("a key-first read refused at the key's reserve is answered by the app; a Li
 });
 
 // AC-2: the comment relay owns its caller context, so a direct poll is admitted as background work.
-test("the comment relay pauses at 19% of the points budget and sends at 21%", async (t) => {
+test("the comment relay pauses at 9% of the points budget and sends at 11%", async (t) => {
   const dir = await directory(t, "paseo-relay-");
   const paseo = { agents: { list: async () => ({ entries: [{ agent: { id: "agent-1", createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-02T00:00:00Z", labels: AGENT.labels } }], pageInfo: { hasMore: false, nextCursor: null } }) } } as unknown as PaseoApi;
 
@@ -274,7 +274,7 @@ test("the comment relay pauses at 19% of the points budget and sends at 21%", as
 });
 
 // AC-2: the project flow's own tick, not only the outer dispatch tick.
-test("the project flow pauses at 19% of the points budget and sends at 21%", async (t) => {
+test("the project flow pauses at 9% of the points budget and sends at 11%", async (t) => {
   const dir = await directory(t, "paseo-projects-");
   const flow = (f: Fixture) => new ProjectFlow({
     linear: f.linear,
@@ -299,7 +299,7 @@ test("the project flow pauses at 19% of the points budget and sends at 21%", asy
 });
 
 // AC-2: health's public check, which is where its caller context lives.
-test("the health check pauses at 19% of the points budget and sends at 21%", async (t) => {
+test("the health check pauses at 9% of the points budget and sends at 11%", async (t) => {
   const dir = await directory(t, "paseo-health-");
   const monitor = (f: Fixture) => new HealthMonitor(f.linear, { read: async () => settings }, [{ name: "Linear", run: async () => { await f.linear.viewerId(); } }], join(dir, "health.json"), () => new Date(f.clock.now).toISOString());
 
@@ -315,7 +315,7 @@ test("the health check pauses at 19% of the points budget and sends at 21%", asy
 });
 
 // AC-2: the label rules' own sync, which reads the app's identity first.
-test("the label rules pause at 19% of the points budget and send at 21%", async (t) => {
+test("the label rules pause at 9% of the points budget and send at 11%", async (t) => {
   t.mock.method(console, "error", () => {});
   const rules = { teamKeys: ["ENG"], groups: [], hash: "rules-1" };
   const sync = (f: Fixture) => new LabelSync({ linear: f.linear, pullRequests: { filesOf: () => null, refresh: async () => {} }, rules: async () => rules, now: f.now } as never);
@@ -332,7 +332,7 @@ test("the label rules pause at 19% of the points budget and send at 21%", async 
 });
 
 // AC-2: manual tasks read their tickets through the real pool admission.
-test("the manual task poll pauses at 19% of the points budget and sends at 21%", async (t) => {
+test("the manual task poll pauses at 9% of the points budget and sends at 11%", async (t) => {
   const dir = await directory(t, "paseo-manual-");
   t.mock.method(console, "error", () => {});
   await writeFile(join(dir, "a.json"), JSON.stringify(MANUAL_TASK("a", "p1")));
@@ -349,7 +349,7 @@ test("the manual task poll pauses at 19% of the points budget and sends at 21%",
 });
 
 // AC-2: the plan-request poll reads the agents' tickets through the real pool admission.
-test("the plan request poll pauses at 19% of the points budget and sends at 21%", async (t) => {
+test("the plan request poll pauses at 9% of the points budget and sends at 11%", async (t) => {
   const dir = await directory(t, "paseo-plans-");
   t.mock.method(console, "error", () => {});
   const paseo = { agents: { list: async () => ({ entries: [{ agent: { id: "agent-1", labels: AGENT.labels } }], pageInfo: { hasMore: false, nextCursor: null } }) } } as unknown as PaseoApi;
@@ -375,7 +375,7 @@ test("the plan request poll pauses at 19% of the points budget and sends at 21%"
 // AC-2: the pull request watch's own poll. The crash pass runs first whatever the budget says;
 // with no crashed agent, its only Linear read is the background batch of the running tickets'
 // states, which pauses like the poll's own reads.
-test("the pull request watch pauses at 19% of the points budget and sends at 21%", async (t) => {
+test("the pull request watch pauses at 9% of the points budget and sends at 11%", async (t) => {
   const dir = await directory(t, "paseo-prwatch-");
   t.mock.method(console, "error", () => {});
   const low = fixture(t);
@@ -395,7 +395,7 @@ test("the pull request watch pauses at 19% of the points budget and sends at 21%
 test("with background work paused on both pools, the pull request watch still restarts a crashed agent", async (t) => {
   const dir = await directory(t, "paseo-crash-");
   t.mock.method(console, "error", () => {});
-  // Every answer keeps both pools at 19%: background work stays paused through the whole poll.
+  // Every answer keeps both pools at 9%: background work stays paused through the whole poll.
   const f = fixture(t, () => ({ issue: { state: { name: "In Progress", type: "started" } } }), () => ({ requests: PLENTY_REQUESTS, points: LOW_POINTS }));
   bothAt(f, LOW_POINTS);
   const prompts: string[] = [];
@@ -417,7 +417,7 @@ test("with background work paused on both pools, the pull request watch still re
 });
 
 // AC-2: the queue backstop's own run.
-test("the queue backstop pauses at 19% of the points budget and sends at 21%", async (t) => {
+test("the queue backstop pauses at 9% of the points budget and sends at 11%", async (t) => {
   const dir = await directory(t, "paseo-backstop-");
   t.mock.method(console, "error", () => {});
   const low = fixture(t);
@@ -432,7 +432,7 @@ test("the queue backstop pauses at 19% of the points budget and sends at 21%", a
 });
 
 // AC-2: the workspace state labels' batched ticket read.
-test("the state labels pause at 19% of the points budget and send at 21%", async (t) => {
+test("the state labels pause at 9% of the points budget and send at 11%", async (t) => {
   t.mock.method(console, "error", () => {});
   const daemon = () => ({
     workspaces: async () => [{ id: "w1", name: "TUC-1: work", labels: [] }],
@@ -517,10 +517,10 @@ test("AC-4: at 6% interactive work passes while the same work at background prio
 test("the app reaching its reserve during a poll stops the remaining writes without falling back to the key; the pause is logged once", async (t) => {
   const dir = await directory(t, "paseo-tasks-");
   for (const item of [MANUAL_TASK("a", "p1"), MANUAL_TASK("bb", "p2")]) await writeFile(join(dir, `${item.id}.json`), JSON.stringify(item));
-  // The plugin's writes go out as the app, which starts one request above its 20% reserve
-  // (1,001 of 5,000) plus room and loses one per answered request; the key reads stay plentiful
-  // and take the poll's background reads (TUC-1684).
-  let appRemaining = 1_002;
+  // The plugin's writes go out as the app, which starts one request above its 10% reserve plus
+  // room (501 of 5,000) and loses one per answered request; the key reads stay plentiful and take
+  // the poll's background reads (TUC-1684).
+  let appRemaining = 502;
   const f = fixture(t, (call, variables) => {
     const data: Record<string, Record<string, unknown>> = {
       issueStatuses: { issues: { nodes: ((variables.ids ?? []) as string[]).map((id) => ({ id, state: { type: "unstarted" }, completedAt: null })) } },
@@ -532,7 +532,7 @@ test("the app reaching its reserve during a poll stops the remaining writes with
     };
     return data[call.operation] ?? {};
   }, (call) => ({ requests: call.pool === "app" ? appRemaining-- : PLENTY_REQUESTS, points: HIGH_POINTS }));
-  f.sample("app", 1_002, HIGH_POINTS);
+  f.sample("app", 502, HIGH_POINTS);
   f.sample("key", PLENTY_REQUESTS, HIGH_POINTS);
   const errors: string[] = [];
   t.mock.method(console, "error", (...args: unknown[]) => { errors.push(args.join(" ")); });
