@@ -4344,6 +4344,9 @@ Candidates live in `$PASEO_HOME/linear-tickets/deputy/candidates.json` (director
    Unavailable checker plans need actual semantic scope, not just review/process adjectives.
    Non-waiving dependency waits remain delegated without approving the prerequisite's unknown
    implementation. Safe preparation/deferral is not whole-ticket completion or owner approval.
+   Temporarily holding unapproved planning is not cancellation and needs no personal cancellation
+   instruction. It authorizes no abandonment of approved work, business choice or unknown delivery;
+   offered bounded investigation, nonbinding preparation and prerequisite coordination may continue.
    Historical deadline validity stays unknown without an authoritative evaluation clock;
    today's date or another monitor's expiration cannot prove it. Actual live deadlines still bind.
    Task/component ownership is not inherently human: an otherwise explicit agent action is not
@@ -4360,7 +4363,7 @@ block, without Paseo, Linear or GitHub credentials in its environment. A tool ev
 unreadable/oversized answer, abstention or failed check refuses the whole request. Citations
 retain source ID, revision and quote.
 
-Evidence is versioned as `deputy-13-material-workflow/owner-autonomy-2026-10-15-v3/<model>/high`.
+Evidence is versioned as `deputy-14-dependency-holds/owner-autonomy-2026-10-15-v3/<model>/high`.
 Old-policy predictions never satisfy current empirical readiness. On restart, an old-version
 refusal/prediction is reevaluated only after the exact unanswered request is freshly verified;
 old selections, citations, intent and grace are discarded. An equivalent new request ID retires
