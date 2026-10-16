@@ -161,7 +161,7 @@ export class Focus {
     if (!file.active) return { active: false, since: null, readAt: null, error: null, tickets: [], left: 0, complete: false };
     const snapshot = await this.current(paseo).catch(() => this.snapshot);
     const tickets = snapshot?.tickets ?? [];
-    const left = tickets.filter((ticket) => ticket.phase !== "review" && ticket.phase !== "done").length;
+    const left = tickets.filter((ticket) => !["manual", "review", "done"].includes(ticket.phase)).length;
     return {
       active: true, since: file.since, readAt: snapshot ? new Date(snapshot.readAt).toISOString() : null, error: this.error,
       tickets, left, complete: Boolean(snapshot) && !this.error && left === 0,
@@ -220,20 +220,23 @@ export class Focus {
       }
       frontier = next;
     }
-    const needsYou = new Set([labels.needsYou, labels.blocked, labels.failed, labels.manual].map((name) => name.toLowerCase()));
+    const needsYou = new Set([labels.needsYou, labels.blocked, labels.failed].map((name) => name.toLowerCase()));
+    const manual = labels.manual.toLowerCase();
     const tickets = [...reasons].flatMap(([id, reason]): FocusTicket[] => {
       const node = nodes.get(id);
       if (!node) return [];
       const agent = agents.get(id);
-      // `needs-you` also covers the owner's manual tasks (`-manual`, no agent takes them) and a plan
-      // parked for the owner's decision; a peer agent waiting for the owner shows through the
-      // labels and states its plugin writes, so a peer claim counts as working only after those.
+      // `manual`: the owner's manual task (`-manual`), which no agent takes, so it is not left for
+      // the agents. `needs-you` also covers a plan parked for the owner's decision; a peer agent
+      // waiting for the owner shows through the labels and states its plugin writes, so a peer
+      // claim counts as working only after those.
       const phase: FocusPhase = CLOSED.includes(node.statusType) ? "done"
         : agent?.working ? "working"
-          : agent?.waiting || parked.has(id) || /needs input/i.test(node.status) || planStage(node.status, node.statusType) === PLAN_REVIEW_STATE || node.labels.some((name) => needsYou.has(name.toLowerCase())) ? "needs-you"
-            : inReviewState(node.status, node.statusType) ? (node.finished ? "done" : "review")
-              : peer?.has(id) ? "working"
-                : "waiting";
+          : node.labels.some((name) => name.toLowerCase() === manual) ? "manual"
+            : agent?.waiting || parked.has(id) || /needs input/i.test(node.status) || planStage(node.status, node.statusType) === PLAN_REVIEW_STATE || node.labels.some((name) => needsYou.has(name.toLowerCase())) ? "needs-you"
+              : inReviewState(node.status, node.statusType) ? (node.finished ? "done" : "review")
+                : peer?.has(id) ? "working"
+                  : "waiting";
       const waitingOn = node.blockers.filter((blocker) => !nodes.get(blocker.id)?.finished).map((blocker) => blocker.identifier);
       return [{ id, identifier: node.identifier, title: node.title, url: node.url, status: node.status, phase, reason, waitingOn }];
     });
