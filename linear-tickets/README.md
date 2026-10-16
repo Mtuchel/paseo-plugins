@@ -1467,14 +1467,16 @@ from the sidebar while focus is on joins the tickets in flight, so its successor
 `linear.focus` reports each ticket in focus with why it is there (`in-flight`, `sub-issue`,
 `blocker`, `queue-blocker`), its unfinished blockers, and its phase: `working` (an agent on this
 host works on it, or a live root ticket agent of the peer host claims it while it neither needs
-you nor is in review), `needs-you` (it waits for your answer, carries `paseo-needs-you`, `-blocked`,
-`-failed` or `-manual` (your manual task, which no agent takes), has a plan parked for your
-decision, or is in Needs input or Plan review), `review` (in review, no agent working), `waiting`
-(blockers, a free slot or its start) or `done` (closed, or in review with its pull requests
-merged). While the peer's claims cannot be read, its tickets get their phase from this host's
-agents and Linear alone. Focus is
-*complete* when every ticket in it is in review or done: their pull requests can be merged. Focus
-stays on until you turn it off; turning it off forgets the tickets in flight.
+you nor is in review), `needs-you` (it waits for your answer, carries `paseo-needs-you`, `-blocked`
+or `-failed`, has a plan parked for your decision, or is in Needs input or Plan review), `manual`
+(it carries `paseo-manual`: your manual task, which no agent takes), `review` (in review, no agent
+working), `waiting` (blockers, a free slot or its start) or `done` (closed, or in review with its
+pull requests merged). While the peer's claims cannot be read, its tickets get their phase from
+this host's agents and Linear alone. `left` counts the tickets the agents still have to bring to
+review: every one that is neither manual, in review nor done. Focus is *complete* when none is
+left: their pull requests can be merged, while your manual tasks may still be open (a ticket
+blocked by one waits, so it is still left). Focus stays on until you turn it off; turning it off
+forgets the tickets in flight.
 
 **Split into sub-issues.** A plan with 2–12 steps also offers **Approve & split into N
 sub-issues**. The plan becomes the parent's plan document and the planning agent is closed.

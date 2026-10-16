@@ -155,9 +155,10 @@ test("while Linear cannot be read, the last set read decides, and before any rea
   assert.equal(await reloaded.admits("child", w.paseo), null);
 });
 
-test("the status says what each ticket waits for, and focus is complete once all are in review or done", async (t) => {
+test("the status says what each ticket waits for, and focus is complete once all are in review or done or manual", async (t) => {
   const w = await world(t, [
-    node("working", { statusType: "started", status: "In Progress", delegateId: "app" }),
+    node("working", { statusType: "started", status: "In Progress", delegateId: "app", children: ["manual"] }),
+    node("manual", { labels: ["paseo-manual"] }),
     node("asking", { statusType: "started", status: "In Progress", delegateId: "app" }),
     node("review", { statusType: "started", status: "In Review", delegateId: "app" }),
     node("merged", { statusType: "started", status: "In Review", delegateId: "app", finished: true }),
@@ -169,21 +170,22 @@ test("the status says what each ticket waits for, and focus is complete once all
   ]);
   const status = await w.focus.enable(w.paseo);
   const phases = Object.fromEntries(status.tickets.map((ticket) => [ticket.id, ticket.phase]));
-  assert.deepEqual(phases, { working: "working", asking: "needs-you", review: "review", merged: "done", blocked: "waiting", plan: "needs-you" }, "a plan review waits for you, it is no code review");
+  assert.deepEqual(phases, { working: "working", manual: "manual", asking: "needs-you", review: "review", merged: "done", blocked: "waiting", plan: "needs-you" }, "a plan review waits for you, it is no code review");
   assert.deepEqual(status.tickets.find((ticket) => ticket.id === "blocked")?.waitingOn, ["TUC-review"], "a merged blocker is finished");
   assert.deepEqual({ left: status.left, complete: status.complete }, { left: 4, complete: false });
 
   for (const id of ["working", "asking", "blocked", "plan"]) w.nodes.set(id, { ...w.nodes.get(id)!, status: "In Review" });
   w.advance(5 * 60_000 + 1);
   const later = await w.make().status({ agents: { list: async () => ({ entries: [], pageInfo: { hasMore: false } }) } } as unknown as PaseoApi);
-  assert.deepEqual({ left: later.left, complete: later.complete }, { left: 0, complete: true });
+  assert.deepEqual({ left: later.left, complete: later.complete }, { left: 0, complete: true }, "an open manual task leaves no work for the agents");
+  assert.equal(later.tickets.find((ticket) => ticket.id === "manual")?.phase, "manual");
 });
 
-test("the owner's manual tasks and parked plans wait for you, and a ticket the peer host's agent works is working", async (t) => {
+test("the owner's manual tasks are manual, parked plans wait for you, and a ticket the peer host's agent works is working", async (t) => {
   let claims: () => Promise<Set<string> | null> = async () => new Set(["peer", "peer-review"]);
   const w = await world(t, [
     node("root", { statusType: "started", status: "In Progress", delegateId: "app", children: ["manual", "peer", "peer-review", "idle", "approved"] }),
-    node("manual", { labels: ["paseo-manual"] }),
+    node("manual", { labels: ["paseo-manual", "paseo-failed"] }),
     node("parked", { statusType: "started", status: "Planning", delegateId: "app" }),
     node("peer", { statusType: "started", status: "In Progress", delegateId: "peer-app" }),
     node("peer-review", { statusType: "started", status: "In Review", delegateId: "peer-app" }),
@@ -192,8 +194,8 @@ test("the owner's manual tasks and parked plans wait for you, and a ticket the p
   ], [{ id: "a1", status: "running", issueId: "root" }], [], { peer: () => claims(), parked: ["parked"] });
   const status = await w.focus.enable(w.paseo);
   const phases = Object.fromEntries(status.tickets.map((ticket) => [ticket.id, ticket.phase]));
-  assert.deepEqual(phases, { root: "working", manual: "needs-you", parked: "needs-you", peer: "working", "peer-review": "review", idle: "waiting", approved: "waiting" });
-  assert.deepEqual({ left: status.left, complete: status.complete }, { left: 6, complete: false });
+  assert.deepEqual(phases, { root: "working", manual: "manual", parked: "needs-you", peer: "working", "peer-review": "review", idle: "waiting", approved: "waiting" }, "a manual task stays manual whatever status label it carries");
+  assert.deepEqual({ left: status.left, complete: status.complete }, { left: 5, complete: false });
 
   // The peer's claims cannot be read: the ticket falls back to what this host and Linear know.
   claims = async () => { throw new Error("claims unreadable"); };

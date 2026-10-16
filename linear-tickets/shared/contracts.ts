@@ -467,10 +467,12 @@ export const setPresenceRpc = defineRpc({
 
 // Focus mode (README, "Focus mode"): no new ticket work starts; the tickets in flight when it was
 // turned on, their sub-issues and their unfinished blockers run to the end. `phase` per ticket:
-// `working` (an agent works on it), `needs-you` (it waits for your answer or a fix),
-// `waiting` (blockers, a free slot or a start), `review` (in review, no agent working), `done`.
-// `complete`: every ticket is in review or done, so their pull requests can be merged.
-export const focusPhaseSchema = z.enum(["working", "needs-you", "waiting", "review", "done"]);
+// `working` (an agent works on it), `needs-you` (it waits for your answer or a fix), `manual`
+// (your manual task: no agent takes it), `waiting` (blockers, a free slot or a start), `review`
+// (in review, no agent working), `done`. `left` counts the tickets agents still have to bring to
+// review: neither manual, in review nor done. `complete`: none is left, so their pull requests can
+// be merged; manual tasks may still be open.
+export const focusPhaseSchema = z.enum(["working", "needs-you", "manual", "waiting", "review", "done"]);
 export type FocusPhase = z.infer<typeof focusPhaseSchema>;
 export const focusTicketSchema = z.object({
   id: z.string(),
