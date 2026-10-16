@@ -3389,12 +3389,18 @@ No tokens, query bodies or ticket text appear in the report.
   `sweepSkips` against `sweepReads + sweepSkips` is how much of the saving the webhooks actually
   cover.
 - **Menu-bar owner reads reuse Linear sources for at most 60 seconds.** Its 15-second refresh
-  still reads current local agent state and decision receipts. Only the paginated owner issue
-  inventory and matching comment batches are shared across polls. Issue pages contain up to 100
-  records instead of 50; each comment request covers up to 25 issues instead of 10, still paging
-  both inventories to completion. Failures are never cached.
+  starts a collection with current local agent state and decision receipts. Overlapping reads
+  from the same SDK and source generation share that in-flight collection, not a completed
+  result; failures are not cached. Issue pages contain up to 100 records instead of 50; each
+  comment request covers up to 25 issues instead of 10, still paging both inventories to completion.
   Browser owner collections bypass this cache. Answer and triage actions re-read Linear before
   delivery and invalidate the cache afterward; completion revalidates before closing a ticket.
+  Exact-echo normalization is reused only while a source's text is unchanged; chronology and
+  current-wait ownership are recomputed. Snapshot hashes reuse serialization without changing
+  revision bytes. Extraction-file reads and temporary serialized contexts are bounded to 16
+  sources per batch; model extraction remains limited to two. No source or history is dropped.
+  A cold start still waits for the complete Linear history; these local bounds do not promise
+  a sub-30-second initial network collection.
 - **Review card metadata refreshes every 15 minutes per identifier.** The label catalog still
   refreshes every five minutes. Decisions and deletion always bypass display metadata and
   check the exact current issue identity from Linear.

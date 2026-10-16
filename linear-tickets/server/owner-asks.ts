@@ -26,6 +26,7 @@ const EXTRACT_CONCURRENCY = 2;
 const MAX_ATTEMPTS = 3;
 const RETRY_DELAYS_MS = [15_000, 60_000, 300_000];
 const CALLER = "owner-asks";
+const SNAPSHOT_READ_CONCURRENCY = 16;
 const AGENT_PAGE = 200;
 
 // Menu-bar polls must not rescan every open issue and its comments on each refresh.
@@ -136,16 +137,17 @@ function extractionInput(draft: Draft): ExtractInput {
   return { identifier: draft.issue.identifier, title: draft.issue.title, ticket: draft.ticketId === draft.issue.id ? null : draft.ticketIdentifier, kind: draft.needsYou ? "needs-you" : draft.manual ? "manual" : "ticket", text: draft.text, context: draft.context };
 }
 
-function extractionHash(draft: Draft): string {
-  return askHash(JSON.stringify([EXTRACTION_VERSION, extractionInput(draft)]));
+function extractionHash(draft: Draft, input = JSON.stringify(extractionInput(draft))): string {
+  return askHash(`[${JSON.stringify(EXTRACTION_VERSION)},${input}]`);
 }
 
 function extractionKey(draft: Draft): string {
   return draft.sourceId === "description" ? draft.issue.id : `${draft.issue.id}-${askHash(draft.sourceId)}`;
 }
 
-function revision(draft: Draft, value: ExtractedAsk | null): string {
-  return askHash(JSON.stringify([draft.issue.id, draft.ticketId, draft.sourceId, sourceScope(draft), extractionInput(draft), value]));
+function revision(draft: Draft, value: ExtractedAsk | null, input = JSON.stringify(extractionInput(draft)), scope = sourceScope(draft)): string {
+  const prefix = JSON.stringify([draft.issue.id, draft.ticketId, draft.sourceId, scope]);
+  return askHash(`${prefix.slice(0, -1)},${input},${JSON.stringify(value)}]`);
 }
 
 function sourceScope(draft: Draft): string {
@@ -190,6 +192,7 @@ export class OwnerAsks {
   private commentStore: CommentStore | null = null;
   // Comment reads run one at a time, so a change read always starts from the store it extends.
   private commentReads: Promise<unknown> = Promise.resolve();
+  private snapshotFlight: { paseo: PaseoApi | null; generation: number; promise: Promise<OwnerAskSnapshot> } | null = null;
 
   constructor(private readonly deps: OwnerAsksDeps) {
     this.directory = deps.directory ?? OWNER_ASK_DIRECTORY();
@@ -207,24 +210,35 @@ export class OwnerAsks {
   // Everything waiting for the owner, from cache, without waiting for the model: an ask whose
   // extraction has not finished retains its manual classification when known, else kind "info".
   async snapshot(paseo: PaseoApi | null, fresh = false): Promise<OwnerAskSnapshot> {
+    const known = this.snapshotFlight;
+    if (!fresh && known?.paseo === paseo && known.generation === this.sourceGeneration) return known.promise;
+    const promise = this.buildSnapshot(paseo, fresh);
+    if (fresh) return promise;
+    const flight = { paseo, generation: this.sourceGeneration, promise };
+    this.snapshotFlight = flight;
+    try { return await promise; }
+    finally { if (this.snapshotFlight === flight) this.snapshotFlight = null; }
+  }
+
+  private async buildSnapshot(paseo: PaseoApi | null, fresh: boolean): Promise<OwnerAskSnapshot> {
     const at = new Date(this.now()).toISOString();
     await this.ledger.load();
     const drafts = await this.collect(paseo, undefined, fresh);
     const asks: BrowserOwnerAsk[] = [];
-    for (const draft of drafts) {
-      const hash = extractionHash(draft);
-      const key = extractionKey(draft);
-      let state = await this.extractionFor(key, hash);
+    for await (const prepared of this.snapshotDrafts(drafts)) {
+      const { draft, input, serializedInput, scope, hash, key } = prepared;
+      const current = this.extractions.get(key);
+      let state = current?.hash === hash ? current : prepared.state;
       if (!state) {
         state = { hash, value: null, attempts: 0, nextAt: 0, running: false };
         this.extractions.set(key, state);
       }
       if (!state.value && !state.running && state.attempts < MAX_ATTEMPTS && state.nextAt <= this.now()) {
-        this.enqueue({ issueId: key, hash, input: extractionInput(draft) });
+        this.enqueue({ issueId: key, hash, input });
       }
       const value = state.value;
-      const sourceRevision = revision(draft, value);
-      const sourceDecision = this.ledger.forSource(draft.issue.id, draft.sourceId, askHash(draft.text), sourceScope(draft));
+      const sourceRevision = revision(draft, value, serializedInput, scope);
+      const sourceDecision = this.ledger.forSource(draft.issue.id, draft.sourceId, askHash(draft.text), scope);
       const decision = this.ledger.latest(draft.issue.id, sourceRevision) ?? sourceDecision;
       if (decision?.result && (decision.receipt.action === "answer" || decision.receipt.action === "done")) continue;
       const expired = decision?.disposition === "deferred" && Date.parse(decision.deferredUntil ?? "") <= this.now();
@@ -257,6 +271,22 @@ export class OwnerAsks {
     asks.sort((a, b) => Number(b.attention === "owner" && !b.disposition) - Number(a.attention === "owner" && !a.disposition) || b.updatedAt.localeCompare(a.updatedAt));
     return { asks, updatedAt: at, history: this.ledger.history(),
       coverage: this.deps.issues ? [] : ["Linear collection is limited to Needs input issues. The complete owner-decision issue reader is not configured."] };
+  }
+
+  // Bound temporary serialized timelines and filesystem reads together. Model
+  // extraction keeps its separate, unchanged concurrency limit.
+  private async *snapshotDrafts(drafts: Draft[]) {
+    for (let offset = 0; offset < drafts.length; offset += SNAPSHOT_READ_CONCURRENCY) {
+      const prepared = await Promise.all(drafts.slice(offset, offset + SNAPSHOT_READ_CONCURRENCY).map(async draft => {
+        const input = extractionInput(draft);
+        const serializedInput = JSON.stringify(input);
+        const scope = sourceScope(draft);
+        const hash = extractionHash(draft, serializedInput);
+        const key = extractionKey(draft);
+        return { draft, input, serializedInput, scope, hash, key, state: await this.extractionFor(key, hash) };
+      }));
+      yield* prepared;
+    }
   }
 
   async answer(input: AnswerAskInput, paseo: PaseoApi | null): Promise<AnswerAskResult> {

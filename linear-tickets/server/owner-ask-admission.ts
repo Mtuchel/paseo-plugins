@@ -26,6 +26,18 @@ export function askContent(text: string): string {
     .replace(/\n\s*Reply here with [“"]@paseo[^\n]*$/i, "").trim();
 }
 
+// One timeline feeds many source cards. Normalize each entry once, not once for
+// every other card; a changed text invalidates its value and discarded timelines
+// retain no cache entries.
+const normalizedSources = new WeakMap<AskSource, { text: string; content: string }>();
+function normalizedSource(source: AskSource): string {
+  const known = normalizedSources.get(source);
+  if (known?.text === source.text) return known.content;
+  const content = askContent(source.text);
+  normalizedSources.set(source, { text: source.text, content });
+  return content;
+}
+
 export function askTimeline(description: string, comments: OwnerAskComment[]): AskSource[] {
   return [{ sourceId: "description", text: description, createdAt: "" },
     ...[...new Map(comments.map(comment => [comment.id, comment])).values()]
@@ -35,7 +47,8 @@ export function askTimeline(description: string, comments: OwnerAskComment[]): A
 
 export function askContext(sourceId: string, timeline: AskSource[], waitSourceId: string | null, currentWait: boolean, liveRequest: boolean): AskContext {
   const original = timeline.find(source => source.sourceId === sourceId)!;
-  const same = timeline.filter(source => askContent(source.text) && askContent(source.text) === askContent(original.text));
+  const content = normalizedSource(original);
+  const same = content ? timeline.filter(source => normalizedSource(source) === content) : [];
   // Prefer the current exact wait; otherwise stable oldest source, not whichever echo a poll
   // happens to return first. Originals remain reviewable; no Linear or ledger mutation occurs.
   same.sort((a, b) => Number(b.sourceId === waitSourceId) - Number(a.sourceId === waitSourceId)
