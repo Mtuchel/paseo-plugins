@@ -60,7 +60,9 @@ export function askContext(sourceId: string, timeline: AskSource[], waitSourceId
   for (const source of [original, ...timeline.filter(source => source.sourceId !== sourceId)]) {
     const text = source.text.slice(0, Math.min(remaining, MAX_ENTRY_CHARS));
     if (text.length !== source.text.length) complete = false;
-    if (text || !source.text) selected.push({ ...source, text });
+    // An untruncated entry is quoted as it is, not copied: one context per source re-reads the
+    // same timeline, and an entry the owner sees in full needs no second object.
+    if (text || !source.text) selected.push(text === source.text ? source : { ...source, text });
     remaining -= text.length;
   }
   return { sourceId, currentWait, liveRequest, duplicateOf: canonical === sourceId ? null : canonical, complete, timeline: selected };

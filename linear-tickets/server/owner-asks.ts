@@ -1,18 +1,19 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { z } from "zod";
 import type { PaseoApi } from "@getpaseo/client";
 import type { DecisionReceipt, OwnerAsk } from "../shared/contracts";
 import type { BrowserOwnerAsk } from "../shared/decision-inbox";
 import type { Handover, HandoverRecord } from "./handover";
 import type { LinearService, OwnerAskComment, OwnerAskIssue } from "./linear";
 import type { NeedsYouIssue, NeedsYouIssues } from "./needs-you";
-import { askHash, EXTRACTION_VERSION, MAX_SOURCE_CHARS, type AskQuestion, type ExtractInput, type Extraction, type ExtractedAsk } from "./owner-ask-extract";
+import { askHash, askHashParts, EXTRACTION_VERSION, MAX_SOURCE_CHARS, type AskQuestion, type ExtractInput, type Extraction, type ExtractedAsk } from "./owner-ask-extract";
 import type { DeliveryOrigin, DeliveryResult } from "./permission-replies";
 import { LIVE_AGENT } from "./process-liveness";
 import { withPriority, type Priority } from "./rate-budget";
 import { paseoHome } from "./ticket-mcp";
-import { askContext, askTimeline, checkAssessment, type AskContext } from "./owner-ask-admission";
+import { askContext, askTimeline, checkAssessment, type AskContext, type AskSource } from "./owner-ask-admission";
 import { classifyAttention } from "./owner-ask-attention";
 import { DecisionLedger, type DecisionRecord } from "./decision-ledger";
 
@@ -41,8 +42,28 @@ const LINEAR_SOURCE_CACHE_MS = 60_000;
 // comment, so every history is read again after COMMENT_FULL_READ_MS.
 const COMMENT_CHANGE_OVERLAP_MS = 5 * 60_000;
 const COMMENT_FULL_READ_MS = 30 * 60_000;
+// The store is persisted, so the first collection after a reload extends the stored histories by
+// the changes since their read instead of reading every history again: that read took 74 requests
+// and about 20 seconds on server087 (2026-10-16) and the menu bar's first RPC after a reload timed
+// out on it. A stored store is resumed only within COMMENT_FULL_READ_MS of its whole read, so the
+// bound on deleted comments is the same as in a running collection.
+const COMMENT_STORE_VERSION = 1;
+const COMMENT_STORE_FILE = "comments.json";
 type Linear = Pick<LinearService, "ownerAskIssues" | "ownerAskIssuesByIds" | "ownerAskComments" | "ownerAskCommentChanges" | "commentBody" | "comment" | "complete" | "viewerId">;
 type CommentStore = { byIssue: Map<string, OwnerAskComment[]>; readAt: number; fullAt: number; expiresAt: number };
+// A stored store is used only when it is complete: anything malformed is treated as absent and the
+// collection that follows reads every history again, about twenty seconds on server087 (2026-10-16).
+// A comment the file is missing would silently drop a source, so nothing half-valid is resumed.
+const storedCommentsSchema = z.object({
+  version: z.literal(COMMENT_STORE_VERSION),
+  readAt: z.number().int().nonnegative(),
+  fullAt: z.number().int().nonnegative(),
+  byIssue: z.record(z.string(), z.array(z.object({ id: z.string(), body: z.string(), createdAt: z.string() }))),
+});
+type StoredComments = z.infer<typeof storedCommentsSchema>;
+type Attention = Pick<OwnerAsk, "attention" | "attentionReason" | "blockerIdentifier">;
+
+type SourceAsk = { revision: string; attention: Attention };
 type NeedsYou = Pick<NeedsYouIssues, "all" | "allStrict" | "remove">;
 
 export type ContinueOutcome = { kind: "started" | "live" | "deferred" | "failed" | "forwarded" | "skipped"; reason?: string; peer?: string };
@@ -82,7 +103,8 @@ type TriageAskResult = NonNullable<DecisionRecord["result"]>;
 // `request` fences the daemon request relayed by this exact wait source. "Retired" means no
 // request remains pending on this host, not proof that every underlying business question was
 // answered. Independently cited current owner evidence can retain attention, never old dispatch.
-type Draft = { issue: OwnerAskIssue; manual: boolean; text: string; sourceId: string; context: AskContext; needsYou: string | null; tracking: NeedsYouIssue | null; route: OwnerAsk["route"]; agentId: string | null; ticketAgentId: string | null; ticketId: string; ticketIdentifier: string; request: "pending" | "retired" | null };
+type Draft = { issue: OwnerAskIssue; manual: boolean; text: string; sourceId: string; context: AskContext; needsYou: string | null; tracking: NeedsYouIssue | null; route: OwnerAsk["route"]; agentId: string | null; ticketAgentId: string | null; ticketId: string; ticketIdentifier: string; request: "pending" | "retired" | null;
+  textHash: string };
 type ExtractionState = { hash: string; value: ExtractedAsk | null; attempts: number; nextAt: number; running: boolean };
 type ExtractionJob = { issueId: string; hash: string; input: ExtractInput };
 type StoredExtraction = { hash: string; version: string; model: string; result: ExtractedAsk | null; attempts: number; nextAt: string | null; at: string };
@@ -133,21 +155,60 @@ function answerSignature(input: AnswerAskInput): string {
   return askHash(JSON.stringify({ issueId: input.issueId, revision: input.revision, answers, note: input.note?.trim() ?? "", done: Boolean(input.done) }));
 }
 
-function extractionInput(draft: Draft): ExtractInput {
+function extractionInput(draft: Draft): ExtractInput & { context: AskContext } {
   return { identifier: draft.issue.identifier, title: draft.issue.title, ticket: draft.ticketId === draft.issue.id ? null : draft.ticketIdentifier, kind: draft.needsYou ? "needs-you" : draft.manual ? "manual" : "ticket", text: draft.text, context: draft.context };
 }
 
-function extractionHash(draft: Draft, input = JSON.stringify(extractionInput(draft))): string {
-  return askHash(`[${JSON.stringify(EXTRACTION_VERSION)},${input}]`);
+// One timeline entry's encoding per collection. Every source of an issue quotes the same entries,
+// and `askContext` hands untruncated entries on as the original objects: a WeakMap keyed by the
+// entry encodes each full entry once for the whole collection instead of once per source (5.5 MB
+// of comment text became ~150 MB of encoding on the server087 inventory, 2026-10-16). A truncated
+// copy is a fresh object and correctly encodes per context; that is the rare case. Keying on the
+// object cannot confuse two texts, because the object carries its own text.
+export type InputParts = readonly (string | Buffer)[];
+type HashableInput = string | InputParts;
+export type EntryBytes = WeakMap<AskSource, Buffer>;
+
+function serializedEntry(bytes: EntryBytes, source: AskSource): Buffer {
+  const known = bytes.get(source);
+  if (known) return known;
+  const encoded = Buffer.from(JSON.stringify({ sourceId: source.sourceId, text: source.text, createdAt: source.createdAt }), "utf8");
+  bytes.set(source, encoded);
+  return encoded;
+}
+
+// The input's own fields and the context's scalars are serialized from the objects themselves, so
+// their keys and order cannot drift from `JSON.stringify(input)`; only the timeline comes in pieces.
+// The pieces are `JSON.stringify(input)` byte for byte, both closing braces included: the bytes are
+// what the extraction hash and every revision are taken over, and a stored extraction is reused
+// only when its hash still matches, so a serialization one byte off re-extracts every source.
+export function extractionInputParts(input: ExtractInput & { context: AskContext }, bytes: EntryBytes): InputParts {
+  const { context, ...fields } = input;
+  const { timeline, ...scalars } = context;
+  const parts: (string | Buffer)[] = [`${JSON.stringify(fields).slice(0, -1)},"context":${JSON.stringify(scalars).slice(0, -1)},"timeline":[`];
+  timeline.forEach((source, index) => {
+    if (index) parts.push(",");
+    parts.push(serializedEntry(bytes, source));
+  });
+  parts.push("]}}");
+  return parts;
+}
+
+function hashParts(prefix: string, input: HashableInput, suffix: string): string {
+  return askHashParts([prefix, ...(typeof input === "string" ? [input] : input), suffix]);
+}
+
+function extractionHash(draft: Draft, input?: HashableInput): string {
+  return hashParts(`[${JSON.stringify(EXTRACTION_VERSION)},`, input ?? extractionInputParts(extractionInput(draft), new WeakMap()), "]");
 }
 
 function extractionKey(draft: Draft): string {
   return draft.sourceId === "description" ? draft.issue.id : `${draft.issue.id}-${askHash(draft.sourceId)}`;
 }
 
-function revision(draft: Draft, value: ExtractedAsk | null, input = JSON.stringify(extractionInput(draft)), scope = sourceScope(draft)): string {
+function revision(draft: Draft, value: ExtractedAsk | null, input?: HashableInput, scope = sourceScope(draft)): string {
   const prefix = JSON.stringify([draft.issue.id, draft.ticketId, draft.sourceId, scope]);
-  return askHash(`${prefix.slice(0, -1)},${input},${JSON.stringify(value)}]`);
+  return hashParts(`${prefix.slice(0, -1)},`, input ?? extractionInputParts(extractionInput(draft), new WeakMap()), `,${JSON.stringify(value)}]`);
 }
 
 function sourceScope(draft: Draft): string {
@@ -163,6 +224,14 @@ function sourceScope(draft: Draft): string {
   }));
 }
 
+// Classification and revision use the same current extraction. A retired daemon request does
+// not prove that the underlying business question was answered.
+function deriveAsk(draft: Draft, value: ExtractedAsk | null, parts: InputParts, scope: string): SourceAsk {
+  const attention = classifyAttention(draft.text, value, draft.context);
+  if (draft.request === "retired") attention.attentionReason += ` Recorded request source ${draft.sourceId} has no pending request on this host. This does not prove every question on the ticket was answered. This retired request cannot be dispatched again.`;
+  return { revision: revision(draft, value, parts, scope), attention };
+}
+
 function scopedText(draft: Draft, value: ExtractedAsk | null, sourceRevision: string, action: DecisionReceipt["action"], response: string): string {
   return [
     `Decision inbox — ${draft.issue.identifier}, ticket ${draft.ticketIdentifier}, source revision ${sourceRevision}.`,
@@ -174,6 +243,22 @@ function scopedText(draft: Draft, value: ExtractedAsk | null, sourceRevision: st
     `Owner's explicit response:\n${response}`,
     "No unselected recommendation is accepted. Existing repository rules, approval requirements and authority limits remain in force.",
   ].join("\n\n");
+}
+
+// One issue's list is the same array object while nothing about it changed. The lists that are new
+// compare by contents, so an issue whose comment came back unchanged does not rewrite the file.
+function sameComments(previous: Map<string, OwnerAskComment[]>, next: Map<string, OwnerAskComment[]>): boolean {
+  if (previous.size !== next.size) return false;
+  for (const [id, comments] of previous) {
+    const other = next.get(id);
+    if (other === comments) continue;
+    if (!other || other.length !== comments.length) return false;
+    for (let index = 0; index < comments.length; index++) {
+      const before = comments[index]!, after = other[index]!;
+      if (before.id !== after.id || before.body !== after.body || before.createdAt !== after.createdAt) return false;
+    }
+  }
+  return true;
 }
 
 export class OwnerAsks {
@@ -190,6 +275,8 @@ export class OwnerAsks {
   private issueCache: { expiresAt: number; value: OwnerAskIssue[] } | null = null;
   private issueFlight: Promise<OwnerAskIssue[]> | null = null;
   private commentStore: CommentStore | null = null;
+  private commentStoreLoaded = false;
+  private commentStoreDirty = false;
   // Comment reads run one at a time, so a change read always starts from the store it extends.
   private commentReads: Promise<unknown> = Promise.resolve();
   private snapshotFlight: { paseo: PaseoApi | null; generation: number; promise: Promise<OwnerAskSnapshot> } | null = null;
@@ -224,26 +311,17 @@ export class OwnerAsks {
     const at = new Date(this.now()).toISOString();
     await this.ledger.load();
     const drafts = await this.collect(paseo, undefined, fresh);
+    // One entry encoding per collection, keyed by the entry objects this collection holds.
+    const entryBytes: EntryBytes = new WeakMap();
     const asks: BrowserOwnerAsk[] = [];
-    for await (const prepared of this.snapshotDrafts(drafts)) {
-      const { draft, input, serializedInput, scope, hash, key } = prepared;
-      const current = this.extractions.get(key);
-      let state = current?.hash === hash ? current : prepared.state;
-      if (!state) {
-        state = { hash, value: null, attempts: 0, nextAt: 0, running: false };
-        this.extractions.set(key, state);
-      }
-      if (!state.value && !state.running && state.attempts < MAX_ATTEMPTS && state.nextAt <= this.now()) {
-        this.enqueue({ issueId: key, hash, input });
-      }
-      const value = state.value;
-      const sourceRevision = revision(draft, value, serializedInput, scope);
-      const sourceDecision = this.ledger.forSource(draft.issue.id, draft.sourceId, askHash(draft.text), scope);
+    for await (const prepared of this.snapshotDrafts(drafts, entryBytes)) {
+      const { draft, scope, value, derived } = prepared;
+      const sourceRevision = derived.revision;
+      const attention = derived.attention;
+      const sourceDecision = this.ledger.forSource(draft.issue.id, draft.sourceId, draft.textHash, scope);
       const decision = this.ledger.latest(draft.issue.id, sourceRevision) ?? sourceDecision;
       if (decision?.result && (decision.receipt.action === "answer" || decision.receipt.action === "done")) continue;
       const expired = decision?.disposition === "deferred" && Date.parse(decision.deferredUntil ?? "") <= this.now();
-      const attention = classifyAttention(draft.text, value, draft.context);
-      if (draft.request === "retired") attention.attentionReason += ` Recorded request source ${draft.sourceId} has no pending request on this host. This does not prove every question on the ticket was answered. This retired request cannot be dispatched again.`;
       asks.push({
         issueId: draft.issue.id,
         sourceId: draft.sourceId,
@@ -273,17 +351,33 @@ export class OwnerAsks {
       coverage: this.deps.issues ? [] : ["Linear collection is limited to Needs input issues. The complete owner-decision issue reader is not configured."] };
   }
 
-  // Bound temporary serialized timelines and filesystem reads together. Model
+  // Bound temporary serialized timelines, extraction reads and filesystem reads together. Model
   // extraction keeps its separate, unchanged concurrency limit.
-  private async *snapshotDrafts(drafts: Draft[]) {
+  // The byte cache belongs to this collection, not a source id shared with another snapshot.
+  private async *snapshotDrafts(drafts: Draft[], entryBytes: EntryBytes) {
+    const files = await this.extractionFiles();
     for (let offset = 0; offset < drafts.length; offset += SNAPSHOT_READ_CONCURRENCY) {
       const prepared = await Promise.all(drafts.slice(offset, offset + SNAPSHOT_READ_CONCURRENCY).map(async draft => {
-        const input = extractionInput(draft);
-        const serializedInput = JSON.stringify(input);
-        const scope = sourceScope(draft);
-        const hash = extractionHash(draft, serializedInput);
         const key = extractionKey(draft);
-        return { draft, input, serializedInput, scope, hash, key, state: await this.extractionFor(key, hash) };
+        const scope = sourceScope(draft);
+        const input = extractionInput(draft);
+        const parts = extractionInputParts(input, entryBytes);
+        const hash = extractionHash(draft, parts);
+        const current = this.extractions.get(key);
+        let state = current?.hash === hash ? current : undefined;
+        if (!state) {
+          const stored = files && !files.has(this.extractionFile(key)) ? null : await this.readExtraction(key);
+          state = await this.extractionFor(key, hash, stored);
+        }
+        if (!state) {
+          state = { hash, value: null, attempts: 0, nextAt: 0, running: false };
+          this.extractions.set(key, state);
+        }
+        if (!state.value && !state.running && state.attempts < MAX_ATTEMPTS && state.nextAt <= this.now()) {
+          this.enqueue({ issueId: key, hash, input });
+        }
+        const value = state.value;
+        return { draft, scope, value, derived: deriveAsk(draft, value, parts, scope) };
       }));
       yield* prepared;
     }
@@ -548,7 +642,8 @@ export class OwnerAsks {
   private async syncComments(ids: string[]): Promise<Map<string, OwnerAskComment[]>> {
     const startedAt = this.now();
     const generation = this.sourceGeneration;
-    const store = this.commentStore && startedAt - this.commentStore.fullAt < COMMENT_FULL_READ_MS ? this.commentStore : null;
+    const resumed = this.commentStore ?? await this.loadCommentStore();
+    const store = resumed && startedAt - resumed.fullAt < COMMENT_FULL_READ_MS ? resumed : null;
     const known = store ? ids.filter(id => store.byIssue.has(id)) : [];
     const added = store ? ids.filter(id => !store.byIssue.has(id)) : ids;
     const changes = store && known.length
@@ -565,9 +660,45 @@ export class OwnerAsks {
       byIssue.set(id, [...new Map((history ?? [...stored, ...changed!]).map(comment => [comment.id, comment])).values()]
         .sort((a, b) => b.createdAt.localeCompare(a.createdAt) || a.id.localeCompare(b.id)));
     }
-    this.commentStore = { byIssue, readAt: startedAt, fullAt: store?.fullAt ?? startedAt,
+    const next: CommentStore = { byIssue, readAt: startedAt, fullAt: store?.fullAt ?? startedAt,
       expiresAt: generation === this.sourceGeneration ? this.now() + LINEAR_SOURCE_CACHE_MS : 0 };
+    this.commentStore = next;
+    await this.storeComments(next, store);
     return new Map(ids.map(id => [id, byIssue.get(id)!]));
+  }
+
+  // The store on disk is resumed only within the whole-read window: outside it the collection that
+  // follows refreshes every history anyway, and that whole read is what drops deleted comments.
+  private async loadCommentStore(): Promise<CommentStore | null> {
+    if (this.commentStoreLoaded) return this.commentStore;
+    this.commentStoreLoaded = true;
+    const stored = await this.readCommentsFile();
+    if (!stored || this.now() - stored.fullAt >= COMMENT_FULL_READ_MS) return null;
+    this.commentStore = stored;
+    return stored;
+  }
+
+  private async readCommentsFile(): Promise<CommentStore | null> {
+    try {
+      const stored = storedCommentsSchema.parse(JSON.parse(await readFile(this.commentStorePath(), "utf8")));
+      return { byIssue: new Map(Object.entries(stored.byIssue)), readAt: stored.readAt, fullAt: stored.fullAt, expiresAt: 0 };
+    } catch { return null; }
+  }
+
+  // Only a successful write clears dirty state; unchanged history must retry a failed write.
+  private async storeComments(next: CommentStore, previous: CommentStore | null): Promise<void> {
+    if (!this.commentStoreDirty && previous && sameComments(previous.byIssue, next.byIssue)) return;
+    this.commentStoreDirty = true;
+    const stored: StoredComments = { version: COMMENT_STORE_VERSION, readAt: next.readAt, fullAt: next.fullAt, byIssue: Object.fromEntries(next.byIssue) };
+    try {
+      await this.write(this.commentStorePath(), JSON.stringify(stored));
+      this.commentStoreDirty = false;
+    }
+    catch (error) { console.error(`[linear-tickets] writing the owner-ask comment store failed: ${error instanceof Error ? error.message : error}`); }
+  }
+
+  private commentStorePath(): string {
+    return join(this.directory, COMMENT_STORE_FILE);
   }
 
   private async collect(paseo: PaseoApi | null, issueId?: string, fresh = false): Promise<Draft[]> {
@@ -634,7 +765,8 @@ export class OwnerAsks {
         const separate = (subIssue && !currentWait) || (waiting?.kind === "request" && !mirror);
         drafts.push({ issue, manual: manual(issue), text, sourceId, context, needsYou: isNeedsYou(issue) ? issue.id : null, tracking: needsYouById.get(issue.id) ?? null,
           route: separate ? "comment" : route.route, agentId: separate ? null : route.agentId,
-          ticketAgentId: separate ? null : agents.newest.get(ticketId) ?? null, ticketId, ticketIdentifier, request });
+          ticketAgentId: separate ? null : agents.newest.get(ticketId) ?? null, ticketId, ticketIdentifier, request,
+          textHash: askHash(text) });
       }
     }
     return drafts;
@@ -677,10 +809,12 @@ export class OwnerAsks {
   // ---------------------------------------------------------------------------------------------
   // Extraction
 
-  private async extractionFor(issueId: string, hash: string): Promise<ExtractionState | undefined> {
+  private async extractionFor(issueId: string, hash: string, known?: StoredExtraction | null): Promise<ExtractionState | undefined> {
     const memory = this.extractions.get(issueId);
     if (memory && memory.hash === hash) return memory;
-    const stored = await this.readExtraction(issueId);
+    // The caller of the cold path has already read this source's extraction file; reading it twice
+    // per source was another 14k filesystem reads on a cold collection (2026-10-16).
+    const stored = known === undefined ? await this.readExtraction(issueId) : known;
     if (!stored || stored.hash !== hash || stored.version !== EXTRACTION_VERSION) return undefined;
     const state: ExtractionState = { hash, value: stored.result, attempts: stored.attempts, nextAt: stored.nextAt ? Date.parse(stored.nextAt) || 0 : 0, running: false };
     this.extractions.set(issueId, state);
@@ -736,7 +870,22 @@ export class OwnerAsks {
   }
 
   private extractionPath(issueId: string): string {
-    return join(this.directory, "extract", `${issueId.replace(/[^A-Za-z0-9-]/g, "_")}.json`);
+    return join(this.directory, "extract", this.extractionFile(issueId));
+  }
+
+  private extractionFile(issueId: string): string {
+    return `${issueId.replace(/[^A-Za-z0-9-]/g, "_")}.json`;
+  }
+
+  // A cold collection read every source's extraction file, and on a fresh install almost all of
+  // those reads are ENOENT. One directory listing answers the same question; a file written after
+  // the listing is simply missed, so that source derives again next collection instead of being
+  // trusted without a read.
+  private async extractionFiles(): Promise<Set<string> | null> {
+    try { return new Set(await readdir(join(this.directory, "extract"))); }
+    catch (error) {
+      return error instanceof Error && "code" in error && error.code === "ENOENT" ? new Set<string>() : null;
+    }
   }
 
   private async readExtraction(issueId: string): Promise<StoredExtraction | null> {

@@ -140,7 +140,15 @@ export function checkExtraction(raw: string, source?: string, context?: AskConte
 
 // One hash per (issue, ask text): the cache key that keeps a restart from re-running the model.
 export function askHash(text: string): string {
-  return createHash("sha256").update(text).digest("hex").slice(0, 32);
+  return askHashParts([text]);
+}
+
+// The same hash over the same bytes in pieces. A source's input is hashed from a reused timeline
+// entry encoding instead of a newly built string (owner-asks.ts); one part keeps `askHash` exact.
+export function askHashParts(parts: readonly (string | Buffer)[]): string {
+  const hash = createHash("sha256");
+  for (const part of parts) hash.update(part);
+  return hash.digest("hex").slice(0, 32);
 }
 
 // `directory`: the owner-asks state directory; the isolated OMP agent directory lives in it.

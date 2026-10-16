@@ -4824,6 +4824,13 @@ still its own ticket). Each ask carries its route from this host's view: `agent`
 agent), `continue` (the ticket's agent is gone: an answer starts a continuation agent through the
 starter's handover path), or `comment`.
 
+Private `owner-asks/comments.json` preserves complete collected histories across reloads
+(`0700` directory, `0600` file). Within the existing thirty-minute full-history window, the
+next collection reads changes with the same overlap rather than fetching every history again.
+Expired, missing or invalid stores require a full read; deletions remain bounded by that window.
+Failed persistence is retried even when the history has not changed. Explicit owner actions
+still fetch current source history and strict registration authority rather than trusting this cache.
+
 **Asks that repeat a live question.** A ticket whose wait was opened by a permission request (the
 agent's question or approval, wait kind `request`) and that has a live root agent on this host
 carries `mirrorsLiveRequest: true` while one of its live agents (subagents included) still holds a
@@ -4861,6 +4868,16 @@ oversized or tool-event responses stay unextracted and retry with backoff before
 Two calls run at a time. Private `owner-asks/extract/` cache files (`0700` directory, `0600`
 files) bind source text, current timeline/wait context and `owner-ask-4-source-currentness`;
 old extraction labels cannot silently restore urgency after this policy change.
+
+Each collection derives revisions and attention from the current source and exact matching
+extraction; there is no separate persistent derived-result cache. Timeline entries are serialized
+once per entry object within that collection, preserving the original JSON bytes and revision
+hashes even when different cards truncate the same source differently. A directory listing avoids
+per-source reads for missing extraction files, including when the directory itself is absent.
+Other listing failures fall back to individual reads. Matching in-memory extractions are published
+only after their durable write and remain consistent between display and fresh action validation.
+Nothing here answers, approves or dispatches: exact owner actions retain their source/revision
+freshness and authority checks.
 
 **Where an answer goes.** `linear.answer-ask` takes
 `{ issueId, sourceId?, revision, answers, note?, done? }`. Shared validated RPC output preserves

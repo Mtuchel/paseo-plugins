@@ -1,15 +1,16 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import type { PaseoApi } from "@getpaseo/client";
 import type { HandoverRecord } from "./handover";
 import type { OwnerAskComment, OwnerAskIssue } from "./linear";
-import { answerText, askRoute, deliveryText, OwnerAsks, selectAskSources, type AnswerAskInput, type ContinueOutcome, type OwnerAsksDeps } from "./owner-asks";
+import { answerText, askRoute, deliveryText, extractionInputParts, OwnerAsks, selectAskSources, type AnswerAskInput, type ContinueOutcome, type OwnerAsksDeps } from "./owner-asks";
 import { answerAskRpc, ownerAsksRpc, triageAskRpc, type OwnerAsk } from "../shared/contracts";
 import type { BrowserOwnerAsk } from "../shared/decision-inbox";
 import { checkExtraction, type ExtractInput, type Extraction } from "./owner-ask-extract";
+import { askContext, askTimeline, type AskContext, type AskSource } from "./owner-ask-admission";
 import { PermissionReplies, type DeliveryOrigin, type DeliveryResult } from "./permission-replies";
 import { NeedsYouIssues } from "./needs-you";
 
@@ -1299,3 +1300,150 @@ for (const change of ["replacement generation", "body edit without timestamp cha
     assert.equal(h.state.issues.length, 0);
   });
 }
+
+const waitRecord = (kind: "request" | "turn-end", commentId: string): HandoverRecord => ({
+  issueId: "i1", identifier: "TUC-1616", agentId: "a1", agentTitle: "agent", branch: null, worktreePath: null,
+  lastCommit: null, summaries: [], links: {}, status: "waiting", progressCommentId: null, resumedFrom: null,
+  updatedAt: at, waiting: { previousStateId: "ip", commentId, kind, at },
+});
+
+const settled = async (h: Harness, owner: OwnerAsks = h.ownerAsks): Promise<BrowserOwnerAsk[]> => {
+  await untilAsync(async () => (await owner.snapshot(h.paseo)).asks.every((ask) => ask.extracted));
+  return (await owner.snapshot(h.paseo)).asks;
+};
+
+test("a restart preserves every source revision and its retired-request attention", async (t) => {
+  const h = await setup({
+    issues: [issue({ title: "Ticket", labels: [], parentId: null, parentIdentifier: null }), issue({ id: "i2", identifier: "TUC-1617", title: "Needs you: Decision for you: who takes TUC-1563?",
+      url: "https://linear.app/tuchel/issue/TUC-1617", description: "**Decision for you: who takes TUC-1563?**\n\n* **Agent does it:** I plan TUC-1563." })],
+    comments: new Map([["i1", [comment("c1", waitComment)]], ["i2", [comment("c2", waitComment.replace("block refresh live", "ship the migration"))]]]),
+    records: new Map([["i1", waitRecord("request", "c1")]]),
+    agents: [{ id: "a1", status: "idle", createdAt: at, issueId: "i1" }],
+  });
+  t.after(() => h.ownerAsks.stop());
+  const first = await settled(h);
+  assert.equal(first.length, 4, "two sources on the first issue, two on the second");
+  assert.ok(first.some((ask) => ask.attentionReason.includes("has no pending request on this host")),
+    `retired-request attention must remain visible: ${JSON.stringify(first.map((ask) => [ask.sourceId, ask.attention, ask.attentionReason]))}`);
+  const resumed = new OwnerAsks(h.deps);
+  t.after(() => resumed.stop());
+  assert.deepEqual(await settled(h, resumed), first, "a restart resumes every source's revision and attention");
+});
+
+test("a source revision changes when it stops being this host's current wait", async (t) => {
+  const h = await setup({
+    issues: [issue({ title: "Ticket", description: "**Decision for you: who takes TUC-1562?**", labels: [], parentId: null })],
+    comments: new Map([["i1", [comment("c1", waitComment)]]]),
+    records: new Map([["i1", waitRecord("turn-end", "c1")]]),
+  });
+  t.after(() => h.ownerAsks.stop());
+  const first = await settled(h);
+  const before = first.find((ask) => ask.sourceId === "c1")!;
+  assert.equal(before.attention, "owner");
+  // The agent asks a second comment: c1 is no longer the exact wait comment this host holds.
+  h.state.comments.set("i1", [comment("c1", waitComment), comment("c2", `${waitComment}\n\n2. May I ship the migration?`)]);
+  h.state.records.set("i1", waitRecord("turn-end", "c2"));
+  const resumed = new OwnerAsks(h.deps);
+  t.after(() => resumed.stop());
+  const moved = await settled(h, resumed);
+  assert.notEqual(moved.find((ask) => ask.sourceId === "c1")!.revision, before.revision,
+    "a stored revision cannot stand once the host's wait state moved");
+});
+
+
+// The extraction hash and every source revision are taken over the bytes of the serialized input.
+// They are deliberately `JSON.stringify(input)` and nothing else: a stored extraction is reused
+// only while its hash matches, so a serialization one byte off re-extracts the whole inventory
+// through the model, and a revision off by a byte stops matching the receipts the ledger holds.
+test("the serialized input pieces are JSON.stringify of the input, byte for byte", () => {
+  const inputs: (ExtractInput & { context: AskContext })[] = [
+    { identifier: "TUC-1616", title: "Ticket", ticket: null, kind: "needs-you", text: "May I ship?",
+      context: { sourceId: "c1", currentWait: true, liveRequest: false, duplicateOf: null, complete: false, timeline: [] } },
+    { identifier: "TUC-1617", title: "Ünicode — 決策", ticket: "TUC-1000", kind: "ticket", text: "May the block refresh live?\n\n“quoted”…",
+      context: { sourceId: "description", currentWait: false, liveRequest: true, duplicateOf: "c1", complete: true, timeline: [
+        { sourceId: "description", text: "**Decision for you**\n\n* a\n* b", createdAt: "2026-10-09T10:00:00.000Z" },
+        { sourceId: "c1", text: "😀 an entry with \u0000 and \"quotes\"", createdAt: "2026-10-09T11:00:00.000Z" },
+      ] } },
+  ];
+  const bytes = new WeakMap<AskSource, Buffer>();
+  for (const input of inputs) {
+    assert.equal(extractionInputParts(input, bytes).join(""), JSON.stringify(input));
+  }
+  // One collection encodes an untruncated entry once for every card of its issue: the cards quote
+  // the very object `askTimeline` built, so the second card reads those bytes back, not new ones.
+  const shared: AskSource = { sourceId: "c1", text: "😀 an entry with \u0000 and \"quotes\"", createdAt: "2026-10-09T11:00:00.000Z" };
+  const one = { ...inputs[0], context: { ...inputs[0].context, timeline: [shared] } };
+  const two = { ...inputs[1], context: { ...inputs[1].context, timeline: [shared, inputs[1].context.timeline[0]!] } };
+  const once = extractionInputParts(one, bytes);
+  const twice = extractionInputParts(two, bytes);
+  assert.equal(once[1], twice[1], "one entry object is encoded once, however many cards quote it");
+  assert.equal(once.join(""), JSON.stringify(one));
+  assert.equal(twice.join(""), JSON.stringify(two));
+});
+
+// `askContext` bounds each card's context by that card's own remaining budget, so one entry can
+// reach a card truncated and another whole. Keying the entry cache by the source id served the
+// first card's shorter bytes to the second card and produced an input that was not
+// `JSON.stringify(input)`: the extraction hash moved and the revision did not match the source.
+test("a truncated entry never serves a card whose budget keeps it whole", () => {
+  const comments = Array.from({ length: 8 }, (_, index) => ({ id: `c${index + 1}`, body: "c".repeat(4_000), createdAt: `2026-10-16T11:0${index}:00.000Z` }));
+  const timeline = askTimeline("d".repeat(1_000), comments);
+  const build = (sourceId: string): ExtractInput & { context: AskContext } => ({ identifier: "TUC-1616", title: "Ticket", ticket: null, kind: "ticket", text: "May I ship?",
+    context: askContext(sourceId, timeline, null, false, false) });
+  const bytes = new WeakMap<AskSource, Buffer>();
+  // The description's budget truncates the oldest comment; that comment's own card quotes it whole.
+  // Both orders are read, because either card can be encoded first.
+  for (const sourceId of ["description", "c1", "c1", "description"]) {
+    const input = build(sourceId);
+    assert.equal(extractionInputParts(input, bytes).join(""), JSON.stringify(input), `${sourceId} must assemble byte for byte`);
+  }
+});
+
+for (const field of ["hash", "version"] as const) {
+  test(`a restarted inbox rejects an extraction whose ${field} no longer matches`, async t => {
+    const h = await setup({ issues: [issue()], needsYou: [{ id: "i1", identifier: "TUC-1616", parentId: "p1", agentId: "a1" }] });
+    t.after(() => h.ownerAsks.stop());
+    const [before] = await settled(h);
+    h.ownerAsks.stop();
+    const path = join(h.directory, "extract", (await readdir(join(h.directory, "extract")))[0]!);
+    const stored = JSON.parse(await readFile(path, "utf8"));
+    await writeFile(path, JSON.stringify({ ...stored, [field]: "obsolete" }));
+    h.deps.resolveModel = () => new Promise<string>(() => {});
+    const restarted = new OwnerAsks(h.deps);
+    t.after(() => restarted.stop());
+    const [current] = (await restarted.snapshot(h.paseo)).asks;
+    assert.equal(current?.extracted, false, "an obsolete extraction must not supply displayed questions");
+    assert.notEqual(current?.revision, before?.revision);
+    assert.equal(current?.sourceId, "description");
+    assert.equal(current?.attention, "owner", "unavailable extraction must not hide an owner wait");
+  });
+}
+
+test("a current durable extraction stays usable in memory after its cache file is lost", async t => {
+  const h = await setup({ issues: [issue()] });
+  t.after(() => h.ownerAsks.stop());
+  const input = await inputFor(h);
+  await rm(join(h.directory, "extract"), { recursive: true, force: true });
+  const [current] = (await h.ownerAsks.snapshot(h.paseo, true)).asks;
+  assert.equal(current?.extracted, true);
+  assert.equal(current?.revision, input.revision, "display and fresh action must use the same valid extraction");
+  assert.equal((await h.ownerAsks.answer({ ...input, done: true }, h.paseo)).delivered, "closed");
+  assert.deepEqual(h.events.filter(event => event.startsWith("complete ")), ["complete i1"]);
+});
+
+test("an unchanged comment history retries failed persistence and survives restart", async t => {
+  const h = await setup({ issues: [issue()], comments: new Map([["i1", [comment("c1", waitComment)]]]) });
+  t.after(() => h.ownerAsks.stop());
+  h.deps.resolveModel = () => new Promise<string>(() => {});
+  const cachePath = join(h.directory, "comments.json");
+  await mkdir(cachePath);
+  const first = await h.ownerAsks.snapshot(h.paseo);
+  await rm(cachePath, { recursive: true });
+  await h.ownerAsks.snapshot(h.paseo, true);
+  h.ownerAsks.stop();
+  h.deps.linear.ownerAskComments = async () => { throw new Error("the recovered history must survive restart"); };
+  const restarted = new OwnerAsks(h.deps);
+  t.after(() => restarted.stop());
+  const current = await restarted.snapshot(h.paseo);
+  assert.deepEqual(current.asks, first.asks, "all original sources and revisions survive without another full-history read");
+});
