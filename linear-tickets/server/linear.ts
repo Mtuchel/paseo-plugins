@@ -962,6 +962,7 @@ export const OWNER_ASKS_BY_ID_QUERY = `query ownerAskIssuesById($ids: [ID!]!, $f
 // Every comment page, newest first, batched across issues without truncating older asks.
 export const OWNER_ASK_COMMENT_BATCH = 25;
 export const OWNER_ASK_COMMENTS = 50;
+const OWNER_ASK_HISTORY_CONCURRENCY = 4;
 export function ownerAskCommentsQuery(count: number): string {
   const indexes = Array.from({ length: count }, (_, index) => index);
   const declarations = indexes.map((index) => `$i${index}: ID!, $a${index}: String`).join(", ");
@@ -2283,9 +2284,11 @@ export class LinearService {
   // Paginate every issue's comments independently; never advertise a partial inventory as complete.
   async ownerAskComments(ids: string[]): Promise<Map<string, OwnerAskComment[]>> {
     const comments = new Map<string, OwnerAskComment[]>();
-    for (let start = 0; start < ids.length; start += OWNER_ASK_COMMENT_BATCH) {
+    let offset = 0;
+    let failed = false;
+    const readBatch = async (start: number) => {
       let round = ids.slice(start, start + OWNER_ASK_COMMENT_BATCH).map(id => ({ id, after: null as string | null, seen: new Set<string>() }));
-      while (round.length) {
+      while (round.length && !failed) {
         const variables: Record<string, unknown> = {};
         round.forEach((item, index) => Object.assign(variables, { [`i${index}`]: item.id, [`a${index}`]: item.after }));
         const data = await this.read(ownerAskCommentsQuery(round.length), variables, (result) =>
@@ -2314,7 +2317,21 @@ export class LinearService {
         });
         round = next;
       }
-    }
+    };
+    const worker = async () => {
+      while (!failed && offset < ids.length) {
+        const start = offset;
+        offset += OWNER_ASK_COMMENT_BATCH;
+        await readBatch(start);
+      }
+    };
+    // Keep each cursor walk serial, but do not serialize unrelated issue histories.
+    // All sends retain read()'s credential, rate-budget and completeness checks.
+    const workers = Array.from({ length: Math.min(OWNER_ASK_HISTORY_CONCURRENCY, Math.ceil(ids.length / OWNER_ASK_COMMENT_BATCH)) }, () =>
+      worker().catch(error => { failed = true; throw error; }));
+    const settled = await Promise.allSettled(workers);
+    const failure = settled.find(result => result.status === "rejected");
+    if (failure) throw failure.reason;
     return comments;
   }
 

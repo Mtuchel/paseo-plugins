@@ -453,6 +453,84 @@ test("owner comment inventory reaches an old unresolved question while other iss
   assert.deepEqual(found.get(ID_B), []);
 });
 
+test("a slow issue batch does not stall other histories or lose their older owner question", async () => {
+  const ids = Array.from({ length: 51 }, (_, index) => `issue-${index}`);
+  let release!: () => void;
+  let enter!: () => void;
+  const blocked = new Promise<void>(resolve => { release = resolve; });
+  const entered = new Promise<void>(resolve => { enter = resolve; });
+  const oldAsk = { id: "old-owner-question", body: "Which legal entity may sign?", createdAt: "2026-10-01T00:00:00Z" };
+  let otherHistoryFinished = false;
+  const post: Post = async (_key, _query, variables) => {
+    if (variables.i0 === "issue-0") {
+      enter();
+      await blocked;
+    }
+    return Object.fromEntries(Object.entries(variables).filter(([name]) => /^i\d+$/.test(name)).map(([name, id]) => {
+      const suffix = name.slice(1);
+      if (id !== "issue-25") return [`t${suffix}`, groupConnection([{ comments: groupConnection([]) }])];
+      if (variables[`a${suffix}`] === "older") {
+        otherHistoryFinished = true;
+        return [`t${suffix}`, groupConnection([{ comments: groupConnection([oldAsk]) }])];
+      }
+      return [`t${suffix}`, groupConnection([{ comments: groupConnection([], "older") }])];
+    }));
+  };
+  const linear = new LinearService(new Credentials("/unused", "env-key"), post);
+  const pending = linear.ownerAskComments(ids);
+  await entered;
+  try {
+    // All injected I/O except the held first page is immediately ready.
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(otherHistoryFinished, true, "independent cursor walks must not wait for the held batch");
+  } finally {
+    release();
+    await pending;
+  }
+  const found = await pending;
+  assert.deepEqual(found.get("issue-25"), [oldAsk]);
+  assert.deepEqual(found.get("issue-0"), []);
+  assert.deepEqual([...found.keys()].sort(), ids.sort(), "return only the complete inventory");
+});
+
+test("a failed history inventory drains its active reads and never returns partial comments", async (t) => {
+  for (const fault of ["cursor", "missing issue", "rate limit"] as const) {
+    await t.test(fault, async () => {
+      let release!: () => void;
+      let enter!: () => void;
+      const blocked = new Promise<void>(resolve => { release = resolve; });
+      const entered = new Promise<void>(resolve => { enter = resolve; });
+      const limited = new RateLimitedError("key", Date.now() + 60_000);
+      const post: Post = async (_key, _query, variables) => {
+        if (variables.i0 === "issue-0") {
+          enter();
+          await blocked;
+          return Object.fromEntries(Object.entries(variables).filter(([name]) => /^i\d+$/.test(name))
+            .map(([name]) => [`t${name.slice(1)}`, groupConnection([{ comments: groupConnection([]) }])]));
+        }
+        if (fault === "rate limit") throw limited;
+        if (fault === "missing issue") return {};
+        return { t0: groupConnection([{ comments: { nodes: [], pageInfo: { hasNextPage: true, endCursor: null } } }]) };
+      };
+      const linear = new LinearService(new Credentials("/unused", "env-key"), post);
+      const pending = linear.ownerAskComments(Array.from({ length: 26 }, (_, index) => `issue-${index}`));
+      let settled = false;
+      const observed = pending.then(() => { settled = true; }, () => { settled = true; });
+      await entered;
+      try {
+        await new Promise<void>(resolve => setImmediate(resolve));
+        assert.equal(settled, false, "a failed collection must settle its outstanding read before retry is possible");
+      } finally {
+        release();
+        await observed;
+      }
+      await assert.rejects(pending, fault === "rate limit"
+        ? (error: unknown) => error === limited
+        : /incomplete or repeated comment cursor|could not read owner-question comments/);
+    });
+  }
+});
+
 test("an incomplete comment cursor rejects the owner inventory rather than dropping asks", async () => {
   const { linear } = service(undefined, () => ({ t0: groupConnection([{ comments: { nodes: [], pageInfo: { hasNextPage: true, endCursor: null } } }]) }));
   await assert.rejects(linear.ownerAskComments([ID_A]), /incomplete or repeated comment cursor/);

@@ -64,6 +64,7 @@ type StoredComments = z.infer<typeof storedCommentsSchema>;
 type Attention = Pick<OwnerAsk, "attention" | "attentionReason" | "blockerIdentifier">;
 
 type SourceAsk = { revision: string; attention: Attention };
+type SnapshotDraft = { draft: Draft; scope: string; value: ExtractedAsk | null; derived: SourceAsk };
 type NeedsYou = Pick<NeedsYouIssues, "all" | "allStrict" | "remove">;
 
 export type ContinueOutcome = { kind: "started" | "live" | "deferred" | "failed" | "forwarded" | "skipped"; reason?: string; peer?: string };
@@ -314,15 +315,15 @@ export class OwnerAsks {
     // One entry encoding per collection, keyed by the entry objects this collection holds.
     const entryBytes: EntryBytes = new WeakMap();
     const asks: BrowserOwnerAsk[] = [];
-    for await (const prepared of this.snapshotDrafts(drafts, entryBytes)) {
+    await this.snapshotDrafts(drafts, entryBytes, (prepared, index) => {
       const { draft, scope, value, derived } = prepared;
       const sourceRevision = derived.revision;
       const attention = derived.attention;
       const sourceDecision = this.ledger.forSource(draft.issue.id, draft.sourceId, draft.textHash, scope);
       const decision = this.ledger.latest(draft.issue.id, sourceRevision) ?? sourceDecision;
-      if (decision?.result && (decision.receipt.action === "answer" || decision.receipt.action === "done")) continue;
+      if (decision?.result && (decision.receipt.action === "answer" || decision.receipt.action === "done")) return;
       const expired = decision?.disposition === "deferred" && Date.parse(decision.deferredUntil ?? "") <= this.now();
-      asks.push({
+      asks[index] = {
         issueId: draft.issue.id,
         sourceId: draft.sourceId,
         deliveryUnknown: decision !== undefined && decision.result === null,
@@ -344,8 +345,12 @@ export class OwnerAsks {
         mirrorsLiveRequest: draft.request === "pending",
         extracted: Boolean(value),
         updatedAt: draft.issue.updatedAt,
-      });
-    }
+      };
+    });
+    // Completion order must not change stable source ordering; omit settled-source holes.
+    let visible = 0;
+    for (const ask of asks) if (ask) asks[visible++] = ask;
+    asks.length = visible;
     asks.sort((a, b) => Number(b.attention === "owner" && !b.disposition) - Number(a.attention === "owner" && !a.disposition) || b.updatedAt.localeCompare(a.updatedAt));
     return { asks, updatedAt: at, history: this.ledger.history(),
       coverage: this.deps.issues ? [] : ["Linear collection is limited to Needs input issues. The complete owner-decision issue reader is not configured."] };
@@ -354,10 +359,14 @@ export class OwnerAsks {
   // Bound temporary serialized timelines, extraction reads and filesystem reads together. Model
   // extraction keeps its separate, unchanged concurrency limit.
   // The byte cache belongs to this collection, not a source id shared with another snapshot.
-  private async *snapshotDrafts(drafts: Draft[], entryBytes: EntryBytes) {
+  private async snapshotDrafts(drafts: Draft[], entryBytes: EntryBytes, consume: (prepared: SnapshotDraft, index: number) => void): Promise<void> {
     const files = await this.extractionFiles();
-    for (let offset = 0; offset < drafts.length; offset += SNAPSHOT_READ_CONCURRENCY) {
-      const prepared = await Promise.all(drafts.slice(offset, offset + SNAPSHOT_READ_CONCURRENCY).map(async draft => {
+    let next = 0;
+    let failed = false;
+    const worker = async () => {
+      while (!failed && next < drafts.length) {
+        const index = next++;
+        const draft = drafts[index]!;
         const key = extractionKey(draft);
         const scope = sourceScope(draft);
         const input = extractionInput(draft);
@@ -377,10 +386,15 @@ export class OwnerAsks {
           this.enqueue({ issueId: key, hash, input });
         }
         const value = state.value;
-        return { draft, scope, value, derived: deriveAsk(draft, value, parts, scope) };
-      }));
-      yield* prepared;
-    }
+        consume({ draft, scope, value, derived: deriveAsk(draft, value, parts, scope) }, index);
+      }
+    };
+    // Refill individual slots: a sparse slow disk read must not idle the other fifteen slots.
+    const workers = Array.from({ length: Math.min(SNAPSHOT_READ_CONCURRENCY, drafts.length) }, () =>
+      worker().catch(error => { failed = true; throw error; }));
+    const settled = await Promise.allSettled(workers);
+    const failure = settled.find(result => result.status === "rejected");
+    if (failure) throw failure.reason;
   }
 
   async answer(input: AnswerAskInput, paseo: PaseoApi | null): Promise<AnswerAskResult> {

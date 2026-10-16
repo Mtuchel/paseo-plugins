@@ -4817,8 +4817,8 @@ manual work—not just "Needs input"—are read with the owner's credential. Iss
 paginated to completion. An issue's comments are read to completion when it joins that inventory;
 after that the plugin keeps them in memory and each collection reads only the comments created or
 edited since the previous one (`updatedAt`, with five minutes' overlap), one request for up to 500
-issues. Every 30 minutes, and after a reload, every history is read again, which drops deleted
-comments; an answer reads its own issue's whole history. Re-reading every history on each
+issues. Every 30 minutes every history is read again, which drops deleted comments; a reload
+resumes an unexpired complete store. An answer reads its own issue's whole history. Re-reading every history on each
 collection took 74 requests on server087 (568 open issues, 13,363 comments on 2026-10-16), about
 1,300 an hour, and made owner asks the largest Linear caller on both pools.
 Failed or incomplete collection is reported as
@@ -4841,6 +4841,12 @@ next collection reads changes with the same overlap rather than fetching every h
 Expired, missing or invalid stores require a full read; deletions remain bounded by that window.
 Failed persistence is retried even when the history has not changed. Explicit owner actions
 still fetch current source history and strict registration authority rather than trusting this cache.
+Full-history reads use at most four independent issue batches at once, with each batch's cursor
+walk kept serial. The request count, per-request size, rate-budget checks and completeness checks
+are unchanged. A failure drains active reads and refuses the inventory; it never persists partial
+history. Source preparation refills sixteen individual read slots rather than waiting for a whole
+batch behind one slow file. Snapshot source order and source/revision/attention calculations stay
+unchanged. This bounds work without increasing the RPC timeout or serving cached authority.
 
 **Asks that repeat a live question.** A ticket whose wait was opened by a permission request (the
 agent's question or approval, wait kind `request`) and that has a live root agent on this host
