@@ -4300,6 +4300,10 @@ Candidates live in `$PASEO_HOME/linear-tickets/deputy/candidates.json` (director
    completion/engineering/access/models policy citation for that part, not a boundaries passage
    alone. A safe offered investigation can win over a risky production mutation or recommended
    pause. An owner-labelled “I run/provide” option cannot be reinterpreted as agent execution.
+   Each action must also declare primitive `actor: "agent"`; owner/external/mixed execution
+   refuses, and missing/unknown/malformed actors require investigation. A human audit handoff
+   is not autonomous merely because an agent heartbeat waits afterward. Ordinary attribution
+   to an already authorized tool account is distinct from forging a personal owner approval.
    When there is no safe exact offered choice, the deputy transparently abstains; there is no
    checked corrective-guidance/reframing side channel in this implementation. No coverage quota
    can fabricate a selection or missing business fact.
@@ -4309,6 +4313,9 @@ Candidates live in `$PASEO_HOME/linear-tickets/deputy/candidates.json` (director
    Specifically approved consequential workflow changes require `specific` authority, so they
    cannot use the standing-only activation shortcut. Missing/unknown outcome scope abstains;
    a new unapproved workflow choice remains an owner boundary.
+   This includes the eventual effects of referenced PRs/stacks bundled with a technical retry,
+   publish or enqueue. A PR number, green check or unchanged patch is not evidence of authorized
+   scope. Known authorized technical delivery remains delegated through its required gates.
    V3 additionally requires `integrity.preservation`, `.ownerArtifacts`, `.acceptance` and `.gates`
    for **each** selected part. Each includes a reason and primitive string state: `not-implicated` (no affected
    requirement/material prerequisite), `satisfied`, `unknown` or `violated`. Missing, unknown or
@@ -4320,6 +4327,10 @@ Candidates live in `$PASEO_HOME/linear-tickets/deputy/candidates.json` (director
    or a gate exception. These are checked source
    bindings, not a claim that JSON assertions mechanically prove their semantic truth; isolated
    evaluator review and current-policy boundary replay remain required.
+   Preservation also covers shared non-Git artifacts: “unused” does not establish ownership or
+   recoverability. Conditional factual reporting may proceed after collecting the required
+   evidence; that authorization neither invents present measurements nor claims acceptance.
+   Citations must name supplied source IDs, never synthetic `QUESTION` or context identifiers.
 
 The evaluator has no tools, MCP servers, extensions, skills, rules, memory or saved session. It
 runs from an empty directory with private isolated configuration and the owner's `auth:` broker
@@ -4327,7 +4338,7 @@ block, without Paseo, Linear or GitHub credentials in its environment. A tool ev
 unreadable/oversized answer, abstention or failed check refuses the whole request. Citations
 retain source ID, revision and quote.
 
-Evidence is versioned as `deputy-7-integrity/owner-autonomy-2026-10-15-v3/<model>/high`.
+Evidence is versioned as `deputy-8-executable-actions/owner-autonomy-2026-10-15-v3/<model>/high`.
 Old-policy predictions never satisfy current empirical readiness. On restart, an old-version
 refusal/prediction is reevaluated only after the exact unanswered request is freshly verified;
 old selections, citations, intent and grace are discarded. An equivalent new request ID retires

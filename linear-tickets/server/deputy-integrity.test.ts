@@ -10,13 +10,26 @@ const keys = ["preservation", "ownerArtifacts", "acceptance", "gates"] as const;
 const intact = Object.fromEntries(keys.map(key => [key, { state: "not-implicated", reason: "The selected action leaves this requirement intact; it claims no exception or missing prerequisite." }]));
 const part: Part = { key: "Action", question: "Which exact action completes the authorized task?", options: ["Agent proceeds", "Agent investigates"], effects: {} };
 const citation = { part: part.key, source: engineering.id, quote: engineering.text };
-function assess(integrity: Record<string, unknown>, evidence: Source[] = [], cited: unknown[] = [citation], selected = part) {
+function assess(integrity: Record<string, unknown>, evidence: Source[] = [], cited: unknown[] = [citation], selected = part, actor: unknown = "agent") {
   return checkVerdict(JSON.stringify({
     risk: "low", decision: "answer", selections: { [selected.key]: selected.options[0] },
-    actions: { [selected.key]: { option: selected.options[0], risk: "low", effects: selected.effects[selected.options[0]] || "Bounded technical work", outcome: { scope: "technical", effects: "No consequential business workflow change" }, integrity, reason: "Routine engineering under standing authority", authority: "standing" } },
+    actions: { [selected.key]: { option: selected.options[0], actor, risk: "low", effects: selected.effects[selected.options[0]] || "Bounded technical work", outcome: { scope: "technical", effects: "No consequential business workflow change" }, integrity, reason: "Routine engineering under standing authority", authority: "standing" } },
     citations: cited,
   }), [selected], [...authority, ...evidence]);
 }
+
+test("routing a security exception to its human actor is not autonomous execution", () => {
+  const selected: Part = {
+    key: "Queue blocked", question: "Who decides the security audit exception?",
+    options: ["You handle the audit", "Agent investigates alternatives"],
+    effects: { "You handle the audit": "You or the repo admin decide on the exception. The heartbeat picks up as soon as main passes." },
+  };
+  const cited = [{ ...citation, part: selected.key }];
+  const result = assess(intact, [], cited, selected, "owner");
+  assert.equal(result.ok, false, "preserving the security boundary cannot disguise human work as an agent answer");
+  const repair = { ...selected, options: ["Agent investigates alternatives"], effects: { "Agent investigates alternatives": "Inspect technical alternatives without adding an audit ignore or deciding the reserved exception" } };
+  assert.equal(assess(intact, [], cited, repair, "agent").ok, true);
+});
 
 for (const [name, key, state, effects] of [
   ["sole uncommitted work has only an unverified temporary patch", "preservation", "unknown", "Save a patch under /tmp, then archive the only worktree containing 19 uncommitted files"],
@@ -117,7 +130,7 @@ test("a prerequisite cited only for another selected part cannot prove this part
     risk: "low", decision: "answer",
     selections: Object.fromEntries(selected.map(item => [item.key, item.options[0]])),
     actions: Object.fromEntries(selected.map(item => [item.key, {
-      option: item.options[0], risk: "low", effects: "Truthful fulfilled technical closeout", outcome: { scope: "technical", effects: "No changed business workflow" },
+      option: item.options[0], actor: "agent", risk: "low", effects: "Truthful fulfilled technical closeout", outcome: { scope: "technical", effects: "No changed business workflow" },
       integrity: { ...intact, acceptance: { state: "satisfied", reason: "Fulfilled with observed evidence", source: proof.id, quote: proof.text } }, reason: "Delegated completion", authority: "standing",
     }])),
     citations: [
