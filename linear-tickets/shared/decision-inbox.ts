@@ -6,6 +6,13 @@ export const browserOwnerAskSchema = ownerAskSchema.extend({
   deliveryUnknown: z.boolean().optional(),
 });
 export type BrowserOwnerAsk = z.infer<typeof browserOwnerAskSchema>;
+// A source only needs nonurgent reading: nothing is answered, researched, delegated or deferred,
+// and its delivery is not unknown. The feeds carry a count of these instead of the sources
+// themselves; the canonical host pages them out on demand (server/decision-inbox.ts), so no
+// source is ever dropped from the inbox.
+export function isSourceReview(ask: BrowserOwnerAsk): boolean {
+  return ask.attention === "info" && !ask.deliveryUnknown && !ask.disposition && !ask.deferredUntil;
+}
 export const liveQuestionSchema = askQuestionSchema.extend({ allowEmpty: z.boolean().default(false) });
 export const liveDecisionSchema = z.object({
   agentId: z.string().min(1), requestId: z.string().min(1), revision: z.string().min(1),
@@ -44,10 +51,28 @@ export type StewardFlow = z.infer<typeof stewardFlowSchema>;
 export const decisionHostSchema = z.object({
   host: z.string(), asks: z.array(browserOwnerAskSchema), live: z.array(liveDecisionSchema),
   backendInstanceId: z.string().uuid().optional(),
+  // How many of this host's canonical owner sources are withheld from `asks` as source reviews
+  // (isSourceReview). Optional: a peer from before the split answers without it, and a host
+  // without an owner snapshot yet has nothing to count.
+  sourceReviews: z.number().int().nonnegative().optional(),
   history: z.array(decisionReceiptSchema), updatedAt: z.string(), error: z.string().nullable(),
   flow: stewardFlowSchema.nullable().default(null),
 });
 export type DecisionHost = z.infer<typeof decisionHostSchema>;
+// One page of withheld source reviews (server/decision-inbox.ts): `total` counts every review
+// matching the query, `asks` is the bounded `offset`-long slice. Paging keeps one answer far below
+// the frontdoor's 16 MiB cap that shipping every source exceeded.
+export const SOURCE_REVIEW_PAGE_LIMIT = 50;
+export const SOURCE_REVIEW_PAGE_MAX = 100;
+export const sourceReviewPageSchema = z.object({
+  host: z.string().min(1),
+  backendInstanceId: z.string().uuid().optional(),
+  updatedAt: z.string(),
+  total: z.number().int().nonnegative(),
+  offset: z.number().int().nonnegative(),
+  asks: z.array(browserOwnerAskSchema),
+});
+export type SourceReviewPage = z.infer<typeof sourceReviewPageSchema>;
 export type CuratedDecision = {
   host: string;
   target: "owner" | "live";

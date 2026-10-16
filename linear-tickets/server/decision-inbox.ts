@@ -6,7 +6,7 @@ import type { PaseoApi } from "@getpaseo/client";
 import type { AgentPermissionRequest, AgentPermissionResponse } from "@getpaseo/protocol/agent-types";
 import { z } from "zod";
 import { askQuestionSchema, decisionReceiptSchema, type DecisionReceipt } from "../shared/contracts";
-import { browserOwnerAskSchema, decisionHostSchema, liveDecisionSchema, type BrowserDecisionAction, type DecisionHost, type DecisionView, type LiveDecision, type StewardFlow } from "../shared/decision-inbox";
+import { browserOwnerAskSchema, decisionHostSchema, isSourceReview, liveDecisionSchema, SOURCE_REVIEW_PAGE_LIMIT, SOURCE_REVIEW_PAGE_MAX, sourceReviewPageSchema, type BrowserDecisionAction, type DecisionHost, type DecisionView, type LiveDecision, type StewardFlow } from "../shared/decision-inbox";
 import type { ActivationRoute } from "./activation";
 import { decisionPage } from "./decision-page";
 import type { OwnerAsks, OwnerAskSnapshot } from "./owner-asks";
@@ -64,12 +64,17 @@ const actionSchema = z.object({
 });
 // Reject unknown peer fields at every object boundary instead of silently stripping a malformed response.
 const peerQuestionSchema = askQuestionSchema.extend({ options: z.array(askQuestionSchema.shape.options.element.strict()) }).strict();
+// The strict ask shape both peer answers carry: one host snapshot and one paged source review.
+const peerAskSchema = browserOwnerAskSchema.extend({ questions: z.array(peerQuestionSchema) }).strict();
 const peerSchema = decisionHostSchema.extend({
   host: z.string().min(1), updatedAt: z.string().datetime({ offset: true }),
-  asks: z.array(browserOwnerAskSchema.extend({ questions: z.array(peerQuestionSchema) }).strict()),
+  asks: z.array(peerAskSchema),
   live: z.array(liveDecisionSchema.extend({ questions: z.array(liveDecisionSchema.shape.questions.element.extend({ options: z.array(askQuestionSchema.shape.options.element.strict()) }).strict()), actions: z.array(liveDecisionSchema.shape.actions.element.strict()) }).strict()),
   history: z.array(decisionReceiptSchema.strict()),
 }).strict();
+// A paged source review read (shared/decision-inbox.ts): strict at the page boundary too, so an
+// extended or malformed page from the canonical host is refused rather than half-shown.
+const peerReviewPageSchema = sourceReviewPageSchema.extend({ asks: z.array(peerAskSchema) }).strict();
 const actionResultSchema = z.object({ delivered: z.string(), message: z.string() }).strict();
 const errorSchema = z.object({ error: z.string(), outcomeUnknown: z.boolean().optional() }).strict();
 const deferralSchema = z.object({ agentId: z.string(), requestId: z.string(), revision: z.string(), until: z.string().datetime() }).strict();
@@ -119,6 +124,22 @@ function triageText(action: "research" | "delegate", note: string): string {
     ? `Research only: gather evidence for this question and report findings. Do not implement, approve, accept a recommendation, change policy or close the owner task.\nOwner instruction: ${note}`
     : `Delegate only reversible technical implementation within the already approved scope below. Do not decide business policy, permissions, spending, destructive or production actions; do not override repository rules, accept recommendations or close the owner task. Stop and ask if the scope needs additional authority.\nOwner scope: ${note}`;
 }
+// The bounds of one source review page (shared/decision-inbox.ts). A page stays small on purpose:
+// a value that is not exactly an in-range whole number is the client's error, never a silently
+// clamped default or a widened feed.
+function reviewPaging(search: string): { offset: number; limit: number; q: string } {
+  const params = new URLSearchParams(search);
+  const bound = (name: string, fallback: number, min: number, max: number): number => {
+    const raw = params.get(name);
+    if (raw === null) return fallback;
+    const value = /^\d+$/.test(raw) ? Number(raw) : Number.NaN;
+    if (!Number.isSafeInteger(value) || value < min || value > max) throw new InboxError(400, `Invalid ${name}: use a whole number from ${min} to ${max}.`);
+    return value;
+  };
+  const q = params.get("q") ?? "";
+  if (q.length > 200) throw new InboxError(400, "The source review search is longer than 200 characters.");
+  return { offset: bound("offset", 0, 0, Number.MAX_SAFE_INTEGER), limit: bound("limit", SOURCE_REVIEW_PAGE_LIMIT, 1, SOURCE_REVIEW_PAGE_MAX), q };
+}
 
 export class BrowserDecisionInbox {
   private readonly host: string;
@@ -155,8 +176,9 @@ export class BrowserDecisionInbox {
     return this.curation.refresh();
   }
 
-  readonly route: ActivationRoute = async ({ method, path, headers, body }) => {
-    if (path !== "/decisions" && path !== "/api/decisions" && path !== "/api/decisions/local" && path !== "/api/decisions/action") return null;
+  readonly route: ActivationRoute = async ({ method, path, search, headers, body }) => {
+    if (path !== "/decisions" && path !== "/api/decisions" && path !== "/api/decisions/local" && path !== "/api/decisions/action"
+      && path !== "/api/decisions/reviews" && path !== "/api/decisions/reviews/local") return null;
     try {
       if (path === "/api/decisions/action") {
         if (method !== "POST") return json(405, { error: "Use POST for a decision action." });
@@ -185,6 +207,7 @@ export class BrowserDecisionInbox {
       }
       if (method !== "GET") return json(405, { error: "Use GET for the decision inbox." });
       if (path === "/api/decisions/local") return json(200, await this.local());
+      if (path === "/api/decisions/reviews" || path === "/api/decisions/reviews/local") return await this.reviewPage(path === "/api/decisions/reviews/local", search ?? "");
       const view = await this.view();
       if (path === "/api/decisions") return json(200, view);
       return { status: 200, headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" }, body: decisionPage(view) };
@@ -275,14 +298,53 @@ export class BrowserDecisionInbox {
     }));
     // Never hide every ask on a ticket because one agent's request disappeared. OwnerAsks
     // resolves the exact wait-comment source; curation deduplicates only source identities.
-    const asks = owner?.snapshot.asks ?? [];
-    return { host: this.host, asks, live,
+    // Nonurgent source reviews are not actionable: the feeds carry them as a count and the page
+    // reads them in pages (reviewPage), never as part of `asks`.
+    const ownerAsks = owner?.snapshot.asks ?? [];
+    const asks = ownerAsks.filter((ask) => !isSourceReview(ask));
+    return { host: this.host, asks, ...(owner ? { sourceReviews: ownerAsks.length - asks.length } : {}), live,
       backendInstanceId: this.deps.backendInstanceId?.(),
       history: [...owner?.snapshot.history ?? [], ...receipts, ...deferrals.history].sort((a, b) => b.at.localeCompare(a.at)).slice(0, 100),
       updatedAt: owner?.snapshot.updatedAt ?? new Date(this.now()).toISOString(), error: errors.length ? errors.join("\n") : null,
       // The steward's flow summary (README, "Ticket steward"). Its failure is a page warning, not
       // an inbox error: the decisions below are still answerable.
       flow: await this.readFlow(errors) };
+  }
+
+  // One page of the canonical host's withheld source reviews (shared/decision-inbox.ts): the
+  // local route serves this host's own owner cache, and every other host proxies the same read to
+  // the canonical host, so a page always lists the canonical owner's sources and never reads
+  // local Linear. Source order, bounded slice: the whole withheld feed is what broke the peers.
+  private async reviewPage(locallyServed: boolean, search: string) {
+    const { offset, limit, q } = reviewPaging(search);
+    const canonicalPeer = await this.deps.canonicalPeer();
+    if (canonicalPeer === null) {
+      // The collection that owns these sources may still be running. An empty page would read as
+      // "no source reviews" and hide every one of them, so a missing collection says so instead
+      // and lets the background collection land.
+      void this.ownerSnapshot();
+      const owner = this.ownerCache;
+      if (!owner) throw new InboxError(503, "Owner asks are being collected; source reviews are not available yet.");
+      const terms = q.toLowerCase().split(/\s+/).filter((term) => term.length > 0);
+      // A term must occur in the row the page renders; searching the JSON of the whole row is the
+      // matcher the page uses, so paged results and the page's own filter agree.
+      const rows = owner.snapshot.asks.filter((ask) => isSourceReview(ask) && terms.every((term) => JSON.stringify([this.host, ask]).toLowerCase().includes(term)));
+      const backendInstanceId = this.deps.backendInstanceId?.();
+      return json(200, { host: this.host, ...(backendInstanceId ? { backendInstanceId } : {}), updatedAt: owner.snapshot.updatedAt, total: rows.length, offset, asks: rows.slice(offset, offset + limit) });
+    }
+    if (locallyServed) throw new InboxError(404, "Only the canonical host serves its own source review pages; the canonical host's are read through /api/decisions/reviews.");
+    const peer = peerOrigin(canonicalPeer);
+    // The forwarded query is rebuilt from the validated values: the canonical host sees exactly
+    // the page this host admitted and nothing else the caller sent.
+    const params = new URLSearchParams({ offset: String(offset), limit: String(limit) });
+    if (q) params.set("q", q);
+    return json(200, await deadline(async () => {
+      const response = await fetch(`${peer}/api/decisions/reviews/local?${params}`, { signal: AbortSignal.timeout(READ_TIMEOUT_MS), redirect: "error", headers: { accept: "application/json" } });
+      if (!response.ok) throw new Error(`Source reviews unavailable from ${peer}: HTTP ${response.status}`);
+      const parsed = peerReviewPageSchema.safeParse(await response.json());
+      if (!parsed.success) throw new Error(`The canonical host ${peer} returned an invalid source review page.`);
+      return parsed.data;
+    }, READ_TIMEOUT_MS));
   }
 
   // The steward's flow for the page's Flow section; its failure is named there.
@@ -393,6 +455,9 @@ export class BrowserDecisionInbox {
       const canonical = canonicalOrigin !== null && source.peer === canonicalOrigin;
       if (canonical) canonicalHost = source.snapshot.host;
       hosts.push({ ...source.snapshot, asks: canonical ? source.snapshot.asks : [],
+        // The count, like the asks it counts, belongs to the canonical owner's inbox only: a
+        // non-canonical peer's reviews are not this page's to summarize.
+        sourceReviews: canonical ? source.snapshot.sourceReviews : undefined,
         history: canonical ? source.snapshot.history : source.snapshot.history.filter((receipt) => receipt.id.startsWith(PREFIX)) });
     }
     if (canonicalPeer !== null && canonicalHost === null) {

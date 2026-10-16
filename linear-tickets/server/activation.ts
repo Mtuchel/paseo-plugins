@@ -186,7 +186,10 @@ export function activationJson(status: number, value: unknown): ActivationResult
 
 // The tailnet review service (review-links.ts) hands every /activation* request to these routes,
 // which authenticate it themselves (activation-endpoints.ts). Null: not an activation route.
-export type ActivationRouteRequest = { method: string; path: string; headers: IncomingHttpHeaders; body: string };
+// `search` is the request line's raw query ("?…", "" when it carries none): the browser routes
+// that page their own answers need it (decision-inbox.ts source review pages), every other route
+// ignores it.
+export type ActivationRouteRequest = { method: string; path: string; headers: IncomingHttpHeaders; body: string; search?: string };
 export type ActivationRouteResult = { status: number; headers?: Record<string, string>; body: string };
 export type ActivationRoute = (request: ActivationRouteRequest) => Promise<ActivationRouteResult | null>;
 

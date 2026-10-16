@@ -549,7 +549,8 @@ export class ReviewLinks {
   }
 
   private async respond(method: string, url: string, headers: IncomingHttpHeaders, body: string): Promise<{ status: number; headers?: Record<string, string>; body?: string | Buffer }> {
-    const path = new URL(url, "http://localhost").pathname;
+    const requestUrl = new URL(url, "http://localhost");
+    const path = requestUrl.pathname;
     const action = /^\/api\/reviews\/([^/]+)\/(decision|recheck|delete|resolve)$/.exec(path);
     // The private frontdoor seam (inbox-backend.ts) answers first: /_inbox/* only, and it holds
     // the instance epoch and the draining state of this checked backend.
@@ -567,7 +568,7 @@ export class ReviewLinks {
     // Draining a host: /activation* goes to the authenticated activation protocol, which answers
     // 401 for a request without the shared secret (and null for every other path).
     if (this.routes) {
-      const custom = await this.routes({ method, path, headers, body });
+      const custom = await this.routes({ method, path, headers, body, search: requestUrl.search });
       if (custom) return custom;
     }
     if (action || path === "/api/push/subscribe") {
