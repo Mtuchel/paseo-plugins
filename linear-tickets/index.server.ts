@@ -47,7 +47,7 @@ import { PullRequestBoard } from "./server/pull-requests";
 import { ManualTasks } from "./server/manual-tasks";
 import { Handover } from "./server/handover";
 import { closeAnswered, NeedsYouIssues } from "./server/needs-you";
-import { OWNER_ASK_DIRECTORY, OwnerAsks } from "./server/owner-asks";
+import { OWNER_ASK_DIRECTORY, OwnerAsks, ownerAsksPage } from "./server/owner-asks";
 import { QueuedLabels } from "./server/queued-labels";
 import { extractWithOmp } from "./server/owner-ask-extract";
 import { daemonServerId, decidePlannotatorReview, paseoAgentUrl, SessionRouter, SessionStore, setAgentLabel, setAgentMode, stopAgentTurn, type HostOwnership } from "./server/sessions";
@@ -659,7 +659,7 @@ export default function contribute(server: PluginServerContext) {
   server.handle(labelPullsRpc, ({ repository, label, numbers }) => pullBoard.label(repository, label, numbers));
   // The owner's asks (README, "Owner asks"): read from cache at once (never waiting for the
   // model), answered through the same paths an "@paseo" reply takes.
-  server.handle(ownerAsksRpc, async (_input, { paseo }) => { attach(paseo); return ownerAsks.snapshot(paseo); });
+  server.handle(ownerAsksRpc, async (_input, { paseo }) => { attach(paseo); return ownerAsksPage(await ownerAsks.snapshot(paseo)); });
   server.handle(answerAskRpc, async (input, { paseo }) => { attach(paseo); return asCaller("owner-asks", () => ownerAsks.answer(input, paseo)); });
   server.handle(triageAskRpc, async (input, { paseo }) => { attach(paseo); return asCaller("owner-asks", () => ownerAsks.triage(input, paseo)); });
   server.handle(connectRpc, ({ apiKey }) => asCaller("sidebar", () => linear.authenticate(apiKey)));

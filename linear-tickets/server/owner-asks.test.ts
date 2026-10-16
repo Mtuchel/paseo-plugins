@@ -6,9 +6,9 @@ import test from "node:test";
 import type { PaseoApi } from "@getpaseo/client";
 import type { HandoverRecord } from "./handover";
 import type { OwnerAskComment, OwnerAskIssue } from "./linear";
-import { answerText, askRoute, deliveryText, extractionInputParts, OwnerAsks, selectAskSources, type AnswerAskInput, type ContinueOutcome, type OwnerAsksDeps } from "./owner-asks";
+import { answerText, askRoute, deliveryText, extractionInputParts, OwnerAsks, ownerAsksPage, selectAskSources, type AnswerAskInput, type ContinueOutcome, type OwnerAsksDeps } from "./owner-asks";
 import { answerAskRpc, ownerAsksRpc, triageAskRpc, type OwnerAsk } from "../shared/contracts";
-import type { BrowserOwnerAsk } from "../shared/decision-inbox";
+import { isSourceReview, type BrowserOwnerAsk } from "../shared/decision-inbox";
 import { checkExtraction, type ExtractInput, type Extraction } from "./owner-ask-extract";
 import { askContext, askTimeline, type AskContext, type AskSource } from "./owner-ask-admission";
 import { PermissionReplies, type DeliveryOrigin, type DeliveryResult } from "./permission-replies";
@@ -871,8 +871,9 @@ test("all-status snapshot separates historical discovery from source-evidenced o
   assert.equal(snapshot.asks.find(ask => ask.sourceId === "unknown")!.attention, "info");
   assert.deepEqual(snapshot.history, []);
   assert.deepEqual(h.events, []);
-  const validated = ownerAsksRpc.output.parse(snapshot);
-  assert.deepEqual(validated.asks.map(ask => ask.sourceId), snapshot.asks.map(ask => ask.sourceId), "validated RPC retains per-source identity");
+  const validated = ownerAsksRpc.output.parse(ownerAsksPage(snapshot));
+  assert.deepEqual(validated.asks.map(ask => ask.sourceId), snapshot.asks.filter(ask => !isSourceReview(ask)).map(ask => ask.sourceId), "validated RPC retains per-source identity");
+  assert.equal(validated.sourceReviews, snapshot.asks.filter(isSourceReview).length);
   const business = validated.asks.find(ask => ask.sourceId === "business")!;
   const mismatched = answerAskRpc.input.parse({ issueId: "i1", sourceId: "identity", revision: business.revision, answers: { q1: "50" } });
   await assert.rejects(h.ownerAsks.answer(mismatched, null), /changed|source/i);
@@ -947,11 +948,13 @@ test("captured TUC-835 report excerpt with a query-string URL remains nonurgent 
     comments: new Map([["i1", [comment("072c92ff-8f17-428f-a1e0-dd7797fed533", source)]]]),
     extraction: async () => ({ ok: false, reason: "offline historical extraction" }) });
   t.after(() => h.ownerAsks.stop());
-  const snapshot = ownerAsksRpc.output.parse(await h.ownerAsks.snapshot(null));
+  const snapshot = await h.ownerAsks.snapshot(null);
   assert.deepEqual(snapshot.asks.map(ask => ({ sourceId: ask.sourceId, attention: ask.attention, extracted: ask.extracted })),
     [{ sourceId: "072c92ff-8f17-428f-a1e0-dd7797fed533", attention: "info", extracted: false }]);
   assert.match(snapshot.asks[0].attentionReason, /review/);
   assert.deepEqual(snapshot.history, []);
+  // The menu bar's page counts the review instead of listing it as an owner decision.
+  assert.deepEqual(ownerAsksRpc.output.parse(ownerAsksPage(snapshot)), { asks: [], updatedAt: snapshot.updatedAt, history: [], sourceReviews: 1 });
   assert.deepEqual(h.events, []);
 });
 

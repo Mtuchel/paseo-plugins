@@ -728,10 +728,12 @@ export const decisionReceiptSchema = z.object({
 });
 export type DecisionReceipt = z.infer<typeof decisionReceiptSchema>;
 
+// `asks` leaves out nonurgent source reviews (shared/decision-inbox.ts isSourceReview);
+// `sourceReviews` counts them (server/owner-asks.ts ownerAsksPage).
 export const ownerAsksRpc = defineRpc({
   name: "linear.owner-asks",
   input: z.object({}),
-  output: z.object({ asks: z.array(ownerAskSchema), updatedAt: z.string(), history: z.array(decisionReceiptSchema).max(100) }),
+  output: z.object({ asks: z.array(ownerAskSchema), updatedAt: z.string(), history: z.array(decisionReceiptSchema).max(100), sourceReviews: z.number().int().nonnegative() }),
 });
 
 export const answerAskRpc = defineRpc({

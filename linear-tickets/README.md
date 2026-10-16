@@ -4848,7 +4848,11 @@ triage and actual answers are shared with the menu bar, which remains available 
 The browser and Paseo Agents menu bar present a decision inbox, not an undifferentiated list of every ticket in
 Linear's "Needs input" state. `linear.owner-asks` reads owner decisions, other waits and recent
 decision receipts; `linear.answer-ask` answers an exact revision of one ask. Reading does not answer,
-approve, complete or reassign anything in Linear.
+approve, complete or reassign anything in Linear. Like the browser feed, `linear.owner-asks`
+withholds nonurgent source reviews (`attention: info`, no disposition, delivery known) and returns
+only their count as `sourceReviews`; the browser's paged review list reads them. Shipping every
+review made the page 28 MB on server087 (14,073 of 14,213 sources, 2026-10-16) and pushed the read
+past the menu bar's 30-second deadline.
 
 **What is read.** All open issues assigned to the owner, including normal issue decisions and
 manual work—not just "Needs input"—are read with the owner's credential. Issue pages are
