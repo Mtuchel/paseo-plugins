@@ -27,6 +27,12 @@ const CLIENT = String.raw`
   // browsed, searched and answered like any owner ask. reviewQuery is the query the loaded
   // pages answer; reviewOffset is how many server sources those pages have consumed.
   let pagedRows = [], reviewTotal = null, reviewOffset = 0, reviewQuery = null, reviewLoading = false, reviewError = '', reviewErrorAppend = false, reviewGeneration = 0, reviewTimer = 0, reviewSource = null;
+  // Recovery evidence beyond what the feed references is read from the owning host when its
+  // section is first opened, one host at a time. A loaded list answers one pass with one ticket
+  // total (flowSignature), so a routine 30-second refresh keeps it and a new pass or total drops
+  // it; flowOpen is what a rewrite of the coverage element has to restore.
+  const flowTickets = new Map(), flowSource = new Map(), flowFailures = new Map();
+  const flowLoading = new Set(), flowOpen = new Set();
   const queue = document.getElementById('queue-list');
   const pane = document.getElementById('detail-content');
   const shell = document.querySelector('.shell');
@@ -89,6 +95,36 @@ const CLIENT = String.raw`
   // Which owner collection the withheld sources come from. The owner sources change only when the
   // canonical host recollects, so a routine 30-second refresh keeps the pages already loaded.
   const withheldSource = () => view.hosts.filter(host => (host.sourceReviews || 0) > 0).map(host => host.host + '@' + host.updatedAt + '#' + host.sourceReviews).join(' ');
+  // Which steward pass and ticket total a loaded recovery list answers. The feed ships only the
+  // tickets its decisions reference plus the steward's total, so a list is complete exactly when
+  // it holds every ticket the summary counts.
+  const flowTotal = data => typeof data.ticketCount === 'number' ? data.ticketCount : (data.tickets || []).length;
+  const flowSignature = data => String(data.at) + '#' + flowTotal(data);
+  const flowLoaded = host => flowSource.get(host.host) === flowSignature(host.flow) ? flowTickets.get(host.host) || [] : (host.flow.tickets || []);
+  const flowNeedsMore = host => flowTotal(host.flow) > flowLoaded(host).length;
+  async function loadFlow(hostName) {
+    const host = view.hosts.find(item => item.host === hostName);
+    // One read per host: the feed may already carry every ticket, and a request in flight serves
+    // every further open.
+    if (!host || !host.flow || flowLoading.has(hostName) || !flowNeedsMore(host)) return;
+    const signature = flowSignature(host.flow);
+    flowLoading.add(hostName);
+    flowFailures.delete(hostName);
+    renderQueue();
+    try {
+      const response = await fetch('/api/decisions/flow?host=' + encodeURIComponent(hostName), {cache:'no-store', headers:{accept:'application/json'}});
+      const page = await response.json();
+      if (!response.ok) throw new Error(page && typeof page.error === 'string' ? page.error : 'Recovery evidence load failed (' + response.status + ').');
+      if (!page || page.host !== hostName || !Array.isArray(page.tickets)) throw new Error('The recovery ticket list is unavailable.');
+      flowTickets.set(hostName, page.tickets);
+      flowSource.set(hostName, signature);
+    } catch (error) {
+      flowFailures.set(hostName, error instanceof Error ? error.message : 'Recovery evidence load failed.');
+    } finally {
+      flowLoading.delete(hostName);
+      renderQueue();
+    }
+  }
   // One page per request, always offset 0 for a reload. The generation discards a response that a
   // newer request superseded; a discarded response changes nothing, so the rows, the total and
   // the error always describe the same query.
@@ -216,10 +252,26 @@ const CLIENT = String.raw`
         (control ? '<p>Recovery control: ' + (control.passStartedAt ? 'pass started ' + escape(date(control.passStartedAt)) : 'no pass in flight') +
           ' · overdue ' + escape(Math.round(control.overduePassMs / 1000)) + 's · maximum unattended ' + escape(Math.round(control.maxUnattendedMs / 1000)) + 's.</p>' +
           '<p>Outcomes: ' + Object.entries(control.recoveryOutcomes).map(([outcome, count]) => escape(outcome) + ' ' + escape(count)).join(' · ') + '</p>' : '') +
-        (data.tickets?.length ? '<details><summary>Recovery evidence · ' + data.tickets.length + ' tickets</summary>' +
-          data.tickets.map(ticket => '<section class="section"><h3>' + escape(ticket.identifier) + '</h3>' + recoveryContext(ticket) + '</section>').join('') + '</details>' : '') +
+        (flowTotal(data) ? recoveryEvidence(host) : '') +
         '</section>';
     }).join('');
+  }
+  // Recovery evidence: the feed carries the referenced tickets and the steward's total, and the
+  // rest of the list is read from the owning host the first time the section is opened. The count
+  // is always the host's own total, so a partial list never reads as the whole one.
+  function recoveryEvidence(host) {
+    const data = host.flow;
+    const total = flowTotal(data);
+    const tickets = flowLoaded(host);
+    const loading = flowLoading.has(host.host);
+    const failure = flowFailures.get(host.host);
+    return '<details' + (flowOpen.has(host.host) || loading || failure ? ' open' : '') + ' data-flow="' + escape(host.host) + '">' +
+      '<summary>Recovery evidence · ' + total + ' tickets' + (tickets.length < total ? ' · ' + tickets.length + ' loaded' : '') + '</summary>' +
+      tickets.map(ticket => '<section class="section"><h3>' + escape(ticket.identifier) + '</h3>' + recoveryContext(ticket) + '</section>').join('') +
+      (loading ? '<p class="empty" role="status">Loading the recovery evidence of this host…</p>'
+        : failure ? '<p class="empty">Recovery evidence unavailable: ' + escape(failure) + '</p><button type="button" data-retry-flow="' + escape(host.host) + '">Retry recovery evidence</button>'
+        : tickets.length < total ? '<p class="empty">The remaining tickets are read from their host when this section is open.</p>' : '') +
+      '</details>';
   }
   function coverage() {
     const warnings = [];
@@ -511,6 +563,16 @@ const CLIENT = String.raw`
     // Page 1 restarts at 0 only when the withheld set may have changed (a new owner collection), or
     // when the last page read failed; otherwise the loaded pages stay.
     if (replaced && (reviewError || reviewTotal === null || reviewSource !== withheldSource())) void loadReviews(false);
+    // A new steward pass or a different ticket total invalidates that host's loaded evidence the
+    // same way: a section that is open reads it again, a closed one reads on its next open.
+    if (replaced) for (const hostName of [...flowSource.keys()]) {
+      const host = view.hosts.find(item => item.host === hostName && item.flow);
+      if (host && flowSource.get(hostName) === flowSignature(host.flow)) continue;
+      flowSource.delete(hostName);
+      flowTickets.delete(hostName);
+      flowFailures.delete(hostName);
+      if (flowOpen.has(hostName)) void loadFlow(hostName);
+    }
     return replaced;
   }
   function baseAction(row, operation) {
@@ -597,6 +659,20 @@ const CLIENT = String.raw`
     if (!button || busy) return;
     const row = [...rows(), ...receipts()].find(item => key(item) === button.dataset.key);
     if (row) select(row);
+  });
+  // Recovery evidence is read from the owning host when its section is opened, never on a routine
+  // refresh: the toggle of a section (also fired for a section rendered open) and the retry of a
+  // failed read are the only triggers, and loadFlow itself ignores both when nothing is missing.
+  const coverageElement = document.getElementById('coverage');
+  coverageElement.addEventListener('toggle', event => {
+    const details = event.target.closest('details[data-flow]');
+    if (!details) return;
+    if (details.open) { flowOpen.add(details.dataset.flow); void loadFlow(details.dataset.flow); }
+    else flowOpen.delete(details.dataset.flow);
+  }, true);
+  coverageElement.addEventListener('click', event => {
+    const retry = event.target.closest('[data-retry-flow]');
+    if (retry) void loadFlow(retry.dataset.retryFlow);
   });
   pane.addEventListener('input', captureDraft);
   pane.addEventListener('change', captureDraft);

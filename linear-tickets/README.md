@@ -3097,7 +3097,9 @@ through the control lane; they do not become implementation roots.
 
 **Where to see it.** The flow summary — the counts per state, the oldest ticket of each state and
 the pass's health — is in the browser decision inbox page's **Flow** section
-(`https://<host>:8444/decisions`) and in the plugin's dispatch status RPC. Monitoring stays in
+(`https://<host>:8444/decisions`) and in the plugin's dispatch status RPC. The section's recovery
+evidence lists the tickets this host's feed referenced and reads the host's whole list once, on
+demand, when it is opened (`GET /api/decisions/flow`). Monitoring stays in
 that view and the durable local journal: no periodic parent status cards or unchanged-stall
 comments are published to Linear. Bounded recovery and one-time actionable owner escalations
 remain active; an unanswered escalation is not posted again.
@@ -4746,6 +4748,16 @@ Background canonical collection awaits the full owner scan before publishing. Lo
 HTTP reads never await that scan: they return the collected owner sources, or an explicit
 collection-pending warning, alongside current live questions. A slow or quota-paused Linear
 scan cannot make a reachable decision host disappear or block forwarding a live answer.
+This host's own snapshot is also served from an in-memory cache, so a peer's five-second read
+never pays for a cold scan: a snapshot younger than five seconds answers unchanged, one younger
+than two minutes answers immediately while its replacement is collected in the background (the
+retry two seconds later then finds that collection already done), and an older or superseded
+snapshot is collected before the read answers. The background collection finishes even when the
+caller that triggered it timed out, and an answer, a triage or an explicit refresh invalidates the
+entry and starts the post-action collection right away, so no read is ever answered with the
+pre-action snapshot. A collection begun under an older generation cannot repopulate the cache.
+When a Linear owner collection lands, the next read still answers from memory and starts the
+recollection that carries the new asks, so no read waits for it.
 Live questions and peer reachability have a separate thirty-second transport cache; they are
 not frozen for the fifteen-minute owner collection interval. Each peer refreshes independently:
 interactive reads return local decisions without waiting for a slow peer. Cold or expired peer
@@ -4777,10 +4789,21 @@ one page (`limit` 1–100, default 50; `q` all-terms search) with the matching `
 proxies it to the canonical host's `GET /api/decisions/reviews/local`, which only the canonical
 host serves; while its first collection runs it answers 503 rather than an empty list. Shipping
 every source in the feed (14k sources, 28 MB) exceeded the frontdoor's 16 MiB answer cap and the
-five-second peer read, so the whole canonical host disappeared. `POST /api/decisions/action`
-accepts an explicit owner-ask or live-request action and routes only to known hosts; paged source
-reviews use it unchanged. Like review mutations, it requires JSON, `x-review-action: 1`, and a
-matching browser Origin; cross-site requests are refused.
+five-second peer read, so the whole canonical host disappeared.
+The steward's `flow` follows the same split. A peer feed carries only the recovery tickets its own
+decisions reference — the identifiers curation joins a task's blocked work and waiting agent on
+(`asks[].ticketIdentifier`, `live[].identifier`) — plus `flow.ticketCount`, the steward's total, so
+a reader can see the list is partial. This host's own page (`GET /api/decisions` and
+`GET /api/decisions/local` on the owning host) keeps every ticket. The whole list stays readable on
+demand: `GET /api/decisions/flow?host=<host>` returns this host's full recovery tickets as
+`{ host, tickets }` when the name is this host and otherwise proxies
+`GET /api/decisions/flow/local` on the one configured peer whose current snapshot calls itself that
+host, under the same five-second deadline, with an unknown or doubled name answered 404 and an
+unreachable or malformed list 503. The host name is resolved against configured origins and current
+peer snapshots; a URL from a payload is never fetched.
+`POST /api/decisions/action` accepts an explicit owner-ask or live-request action and routes only
+to known hosts; paged source reviews use it unchanged. Like review mutations, it requires JSON,
+`x-review-action: 1`, and a matching browser Origin; cross-site requests are refused.
 
 Owner answers and research/delegation/defer/reopen use the same revision-bound `OwnerAsks` backend
 as the menu bar. Live answers bind the displayed agent, request, and full source revision to the
@@ -4969,6 +4992,11 @@ discoverable under **Needs source review**. Advisor/dependency waits stay separa
 The browser loads source reviews 50 at a time from the canonical host, with explicit load-more
 controls and the full review count. Search runs on the canonical host, so it still covers every
 discovered source, including pages not yet loaded.
+Recovery evidence is paged the same way but per host: the Flow section's `<details>` names the
+steward's total ticket count while the feed carries only the referenced tickets, and the first time
+it is opened the host's full list is read once from `GET /api/decisions/flow?host=`, with a loading
+line, an error with a Retry button, and no reload while that host's pass or ticket total is
+unchanged.
 The direct live permission fail-open/answer UI and deputy owner boundaries remain unchanged.
 
 An explicitly evidenced blocking ticket can supply `blockerIdentifier`. The menu bar groups

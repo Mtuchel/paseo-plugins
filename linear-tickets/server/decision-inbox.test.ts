@@ -6,7 +6,7 @@ import test, { type TestContext } from "node:test";
 import type { PaseoApi } from "@getpaseo/client";
 import type { AgentPermissionRequest, AgentPermissionResponse } from "@getpaseo/protocol/agent-types";
 import type { OwnerAsk } from "../shared/contracts";
-import type { BrowserDecisionAction, DecisionHost } from "../shared/decision-inbox";
+import type { BrowserDecisionAction, DecisionHost, StewardFlow } from "../shared/decision-inbox";
 import { BrowserDecisionInbox, type BrowserDecisionInboxDeps } from "./decision-inbox";
 import { PermissionReplies } from "./permission-replies";
 import { INBOX_DISPLAYED_HEADER } from "./inbox-transport";
@@ -51,6 +51,8 @@ async function harness(t: TestContext, host = "laptop", asks: OwnerAsk[] = [owne
   const sent: { agentId: string; requestId: string; response: AgentPermissionResponse }[] = [];
   const ownerActions: { operation: string; input: unknown }[] = [];
   const listCalls: (string | undefined)[] = [];
+  let flowDep: (() => Promise<StewardFlow>) | undefined;
+  let flowReads = 0;
   const agents: Agent[] = [{ id: "a", title: "Standalone", status: "idle", labels: {}, pendingPermissions: [structuredClone(question)] }];
   let pages: Agent[][] | null = null;
   const sdk = { agents: {
@@ -83,7 +85,10 @@ async function harness(t: TestContext, host = "laptop", asks: OwnerAsk[] = [owne
     replies.attach(sdk);
     const inbox = new BrowserDecisionInbox({ ownerAsks, paseo: () => sdk, replies, peers: async () => peers,
       canonicalPeer: async () => canonical, host, backendInstanceId, agentUrl: async (id) => `https://paseo.test/agents/${id}`,
-      directory: join(directory, "inbox"), now: () => now });
+      directory: join(directory, "inbox"), now: () => now,
+      // Only a test that asks for a steward flow gets the dependency: a host without one answers
+      // `flow: null` like a host that never ran the steward, and the other tests keep it that way.
+      ...(flowDep ? { flow: () => { flowReads++; return flowDep!(); } } : {}) });
     return { inbox, replies };
   };
   const { inbox, replies } = create();
@@ -104,6 +109,7 @@ async function harness(t: TestContext, host = "laptop", asks: OwnerAsk[] = [owne
     canonical: (value: string | null) => { canonical = value; }, peers: (values: string[]) => { peers = values; },
     pages: (values: Agent[][]) => { pages = values; }, ownerReads: () => ownerReads,
     onOwnerRead: (work: () => Promise<void>) => { ownerRead = work; }, onSubmit: (work: typeof submit) => { submit = work; },
+    flow: (work: () => Promise<StewardFlow>) => { flowDep = work; }, flowReads: () => flowReads,
   };
 }
 function peerSnapshot(host = "server087"): DecisionHost {
@@ -447,7 +453,9 @@ test("transport refresh updates live questions without repeating the fifteen-min
   const h = await harness(t);
   await h.inbox.view();
   h.agents[0].pendingPermissions = [{ ...question, id: "q2" }];
-  h.clock(h.now() + 30_001);
+  // Past the transport window and the memory's stale window: a read inside either answers from the
+  // snapshot it already has while its replacement collects behind it.
+  h.clock(h.now() + 121_000);
   const view = await h.inbox.view();
   assert.equal(view.hosts[0].live[0].requestId, "q2");
   assert.equal(h.ownerReads(), 1);
@@ -464,7 +472,7 @@ test("a recovered canonical peer becomes reachable on the next transport refresh
   });
   assert.deepEqual((await h.inbox.view()).unreachable, [peer]);
   reachable = true;
-  h.clock(h.now() + 30_001);
+  h.clock(h.now() + 121_000);
   const recovered = await h.inbox.view();
   assert.equal(recovered.canonicalHost, "server087");
   assert.deepEqual(recovered.unreachable, []);
@@ -550,6 +558,9 @@ test("an answer during a transport read cannot republish the answered request", 
     if (hold) { hold = false; entered.release(); await release.promise; }
     return page;
   });
+  // The transport read has to collect and be held by the mock, so it has to be past the memory's
+  // five-second window: a fresh read answers from the collection the harness already made.
+  h.clock(h.now() + 121_000);
   const reading = h.inbox.view();
   await entered.promise;
   assert.equal((await h.post(input)).status, 200);
@@ -737,7 +748,7 @@ const actionable: OwnerAsk[] = [
   { ...sourceReview(8, "Researching note"), disposition: "research" },
 ];
 const reviews = [sourceReview(1, "Alpha note"), sourceReview(2, "Beta note"), sourceReview(3, "Beta other")];
-async function reviewsRoute(inbox: BrowserDecisionInbox, path: string, search = "") {
+async function getRoute(inbox: BrowserDecisionInbox, path: string, search = "") {
   const response = await inbox.route({ method: "GET", path, search, headers: {}, body: "" });
   assert.ok(response);
   return { status: response.status, body: JSON.parse(response.body) as Record<string, unknown> };
@@ -752,7 +763,7 @@ test("the canonical feed carries every actionable owner ask in full and only cou
   const view = await h.inbox.view();
   assert.deepEqual(view.hosts[0].asks.map(ask => ask.revision), actionable.map(ask => ask.revision));
   assert.equal(view.hosts[0].sourceReviews, 3);
-  const served = await reviewsRoute(h.inbox, "/api/decisions/local");
+  const served = await getRoute(h.inbox, "/api/decisions/local");
   assert.equal(served.body.sourceReviews, 3);
 });
 
@@ -760,25 +771,25 @@ test("the canonical host pages its source reviews in source order, bounded and s
   const h = await harness(t, "laptop", [...actionable, ...reviews]);
   await h.inbox.refresh();
   for (const path of ["/api/decisions/reviews", "/api/decisions/reviews/local"]) {
-    const first = await reviewsRoute(h.inbox, path, "?offset=0&limit=2");
+    const first = await getRoute(h.inbox, path, "?offset=0&limit=2");
     assert.equal(first.status, 200);
     assert.equal(first.body.host, "laptop");
     assert.equal(first.body.total, 3);
     assert.equal(first.body.offset, 0);
     assert.deepEqual((first.body.asks as OwnerAsk[]).map(ask => ask.revision), ["info-r1", "info-r2"]);
-    const rest = await reviewsRoute(h.inbox, path, "?offset=2&limit=2");
+    const rest = await getRoute(h.inbox, path, "?offset=2&limit=2");
     assert.deepEqual((rest.body.asks as OwnerAsk[]).map(ask => ask.revision), ["info-r3"]);
     assert.equal(rest.body.total, 3);
-    const defaults = await reviewsRoute(h.inbox, path);
+    const defaults = await getRoute(h.inbox, path);
     assert.deepEqual((defaults.body.asks as OwnerAsk[]).map(ask => ask.revision), ["info-r1", "info-r2", "info-r3"]);
-    const searched = await reviewsRoute(h.inbox, path, "?q=BETA%20note");
+    const searched = await getRoute(h.inbox, path, "?q=BETA%20note");
     assert.equal(searched.body.total, 1);
     assert.deepEqual((searched.body.asks as OwnerAsk[]).map(ask => ask.revision), ["info-r2"]);
-    const past = await reviewsRoute(h.inbox, path, "?offset=10");
+    const past = await getRoute(h.inbox, path, "?offset=10");
     assert.equal(past.status, 200);
     assert.deepEqual(past.body.asks, []);
     for (const bad of ["?limit=0", "?limit=101", "?offset=-1", "?offset=abc", "?limit=2.5"]) {
-      assert.equal((await reviewsRoute(h.inbox, path, bad)).status, 400, `${path}${bad}`);
+      assert.equal((await getRoute(h.inbox, path, bad)).status, 400, `${path}${bad}`);
     }
   }
   assert.equal((await h.inbox.route({ method: "POST", path: "/api/decisions/reviews", search: "", headers: {}, body: "" }))?.status, 405);
@@ -789,7 +800,7 @@ test("source reviews are unavailable, not empty, while the canonical owner colle
   const blocked = barrier();
   h.onOwnerRead(() => blocked.promise);
   t.after(() => blocked.release());
-  const pending = await reviewsRoute(h.inbox, "/api/decisions/reviews");
+  const pending = await getRoute(h.inbox, "/api/decisions/reviews");
   assert.equal(pending.status, 503);
   assert.match(String(pending.body.error), /being collected/);
 });
@@ -801,19 +812,19 @@ test("a non-canonical host reads source review pages from the canonical peer and
   const page = { host: "server087", backendInstanceId: PEER_BACKEND, updatedAt: "2026-10-12T00:00:00.000Z", total: 51, offset: 50, asks: [sourceReview(2, "Beta note")] };
   let answer: () => Response = () => Response.json(page);
   const calls = mockPeers(t, () => answer());
-  const read = await reviewsRoute(h.inbox, "/api/decisions/reviews", "?offset=50&limit=50&q=beta");
+  const read = await getRoute(h.inbox, "/api/decisions/reviews", "?offset=50&limit=50&q=beta");
   assert.equal(read.status, 200);
   assert.deepEqual(read.body, page);
   assert.deepEqual(calls.map(call => call.url), [`${peer}/api/decisions/reviews/local?offset=50&limit=50&q=beta`]);
   assert.equal(h.ownerReads(), 0);
-  assert.equal((await reviewsRoute(h.inbox, "/api/decisions/reviews/local")).status, 404, "only the canonical host serves its own pages");
+  assert.equal((await getRoute(h.inbox, "/api/decisions/reviews/local")).status, 404, "only the canonical host serves its own pages");
   assert.equal(calls.length, 1, "the canonical-only route never proxies");
   answer = () => Response.json({ ...page, asks: [{ ...sourceReview(2, "Beta note"), untrustedExtra: true }] });
-  const malformed = await reviewsRoute(h.inbox, "/api/decisions/reviews");
+  const malformed = await getRoute(h.inbox, "/api/decisions/reviews");
   assert.equal(malformed.status, 503);
   assert.match(String(malformed.body.error), /invalid source review page/);
   answer = () => Response.json({ error: "busy" }, { status: 503 });
-  const failed = await reviewsRoute(h.inbox, "/api/decisions/reviews");
+  const failed = await getRoute(h.inbox, "/api/decisions/reviews");
   assert.equal(failed.status, 503);
   assert.match(String(failed.body.error), /HTTP 503/);
   assert.equal(h.ownerReads(), 0);
@@ -838,9 +849,213 @@ test("the canonical peer's source review count reaches the view, and a peer with
 test("a paged source review is answered through the canonical owner action", async (t) => {
   const h = await harness(t, "laptop", reviews);
   await h.inbox.refresh();
-  const page = await reviewsRoute(h.inbox, "/api/decisions/reviews", "?limit=1");
+  const page = await getRoute(h.inbox, "/api/decisions/reviews", "?limit=1");
   const row = (page.body.asks as OwnerAsk[])[0];
   const result = await h.post({ host: page.body.host, target: "owner", operation: "answer", issueId: row.issueId, revision: row.revision, answers: {}, note: "Seen" });
   assert.equal(result.status, 200);
   assert.deepEqual(h.ownerActions.map(action => action.input), [{ issueId: "info-1", revision: "info-r1", answers: {}, note: "Seen" }]);
+});
+
+// This host's own snapshot is served from memory: a peer reads it under a five-second deadline and
+// retries two seconds later, so the first read must not wait for a Linear scan, a Paseo listing or
+// the steward, and the read after it must find the collection already done.
+const flush = () => new Promise<void>((resolve) => { setImmediate(() => resolve()); });
+// A background collection is never part of the answer that triggered it: turn the event loop until
+// it has reached the step the test waits on, so the counts that follow are the collection's own.
+const until = async (condition: () => boolean) => {
+  for (let turn = 0; turn < 100 && !condition(); turn++) await flush();
+  assert.ok(condition(), "the background collection did not reach the expected step");
+};
+const openQuestion = (body: Record<string, unknown>) => (body.live as { agentId: string; requestId: string; revision: string }[])[0];
+
+test("the local feed answers from memory until the snapshot is five seconds old", async (t) => {
+  const h = await harness(t);
+  h.flow(async () => flow);
+  const inbox = h.create().inbox;
+  const first = await getRoute(inbox, "/api/decisions/local");
+  assert.equal(first.status, 200);
+  const listings = h.listCalls.length, flows = h.flowReads();
+  assert.ok(listings > 0 && flows === 1, "the first read collects the snapshot");
+  h.clock(h.now() + 4_000);
+  h.agents[0].pendingPermissions = [{ ...question, id: "q2" }];
+  const second = await getRoute(inbox, "/api/decisions/local");
+  assert.deepEqual(second.body, first.body);
+  assert.equal(h.listCalls.length, listings, "a fresh snapshot is not collected again");
+  assert.equal(h.flowReads(), flows);
+});
+
+test("a stale snapshot answers while its replacement collects, and the follow-up read serves that replacement", async (t) => {
+  const h = await harness(t);
+  const gate = barrier();
+  let blocked = false;
+  h.flow(async () => { if (blocked) await gate.promise; return flow; });
+  const inbox = h.create().inbox;
+  t.after(() => gate.release());
+  const first = await getRoute(inbox, "/api/decisions/local");
+  const listings = h.listCalls.length, flows = h.flowReads();
+  blocked = true;
+  h.clock(h.now() + 10_000);
+  h.agents[0].pendingPermissions = [{ ...question, id: "q2" }];
+  const stale = await getRoute(inbox, "/api/decisions/local");
+  assert.deepEqual(stale.body, first.body, "a snapshot inside the stale window answers before its replacement lands");
+  await until(() => h.flowReads() === flows + 1);
+  assert.equal(h.listCalls.length, listings + 1, "the replacement collection runs behind the read");
+  gate.release();
+  await flush();
+  const next = await getRoute(inbox, "/api/decisions/local");
+  assert.equal(openQuestion(next.body).requestId, "q2");
+  assert.equal(h.flowReads(), flows + 1, "the landed replacement is served from memory");
+});
+
+test("a snapshot older than two minutes is collected before the read answers", async (t) => {
+  const h = await harness(t);
+  const gate = barrier();
+  let blocked = false;
+  h.flow(async () => { if (blocked) await gate.promise; return flow; });
+  const inbox = h.create().inbox;
+  t.after(() => gate.release());
+  await getRoute(inbox, "/api/decisions/local");
+  blocked = true;
+  h.clock(h.now() + 121_000);
+  h.agents[0].pendingPermissions = [{ ...question, id: "q2" }];
+  let answered = false;
+  const pending = getRoute(inbox, "/api/decisions/local").then((response) => { answered = true; return response; });
+  await flush();
+  assert.equal(answered, false, "an expired snapshot is not served while its replacement collects");
+  gate.release();
+  assert.equal(openQuestion((await pending).body).requestId, "q2");
+});
+
+test("an answer and an explicit refresh invalidate the memory instead of being followed by it", async (t) => {
+  const h = await harness(t);
+  const before = await getRoute(h.inbox, "/api/decisions/local");
+  const live = openQuestion(before.body);
+  const result = await h.post({ host: before.body.host, target: "live", operation: "answer", agentId: live.agentId, requestId: live.requestId, revision: live.revision, answers: { Runner: "Node" } });
+  assert.equal(result.status, 200);
+  const after = await getRoute(h.inbox, "/api/decisions/local");
+  assert.deepEqual(after.body.live, [], "the answered question is gone from the very next read");
+  h.agents[0].pendingPermissions = [{ ...question, id: "q3" }];
+  await h.inbox.refresh();
+  const refreshed = await getRoute(h.inbox, "/api/decisions/local");
+  assert.equal(openQuestion(refreshed.body).requestId, "q3");
+});
+
+test("a collection begun before an answer never lands in the memory after it", async (t) => {
+  const h = await harness(t);
+  const gates: { promise: Promise<void>; release: () => void }[] = [];
+  let blocked = false;
+  h.flow(async () => { if (blocked) { const gate = barrier(); gates.push(gate); await gate.promise; } return flow; });
+  const inbox = h.create().inbox;
+  t.after(() => gates.forEach(gate => gate.release()));
+  const first = await getRoute(inbox, "/api/decisions/local");
+  const live = openQuestion(first.body);
+  blocked = true;
+  h.clock(h.now() + 10_000);
+  assert.equal(openQuestion((await getRoute(inbox, "/api/decisions/local")).body).requestId, "q1", "the stale answer still carries the open question");
+  await until(() => gates.length === 1);
+  const listings = h.listCalls.length, flows = h.flowReads();
+  // The answer lands while that collection is in flight: the action collects its replacement right
+  // away, and the older collection must not write the memory afterwards — even when it lands last.
+  assert.equal((await h.post({ host: first.body.host, target: "live", operation: "answer", agentId: live.agentId, requestId: live.requestId, revision: live.revision, answers: { Runner: "Node" } }, inbox)).status, 200);
+  await until(() => gates.length === 2);
+  gates[1].release();
+  await flush();
+  gates[0].release();
+  await flush();
+  const after = await getRoute(inbox, "/api/decisions/local");
+  assert.deepEqual(after.body.live, [], "the answered question is gone from the memory");
+  assert.equal(h.listCalls.length, listings + 1, "the post-answer collection is what the memory holds");
+  assert.equal(h.flowReads(), flows + 1, "the answer is served from the collection the action started");
+});
+
+test("a landed owner collection reaches the next reads without any read waiting for it", async (t) => {
+  const h = await harness(t);
+  const gate = barrier();
+  h.onOwnerRead(() => gate.promise);
+  t.after(() => gate.release());
+  const first = await getRoute(h.inbox, "/api/decisions/local");
+  assert.deepEqual(first.body.asks, [], "the owner collection is still running");
+  assert.match(String(first.body.error), /being collected/);
+  const listings = h.listCalls.length;
+  gate.release();
+  await flush();
+  const landing = await getRoute(h.inbox, "/api/decisions/local");
+  assert.deepEqual(landing.body.asks, [], "the read after the landing answers from memory while it recollects");
+  // Every read answers from memory; the recollection the landing started is what they turn to.
+  let next = landing;
+  for (let turn = 0; turn < 100 && !(next.body.asks as OwnerAsk[]).length; turn++) {
+    await flush();
+    next = await getRoute(h.inbox, "/api/decisions/local");
+  }
+  assert.equal((next.body.asks as OwnerAsk[]).map(ask => ask.revision).join(), ownerAsk.revision, "the landed owner collection is in the answer");
+  assert.equal(h.listCalls.length, listings + 1, "the landing is collected once, not on every read");
+  assert.equal((await getRoute(h.inbox, "/api/decisions/local")).status, 200);
+  assert.equal(h.listCalls.length, listings + 1, "the recollection answers from memory afterwards");
+});
+
+// The steward's flow: three tracked recovery tickets, of which this host's decisions reference two
+// — the owner ask's ticket and the live agent's ticket label (decision-curation.ts joins on
+// exactly those). A peer feed ships the referenced ones; the whole list stays readable on demand.
+function recoveryTicket(identifier: string) {
+  return { identifier, situation: "Needs checking", since: "2026-10-12T00:00:00.000Z", reason: `Recovery evidence for ${identifier}` };
+}
+const flow: StewardFlow = { at: "2026-10-12T00:00:00.000Z", counts: { "waiting-owner": 1 }, oldest: [], error: null,
+  tickets: [recoveryTicket("TUC-1"), recoveryTicket("TUC-5"), recoveryTicket("TUC-9")] };
+
+test("a peer feed ships only the recovery tickets its decisions reference, with the steward's total", async (t) => {
+  const h = await harness(t);
+  h.flow(async () => flow);
+  h.agents[0].labels["linear.identifier"] = "TUC-5";
+  const inbox = h.create().inbox;
+  const feed = await getRoute(inbox, "/api/decisions/local");
+  assert.deepEqual(feed.body.flow, { ...flow, tickets: [recoveryTicket("TUC-1"), recoveryTicket("TUC-5")], ticketCount: 3 });
+  const view = await inbox.view();
+  assert.deepEqual(view.hosts[0].flow, { ...flow, ticketCount: 3 }, "this host's own page keeps every ticket");
+});
+
+
+test("the recovery evidence of a host is read locally or from the peer that owns it", async (t) => {
+  const h = await harness(t);
+  h.flow(async () => flow);
+  const local = h.create().inbox;
+  const own = await getRoute(local, "/api/decisions/flow/local");
+  assert.equal(own.status, 200);
+  assert.deepEqual(own.body, { host: "laptop", tickets: flow.tickets });
+  assert.deepEqual((await getRoute(local, "/api/decisions/flow", "?host=laptop")).body, { host: "laptop", tickets: flow.tickets });
+  assert.equal((await getRoute(local, "/api/decisions/flow")).status, 400, "the host to read is named");
+  const peer = "https://server087.test:8444";
+  h.peers([peer]);
+  const page = { host: "server087", tickets: [recoveryTicket("TUC-9")] };
+  let ticketAnswer = () => Response.json(page);
+  const calls = mockPeers(t, (url) => url.endsWith("/api/decisions/local") ? Response.json(peerSnapshot()) : ticketAnswer());
+  const proxied = await getRoute(local, "/api/decisions/flow", "?host=server087");
+  assert.equal(proxied.status, 200);
+  assert.deepEqual(proxied.body, page);
+  assert.deepEqual(calls.map(call => call.url), [`${peer}/api/decisions/local`, `${peer}/api/decisions/flow/local`]);
+  const fetched = calls.length;
+  const unknown = await getRoute(local, "/api/decisions/flow", "?host=https%3A%2F%2Fevil.test");
+  assert.equal(unknown.status, 404);
+  assert.match(String(unknown.body.error), /Unknown or unavailable decision host/);
+  assert.equal(calls.length, fetched + 1, "an unknown host resolves against the configured origins only");
+  assert.equal(calls[fetched].url, `${peer}/api/decisions/local`);
+  ticketAnswer = () => Response.json({ ...page, untrustedExtra: true });
+  const extended = await getRoute(local, "/api/decisions/flow", "?host=server087");
+  assert.equal(extended.status, 503);
+  assert.match(String(extended.body.error), /invalid recovery ticket list/);
+  ticketAnswer = () => Response.json({ ...page, tickets: [{ ...recoveryTicket("TUC-9"), untrustedExtra: true }] });
+  assert.equal((await getRoute(local, "/api/decisions/flow", "?host=server087")).status, 503);
+  ticketAnswer = () => Response.json({ ...page, host: "someone-else" });
+  const mislabelled = await getRoute(local, "/api/decisions/flow", "?host=server087");
+  assert.equal(mislabelled.status, 503);
+  assert.match(String(mislabelled.body.error), /answered for someone-else instead of server087/);
+  ticketAnswer = () => Response.json({ error: "busy" }, { status: 503 });
+  const failed = await getRoute(local, "/api/decisions/flow", "?host=server087");
+  assert.equal(failed.status, 503);
+  assert.match(String(failed.body.error), /HTTP 503/);
+  // A host that never ran the steward has no recovery evidence to read: an explicit error, never
+  // an empty list that reads as "no tickets".
+  const bare = await harness(t);
+  const noFlow = await getRoute(bare.create().inbox, "/api/decisions/flow/local");
+  assert.equal(noFlow.status, 503);
+  assert.match(String(noFlow.body.error), /no ticket flow configured/);
 });

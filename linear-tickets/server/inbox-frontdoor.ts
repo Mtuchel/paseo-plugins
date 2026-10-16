@@ -363,9 +363,10 @@ class Frontdoor implements InboxFrontdoor {
       // existing clients and the strict peer schemas keep their shape.
       return json(200, { ...view, availability: this.availability() });
     }
-    // Source review pages are read live from the backend with their paging query, never from the
-    // snapshot: only the canonical host can answer them (decision-inbox.ts).
-    if (path === "/api/inbox" || path === "/api/decisions/local" || path === "/api/decisions/reviews" || path === "/api/decisions/reviews/local" || path === "/api/push/key") return this.forward("read", method, originForm, headers, null);
+    // Source review pages and recovery evidence are read live from the backend with their query,
+    // never from the snapshot: only the owning host can answer them (decision-inbox.ts).
+    if (path === "/api/inbox" || path === "/api/decisions/local" || path === "/api/decisions/reviews" || path === "/api/decisions/reviews/local"
+      || path === "/api/decisions/flow" || path === "/api/decisions/flow/local" || path === "/api/push/key") return this.forward("read", method, originForm, headers, null);
     if (path === "/manifest.webmanifest") return { status: 200, headers: { "content-type": "application/manifest+json" }, body: MANIFEST };
     if (path === "/sw.js") return { status: 200, headers: { "content-type": "text/javascript; charset=utf-8", "service-worker-allowed": "/" }, body: SERVICE_WORKER };
     if (path === "/icon.png") return { status: 200, headers: { "content-type": "image/png" }, body: REVIEW_ICON_PNG };
