@@ -1,11 +1,10 @@
 import { Continuations, continuationMarker, continuationReceipt, type ContinueOperation, type ContinuationResult } from "./continuations";
 import { asCaller } from "./linear-usage";
-import { execFile } from "node:child_process";
+import { execFile } from "./child-processes";
 import { existsSync } from "node:fs";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
-import { promisify } from "node:util";
 import type { PaseoAgent, PaseoAgentHandle, PaseoApi } from "@getpaseo/client";
 import type { AgentPermissionRequest } from "@getpaseo/protocol/agent-types";
 import type { AgentApi, OpenSession, SelectOption, SessionPlanStep } from "./agent-app";
@@ -36,7 +35,6 @@ import { candidates, normalizeModel } from "../shared/model-fallbacks";
 import { availability, claims, finishPending, incidentFor, LIMIT_SPACING, limitError, limitSchedule, limitTime, updateEpisode, type LimitPending, type LimitResumeStore, type UsageReader } from "./limit-resume";
 import { rateBudget, RateLimitedError, withPriority, type RateBudget } from "./rate-budget";
 
-const exec = promisify(execFile);
 const HANDLED_LIMIT = 200;
 const SWEEP_MS = 60_000;
 const QUEUED_OWNER_MAX_PAGES = 100;
@@ -305,21 +303,21 @@ function paseoCli(): string {
 export async function setAgentMode(agentId: string, modeId: string): Promise<void> {
   const env = { ...process.env };
   delete env.PASEO_AGENT_ID;
-  await exec(paseoCli(), ["agent", "mode", agentId, modeId], { timeout: 15_000, env });
+  await execFile(paseoCli(), ["agent", "mode", agentId, modeId], { timeout: 15_000, env });
 }
 
 // Sets one label on an agent (the plugin SDK cannot), e.g. its plan policy after the small-ticket route.
 export async function setAgentLabel(agentId: string, name: string, value: string): Promise<void> {
   const env = { ...process.env };
   delete env.PASEO_AGENT_ID;
-  await exec(paseoCli(), ["agent", "update", agentId, "--label", `${name}=${value}`], { timeout: 15_000, env });
+  await execFile(paseoCli(), ["agent", "update", agentId, "--label", `${name}=${value}`], { timeout: 15_000, env });
 }
 
 // Interrupts the agent's running turn. The plugin SDK has no cancel, so the CLI does it.
 export async function stopAgentTurn(agentId: string): Promise<void> {
   const env = { ...process.env };
   delete env.PASEO_AGENT_ID;
-  await exec(paseoCli(), ["stop", agentId], { timeout: 15_000, env });
+  await execFile(paseoCli(), ["stop", agentId], { timeout: 15_000, env });
 }
 
 const OTHER_OPTION = /^other\b/i;
@@ -351,7 +349,7 @@ export function paseoAgentUrl(serverId: string, agentId: string): string {
 
 let serverIdCache: Promise<string | null> | null = null;
 export function daemonServerId(): Promise<string | null> {
-  serverIdCache ??= exec(paseoCli(), ["daemon", "status", "--json"], { timeout: 15_000 })
+  serverIdCache ??= execFile(paseoCli(), ["daemon", "status", "--json"], { timeout: 15_000 })
     .then(({ stdout }) => { const id = (JSON.parse(stdout) as { serverId?: unknown }).serverId; return typeof id === "string" ? id : null; })
     .catch(() => null);
   return serverIdCache;

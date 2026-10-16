@@ -1,10 +1,9 @@
-import { execFile } from "node:child_process";
+import { execFile } from "./child-processes";
 import { createHash } from "node:crypto";
 import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { createServer, type IncomingHttpHeaders, type Server } from "node:http";
 import { hostname } from "node:os";
 import { dirname, join } from "node:path";
-import { promisify } from "node:util";
 import { z } from "zod";
 import { isActivationPath, MAX_ACTIVATION_BODY_BYTES, type ActivationRoute } from "./activation";
 import { DecisionPendingError, FencedError, StaleResolutionError, type ApplyingEntry, type ResolveAction } from "./decision-journal";
@@ -25,7 +24,6 @@ import type { ReviewIssueInfo } from "./review-issue-info";
 import type { PipelineReview } from "./plan-pipeline";
 import { ReviewClosedError } from "./sessions";
 
-const exec = promisify(execFile);
 // The checked inbox backend. The browser-facing port 127.0.0.1:47832 and the tailnet origin
 // :8444 belong to the persistent inbox frontdoor now (inbox-frontdoor.ts, installed by
 // tools/inbox-service-install.mjs); this server answers only the frontdoor and is never published.
@@ -138,11 +136,11 @@ async function backendAlive(localUrl: string): Promise<boolean> {
 }
 
 async function unserveReview(port: number): Promise<void> {
-  await exec(tailscaleBinary(), ["serve", `--https=${port}`, "off"], { timeout: 12_000 });
+  await execFile(tailscaleBinary(), ["serve", `--https=${port}`, "off"], { timeout: 12_000 });
 }
 
 async function routeReview(port: number, proxyPort: number): Promise<void> {
-  await exec(tailscaleBinary(), ["serve", "--bg", `--https=${port}`, `http://127.0.0.1:${proxyPort}`], { timeout: 12_000 });
+  await execFile(tailscaleBinary(), ["serve", "--bg", `--https=${port}`, `http://127.0.0.1:${proxyPort}`], { timeout: 12_000 });
 }
 
 // The tailnet port of a review's route; null for the ports this plugin must never touch.

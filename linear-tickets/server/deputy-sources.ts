@@ -1,9 +1,8 @@
-import { execFile } from "node:child_process";
+import { execFile } from "./child-processes";
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { promisify } from "node:util";
 import { AUTONOMY_POLICY, AUTONOMY_POLICY_REVISION } from "../shared/autonomy-policy";
 import { strictRecordProvenance } from "./agent-records";
 import type { LinearService, TicketComment } from "./linear";
@@ -342,21 +341,20 @@ export function verifyCitation(sources: Source[], sourceId: unknown, quote: unkn
 // ---------------------------------------------------------------------------------------------
 // The host's readers
 
-const run = promisify(execFile);
 // One fetch per repository at most every 10 minutes: every question reads the same commit.
 const FETCH_EVERY_MS = 10 * 60 * 1000;
 const fetchedAt = new Map<string, number>();
 
 export async function readPrinciples(repository: string, now = Date.now()): Promise<Principles> {
   if (now - (fetchedAt.get(repository) ?? 0) >= FETCH_EVERY_MS) {
-    await run("git", ["-C", repository, "fetch", "--quiet", "origin", "main"], { timeout: 60_000 });
+    await execFile("git", ["-C", repository, "fetch", "--quiet", "origin", "main"], { timeout: 60_000 });
     fetchedAt.set(repository, now);
   }
-  const commit = (await run("git", ["-C", repository, "rev-parse", "origin/main"], { timeout: 10_000 })).stdout.trim();
+  const commit = (await execFile("git", ["-C", repository, "rev-parse", "origin/main"], { timeout: 10_000 })).stdout.trim();
   if (!/^[0-9a-f]{40}$/.test(commit)) throw new Error("origin/main does not resolve to a commit");
   const files: Record<string, string> = {};
   for (const file of ["approved.md", "decisions.md", "decision-queue.md"]) {
-    files[file] = (await run("git", ["-C", repository, "show", `${commit}:docs/principles/${file}`], { maxBuffer: 16 * 1024 * 1024, timeout: 10_000 })).stdout;
+    files[file] = (await execFile("git", ["-C", repository, "show", `${commit}:docs/principles/${file}`], { maxBuffer: 16 * 1024 * 1024, timeout: 10_000 })).stdout;
   }
   if (!files["approved.md"].trim() || !files["decisions.md"].trim()) throw new Error("the principles register is empty");
   return { commit: commit.slice(0, 12), files };
@@ -374,7 +372,7 @@ export async function pluginReadme(home: string): Promise<RuleDocument> {
 
 // The agent repository's root AGENTS.md; none is fine, an unreadable one is not.
 export async function repositoryInstructions(cwd: string): Promise<RuleDocument | null> {
-  const root = (await run("git", ["-C", cwd, "rev-parse", "--show-toplevel"], { timeout: 10_000 })).stdout.trim();
+  const root = (await execFile("git", ["-C", cwd, "rev-parse", "--show-toplevel"], { timeout: 10_000 })).stdout.trim();
   const text = await readFile(join(root, "AGENTS.md"), "utf8").catch((error: unknown) => {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
     throw error;

@@ -1,9 +1,8 @@
-import { execFile } from "node:child_process";
+import { execFile } from "./child-processes";
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, open, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
-import { promisify } from "node:util";
 import type { AgentPermissionRequest, AgentPermissionResponse } from "@getpaseo/protocol/agent-types";
 import { agentAppDirectory, type AgentApi } from "./agent-app";
 import { record } from "./context";
@@ -493,11 +492,10 @@ export async function readBatch(directory: string, until: string): Promise<Batch
 // The principles register (tuchel-platform `docs/principles/`), always as on origin/main
 
 export type Register = { approved: string; decisions: string; queue: string };
-const run = promisify(execFile);
 
 export async function readRegister(repository: string): Promise<Register> {
-  await run("git", ["-C", repository, "fetch", "--quiet", "origin", "main"], { timeout: 120_000 });
-  const show = async (file: string) => (await run("git", ["-C", repository, "show", `origin/main:docs/principles/${file}`], { maxBuffer: 16 * 1024 * 1024 })).stdout;
+  await execFile("git", ["-C", repository, "fetch", "--quiet", "origin", "main"], { timeout: 120_000 });
+  const show = async (file: string) => (await execFile("git", ["-C", repository, "show", `origin/main:docs/principles/${file}`], { maxBuffer: 16 * 1024 * 1024 })).stdout;
   const [approved, decisions, queue] = await Promise.all([show("approved.md"), show("decisions.md"), show("decision-queue.md")]);
   if (!approved.trim() || !decisions.trim()) throw new Error("The principles register on origin/main is empty.");
   return { approved, decisions, queue };

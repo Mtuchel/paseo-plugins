@@ -1,8 +1,5 @@
-import { execFile } from "node:child_process";
+import { execFile } from "./child-processes";
 import { existsSync } from "node:fs";
-import { promisify } from "node:util";
-
-const exec = promisify(execFile);
 
 // The daemon's PATH rarely includes Tailscale's CLI, so the usual install locations come first.
 export function tailscaleBinary(): string {
@@ -18,7 +15,7 @@ export function tailscaleBinary(): string {
 // with, so the review link a Linear comment carries keeps working across reloads.
 export async function tailnetOrigin(port = 8444): Promise<string | null> {
   try {
-    const { stdout } = await exec(tailscaleBinary(), ["status", "--json"], { timeout: 8_000 });
+    const { stdout } = await execFile(tailscaleBinary(), ["status", "--json"], { timeout: 8_000 });
     const self = JSON.parse(stdout) as { Self?: { DNSName?: unknown } };
     const dns = String(self.Self?.DNSName ?? "").replace(/\.$/, "");
     return dns ? `https://${dns}:${port}` : null;

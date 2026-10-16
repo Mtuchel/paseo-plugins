@@ -1,10 +1,9 @@
-import { execFile, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
-import { promisify } from "node:util";
+import { execFile, spawn } from "./child-processes";
 import { dispatchLabels } from "./dispatch";
 import { z } from "zod";
 import type { IssueStatus, LinearService } from "./linear";
@@ -61,7 +60,7 @@ type Linear = Pick<LinearService, "addLabel" | "comment" | "moveToReady" | "reop
 // it was added from. Null when `directory` is gone or not in a repository.
 async function mainCheckout(directory: string): Promise<string | null> {
   if (!existsSync(directory)) return null;
-  const found = await promisify(execFile)("git", ["-C", directory, "rev-parse", "--path-format=absolute", "--git-common-dir"], { timeout: CHECK_TIMEOUT_MS, env: { ...process.env, PATH: TOOL_PATH } }).catch(() => null);
+  const found = await execFile("git", ["-C", directory, "rev-parse", "--path-format=absolute", "--git-common-dir"], { timeout: CHECK_TIMEOUT_MS, env: { ...process.env, PATH: TOOL_PATH } }).catch(() => null);
   const common = found?.stdout.trim();
   if (!common) return null;
   return basename(common) === ".git" ? dirname(common) : common;
@@ -76,8 +75,10 @@ export function runCheck(command: string, directories: string[]): Promise<CheckR
     const child = spawn("/bin/sh", ["-c", command], { cwd: where, env: { ...process.env, PATH: TOOL_PATH }, stdio: ["ignore", "pipe", "pipe"] });
     let output = "";
     const collect = (chunk: Buffer) => { if (output.length < CHECK_OUTPUT_BYTES) output += chunk.toString("utf8").slice(0, CHECK_OUTPUT_BYTES - output.length); };
-    child.stdout.on("data", collect);
-    child.stderr.on("data", collect);
+    // Both slots are "pipe": the helper's SpawnedChild types them Readable | null without node's
+    // stdio-narrowing overloads.
+    child.stdout!.on("data", collect);
+    child.stderr!.on("data", collect);
     const timer = setTimeout(() => child.kill("SIGKILL"), CHECK_TIMEOUT_MS);
     child.on("error", (error) => { clearTimeout(timer); resolve({ ok: false, code: null, output: error.message, cwd: where }); });
     child.on("close", (code) => { clearTimeout(timer); resolve({ ok: code === 0, code, output, cwd: where }); });

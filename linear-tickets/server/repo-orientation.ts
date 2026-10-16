@@ -1,11 +1,8 @@
-import { execFile } from "node:child_process";
+import { execFile } from "./child-processes";
 import { open } from "node:fs/promises";
 import { join, posix } from "node:path";
-import { promisify } from "node:util";
 import type { TicketDetail } from "../shared/contracts";
 import { record } from "./context";
-
-const exec = promisify(execFile);
 
 // Ticket agents used to find the domain guides (nested AGENTS.md) by hand and explore code in
 // their own context (TUC-371). The launch prompt now lists the checkout's guides, the ones the
@@ -113,7 +110,7 @@ async function heading(path: string): Promise<string> {
 }
 
 export async function guidePaths(cwd: string): Promise<string[]> {
-  const { stdout } = await exec("git", ["-C", cwd, "ls-files", "-z", "--", ":(glob)**/AGENTS.md"], { timeout: GIT_TIMEOUT_MS, maxBuffer: 4 * 1024 * 1024 });
+  const { stdout } = await execFile("git", ["-C", cwd, "ls-files", "-z", "--", ":(glob)**/AGENTS.md"], { timeout: GIT_TIMEOUT_MS, maxBuffer: 4 * 1024 * 1024 });
   return stdout.split("\0").filter((path) => path && path !== "AGENTS.md");
 }
 

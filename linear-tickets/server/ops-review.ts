@@ -1,11 +1,10 @@
-import { execFile } from "node:child_process";
+import { execFile } from "./child-processes";
 import { createHash, randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { link, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { hostname } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
-import { promisify } from "node:util";
 import type { CreatedIssueRef, IssueStatus, OpsMarkerIssue } from "./linear";
 import { isoWeek, type OpsWriter } from "./owner-decisions";
 import { paseoHome } from "./ticket-mcp";
@@ -684,14 +683,12 @@ export async function pidLock<T>(path: string, work: () => Promise<T>, deps: Loc
 // The Graphite merge queue lands a stack through its own draft PR and closes the stack's pull
 // requests unmerged with the label `externally-merged`; GitHub's `is:merged` counts only the rest.
 
-const run = promisify(execFile);
-
 export async function mergedPullRequests(from: number, to: number): Promise<number | null> {
   const range = `${iso(from).replace(/\.\d{3}Z$/, "Z")}..${iso(to).replace(/\.\d{3}Z$/, "Z")}`;
   try {
     let total = 0;
     for (const query of [`is:merged merged:${range}`, `is:unmerged label:externally-merged closed:${range}`]) {
-      const { stdout } = await run("gh", ["api", "-X", "GET", "search/issues", "-f", `q=repo:${GITHUB_REPO} is:pr ${query}`, "--jq", ".total_count"], { timeout: 60_000 });
+      const { stdout } = await execFile("gh", ["api", "-X", "GET", "search/issues", "-f", `q=repo:${GITHUB_REPO} is:pr ${query}`, "--jq", ".total_count"], { timeout: 60_000 });
       const count = Number(stdout.trim());
       if (!Number.isInteger(count) || count < 0) return null;
       total += count;

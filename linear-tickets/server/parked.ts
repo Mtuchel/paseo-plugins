@@ -1,10 +1,10 @@
-import { execFileSync, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { closeSync, existsSync, openSync, readFileSync, renameSync, statSync } from "node:fs";
+import { existsSync, readFileSync, renameSync, statSync } from "node:fs";
 import { mkdir, open, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
+import { execFile, spawn } from "./child-processes";
 import { plannotatorPaths } from "./plannotator";
 import { PLANNOTATOR_HOST_SOURCE } from "./plannotator-host-source";
 
@@ -199,7 +199,7 @@ export class PlannotatorHost {
     else if (state || spawned) console.error("[linear-tickets] Plannotator host stopped answering; starting it again");
     await this.stopHosts();
     if (this.stopped) return;
-    this.spawn(found);
+    await this.spawn(found);
   }
 
   private async readState(): Promise<HostState | null> {
@@ -209,34 +209,39 @@ export class PlannotatorHost {
     } catch { return null; }
   }
 
-  private spawn(found: HostLocation): void {
+  // The helper starts the host and opens its log itself (a file descriptor cannot cross the
+  // helper's channel). The host is detached: it outlives the plugin, and the helper exiting does
+  // not end it.
+  private async spawn(found: HostLocation): Promise<void> {
     try {
       if (statSync(this.paths.log).size > LOG_ROTATE_BYTES) renameSync(this.paths.log, `${this.paths.log}.1`);
     } catch { /* no log yet, or it keeps appending */ }
-    const out = openSync(this.paths.log, "a", 0o600);
-    try {
-      const child = spawn(found.bun, [this.paths.script], {
-        cwd: this.paths.parked,
-        detached: true,
-        env: {
-          ...process.env,
-          LINEAR_TICKETS_PARKED: this.paths.parked,
-          LINEAR_TICKETS_PLANNOTATOR_EVENTS: this.paths.events,
-          LINEAR_TICKETS_DECISIONS: this.paths.decisions,
-          LINEAR_TICKETS_PLANNOTATOR_OPEN: this.paths.open,
-          LINEAR_TICKETS_PLANNOTATOR_PACKAGE: found.plannotator,
-          LINEAR_TICKETS_PLANNOTATOR_HOST_STATE: this.paths.state,
-          LINEAR_TICKETS_PLANNOTATOR_HOST_VERSION: this.version,
-          LINEAR_TICKETS_PLANNOTATOR_PORTS: this.paths.ports,
-          LINEAR_TICKETS_PLANNOTATOR_PLUGIN_ALIVE: this.paths.alive,
-        },
-        stdio: ["ignore", out, out],
-      });
-      child.on("error", (error) => console.error(`[linear-tickets] Plannotator host failed to start: ${error.message}`));
-      child.unref();
-      this.spawned = child.pid ? { pid: child.pid, at: Date.now() } : null;
-      this.live = Boolean(child.pid);
-    } finally { closeSync(out); }
+    const child = spawn(found.bun, [this.paths.script], {
+      cwd: this.paths.parked,
+      detached: true,
+      env: {
+        ...process.env,
+        LINEAR_TICKETS_PARKED: this.paths.parked,
+        LINEAR_TICKETS_PLANNOTATOR_EVENTS: this.paths.events,
+        LINEAR_TICKETS_DECISIONS: this.paths.decisions,
+        LINEAR_TICKETS_PLANNOTATOR_OPEN: this.paths.open,
+        LINEAR_TICKETS_PLANNOTATOR_PACKAGE: found.plannotator,
+        LINEAR_TICKETS_PLANNOTATOR_HOST_STATE: this.paths.state,
+        LINEAR_TICKETS_PLANNOTATOR_HOST_VERSION: this.version,
+        LINEAR_TICKETS_PLANNOTATOR_PORTS: this.paths.ports,
+        LINEAR_TICKETS_PLANNOTATOR_PLUGIN_ALIVE: this.paths.alive,
+      },
+      stdio: ["ignore", { file: this.paths.log, flags: "a", mode: 0o600 }, { file: this.paths.log, flags: "a", mode: 0o600 }],
+    });
+    child.on("error", (error) => console.error(`[linear-tickets] Plannotator host failed to start: ${error.message}`));
+    // The pid arrives with "spawn"; a host the helper could not start has none.
+    const pid = await new Promise<number | null>((resolve) => {
+      child.on("spawn", () => resolve(child.pid ?? null));
+      child.on("close", () => resolve(null));
+    });
+    child.unref();
+    this.spawned = pid === null ? null : { pid, at: Date.now() };
+    this.live = pid !== null;
   }
 
   // Every process running this host's script (an older version, one that stopped answering, or a
@@ -245,7 +250,8 @@ export class PlannotatorHost {
     let pids: number[] = [];
     try {
       const pattern = this.paths.script.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      pids = execFileSync("pgrep", ["-f", pattern], { encoding: "utf8", timeout: 5_000 }).split("\n").map(Number).filter((pid) => Number.isInteger(pid) && pid > 0 && pid !== process.pid);
+      const { stdout } = await execFile("pgrep", ["-f", pattern], { timeout: 5_000 });
+      pids = stdout.split("\n").map(Number).filter((pid) => Number.isInteger(pid) && pid > 0 && pid !== process.pid);
     } catch { /* none running */ }
     for (const pid of pids) { try { process.kill(pid, "SIGTERM"); } catch { /* gone */ } }
     const deadline = Date.now() + STOP_WAIT_MS;

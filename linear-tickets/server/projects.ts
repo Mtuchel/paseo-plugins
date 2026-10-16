@@ -1,8 +1,5 @@
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
+import { execFile } from "./child-processes";
 import type { PaseoApi } from "@getpaseo/client";
-
-const exec = promisify(execFile);
 
 export class ProjectUnavailableError extends Error {}
 
@@ -14,7 +11,7 @@ export async function findProject(paseo: PaseoApi, id: string) {
 }
 
 export async function readBranches(path: string) {
-  const git = (args: string[]) => exec("git", ["-C", path, ...args], { timeout: 15_000, maxBuffer: 2 * 1024 * 1024 });
+  const git = (args: string[]) => execFile("git", ["-C", path, ...args], { timeout: 15_000, maxBuffer: 2 * 1024 * 1024 });
   const results = await Promise.allSettled([
     git(["for-each-ref", "--format=%(refname)%09%(refname:short)%09%(symref)", "refs/heads", "refs/remotes"]),
     git(["symbolic-ref", "--quiet", "HEAD"]),

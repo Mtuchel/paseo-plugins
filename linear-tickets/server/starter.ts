@@ -7,8 +7,7 @@ import { mappedBaseBranch, mappingLabel, savedMapping, type ProjectMapping } fro
 import { modelSteps, planTier, type Tier } from "../shared/plan-model";
 import type { AcceptanceTestsStore } from "./acceptance-tests";
 import { Capacity } from "./capacity";
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
+import { execFile } from "./child-processes";
 import type { Handover } from "./handover";
 import type { Focus } from "./focus";
 import type { ActivationResume } from "./activation";
@@ -491,7 +490,7 @@ export class TicketStarter {
   }
 
   private async gitTip(cwd: string, branch: string): Promise<string> {
-    const { stdout } = await promisify(execFile)("git", ["-C", cwd, "rev-parse", "--verify", `refs/heads/${branch}`], { maxBuffer: 1_000_000 }).catch(() => ({ stdout: "" }));
+    const { stdout } = await execFile("git", ["-C", cwd, "rev-parse", "--verify", `refs/heads/${branch}`], { maxBuffer: 1_000_000 }).catch(() => ({ stdout: "" }));
     return String(stdout).trim();
   }
 }
