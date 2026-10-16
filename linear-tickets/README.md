@@ -4366,6 +4366,10 @@ Candidates live in `$PASEO_HOME/linear-tickets/deputy/candidates.json` (director
    contradicted by an ambiguous "existing owner" role. Reporting or asking a later technical
    question through the same answer channel is agent work, not inherently human execution.
    An ambiguous "you" or missing tool proves neither a human recipient nor a capable parent agent.
+   The recipient's execution is separate from the asking agent sending that request. The deputy
+   cannot promise to perform a later review merely by delivering a label. Existing identity evidence,
+   including personal owner-only approval acts, still binds; technical delegability alone does not
+   establish a capable agent recipient or rewrite a literal assignment.
    Actual human assignments and personal approval boundaries still bind; actor interpretation
    supplies no missing task authority.
    Fully described bounded UI state/navigation and regression corrections remain technical when
@@ -4379,7 +4383,7 @@ block, without Paseo, Linear or GitHub credentials in its environment. A tool ev
 unreadable/oversized answer, abstention or failed check refuses the whole request. Citations
 retain source ID, revision and quote.
 
-Evidence is versioned as `deputy-15-material-commitments/owner-autonomy-2026-10-15-v3/<model>/high`.
+Evidence is versioned as `deputy-16-executable-actors/owner-autonomy-2026-10-15-v3/<model>/high`.
 Old-policy predictions never satisfy current empirical readiness. On restart, an old-version
 refusal/prediction is reevaluated only after the exact unanswered request is freshly verified;
 old selections, citations, intent and grace are discarded. An equivalent new request ID retires
