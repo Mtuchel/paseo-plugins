@@ -26,7 +26,7 @@ export const DEPUTY_DIRECTORY = () => join(paseoHome(), "linear-tickets", "deput
 const KEEP_MS = 14 * 24 * 60 * 60 * 1000;
 const SETTLEMENT_RETRY_MS = 5 * 60 * 1000;
 const MAX_PARALLEL_EVALUATIONS = 2;
-const RETRYABLE_REFUSALS: Record<string, true | undefined> = { "source-unavailable": true, "evaluator-unavailable": true, "no-knowledge": true, "no-evaluator": true };
+const RETRYABLE_REFUSALS: Record<string, true | undefined> = { "source-unavailable": true, "evaluator-unavailable": true, "no-knowledge": true, "no-evaluator": true, "evidence-changed": true };
 export const CHECKED_CONNECTION_MISSING = "no checked answer connection to the local Paseo daemon";
 
 export type ArbitratedOutcome = "applied" | "owner-first" | "gone" | "revoked";
@@ -348,7 +348,16 @@ export class Deputy {
     if (candidate.status !== "refused" || candidate.reason !== reason || candidate.version !== version || candidate.refusalCategory !== category) {
       await logQuietly(() => this.deps.log.append({ kind: "deputy-refusal", id: candidate.key, key: randomUUID(), at: new Date(this.now()).toISOString(), identifier: candidate.identifier, issueId: candidate.issueId, version, mode: candidate.mode, reason, ...(category ? { category } : {}) }), `deputy refusal on ${candidate.identifier}`);
     }
-    await this.patch(candidate.key, { status: "refused", reason, version, refusalCategory: category, retryAt: category && RETRYABLE_REFUSALS[category] ? new Date(this.now() + SETTLEMENT_RETRY_MS).toISOString() : undefined });
+    const recorded = await this.change(store => {
+      const current = store[candidate.key];
+      if (!current) return false;
+      // A replacement can retire this request while its refusal journal is awaited.
+      // Fence the durable transition inside the same serialized store mutation.
+      if (category === "evidence-changed" && (current.status !== "waiting" || this.revoked.has(candidate.key))) return false;
+      store[candidate.key] = { ...current, status: "refused", reason, version, refusalCategory: category, retryAt: category && RETRYABLE_REFUSALS[category] ? new Date(this.now() + SETTLEMENT_RETRY_MS).toISOString() : undefined, updatedAt: new Date(this.now()).toISOString() };
+      return true;
+    });
+    if (!recorded) return;
     if (category && RETRYABLE_REFUSALS[category]) this.retrySettlement();
     console.log(`[linear-tickets] deputy: ${candidate.identifier} question ${candidate.ref} stays with the owner: ${reason}`);
   }
@@ -389,6 +398,9 @@ export class Deputy {
     const generation = this.settingsGeneration;
     let candidate = (await this.readStore())[key];
     if (!candidate || this.stopped || (retry ? !this.retryable(candidate) : candidate.status !== "evaluating")) return;
+    // A prior prediction's grace and retry category survive interrupted evaluation.
+    // A refreshed answer must not borrow that earlier prediction's elapsed grace.
+    const freshGrace = Boolean(candidate.graceDeadline) && RETRYABLE_REFUSALS[candidate.refusalCategory ?? ""] === true;
     if (!await this.stillPending(candidate)) return;
     const settings = await this.deps.settings.read();
     const { mode, model } = settings.deputy;
@@ -417,15 +429,16 @@ export class Deputy {
     if (this.stopped || !await this.stillPending(candidate)) return;
     if (generation !== this.settingsGeneration) { await this.outcome(candidate, "canceled", "the deputy settings changed during evaluation"); return; }
     if ((await this.readStore())[key]?.status !== "evaluating") return;
-    // Recorded once, before any dispatch: the evidence compares it with the owner's later answer.
-    await this.deps.log.append({ kind: "deputy-prediction", id: key, key: version, at: new Date(this.now()).toISOString(), identifier: candidate.identifier, issueId: candidate.issueId, version, mode: candidate.mode, selections: verdict.selections, citations: verdict.citations, standing: verdict.standing });
+    // Preserve each evidence-bound prediction. Empirical evidence still counts only
+    // the first shadow prediction per question, never retries or live answers.
+    await this.deps.log.append({ kind: "deputy-prediction", id: key, key: `${version}:${evidenceFingerprint}`, at: new Date(this.now()).toISOString(), identifier: candidate.identifier, issueId: candidate.issueId, version, mode: candidate.mode, selections: verdict.selections, citations: verdict.citations, standing: verdict.standing });
     const latest = (await this.readStore())[key];
     if (!latest || latest.status !== "evaluating") return;
     if (now.deputy.mode !== "live") {
       await this.patch(key, { status: "predicted", reason: undefined, refusalCategory: undefined, version, selections: verdict.selections, citations: verdict.citations, standing: verdict.standing });
       return;
     }
-    const graceDeadline = new Date(Date.parse(candidate.observedAt) + now.deputy.graceMinutes * 60_000).toISOString();
+    const graceDeadline = new Date((freshGrace ? this.now() : Date.parse(candidate.observedAt)) + now.deputy.graceMinutes * 60_000).toISOString();
     const waiting = await this.patch(key, { status: "waiting", reason: undefined, refusalCategory: undefined, version, selections: verdict.selections, citations: verdict.citations, standing: verdict.standing, graceDeadline });
     if (waiting) this.schedule(waiting, generation);
   }
@@ -560,7 +573,12 @@ export class Deputy {
     const evidenceFingerprint = createHash("sha256").update(JSON.stringify([candidate.version, input])).digest("hex");
     // Quotes alone are insufficient: amended policy can retain the quote, and a new
     // blocking-only source can contradict it. Legacy predictions without a snapshot fail closed.
-    if (candidate.evidenceFingerprint !== evidenceFingerprint) { await this.outcome(candidate, "canceled", "the evaluator evidence changed since the prediction"); return; }
+    if (candidate.evidenceFingerprint !== evidenceFingerprint) {
+      if (this.stopped || this.revoked.has(key) || generation !== this.settingsGeneration) return;
+      if (!candidate.evidenceFingerprint) await this.outcome(candidate, "canceled", "the prediction has no evidence snapshot");
+      else await this.refuse(candidate, candidate.version!, "the evaluator evidence changed since the prediction", "evidence-changed");
+      return;
+    }
     const stale = (candidate.citations ?? []).find((citation) => typeof verifyCitation(assessed.sources, citation.sourceId, citation.quote) === "string");
     if (stale) { await this.outcome(candidate, "canceled", `the sources changed since the prediction (${stale.sourceId})`); return; }
     const arbiter = await this.arbiter();

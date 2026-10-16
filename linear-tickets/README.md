@@ -4411,8 +4411,12 @@ old selections, citations, intent and grace are discarded. An equivalent new req
 the old candidate and gets fresh evaluation/grace, never a copied answer. Interrupted/unknown
 dispatches are never replayed. Unavailable sources/evaluators retry at most every five minutes.
 Dispatch fingerprints the complete evaluator input, including blocking-only sources. Changed
-input cancels even if an old quotation remains — a ticket comment the owner edited, deleted or
-wrote during the grace period cancels the prediction instead of being outrun. Settings changes
+input invalidates the prediction even if an old quotation remains. The exact still-pending
+question is reconsidered after the five-minute retry interval, with fresh sources and evaluation;
+a replacement prediction receives a full new grace period. An edited, deleted or new owner
+constraint can therefore refuse the earlier answer, never be outrun by it. Each evidence-bound
+prediction remains journaled; retries add no empirical cases. Missing-snapshot predictions and
+previously canceled work remain terminal. Settings changes
 synchronously revoke unsent work, including change-away/change-back; the checked arbiter checks
 revocation after async admission immediately before sending. A response already on the wire
 retains its real outcome.
