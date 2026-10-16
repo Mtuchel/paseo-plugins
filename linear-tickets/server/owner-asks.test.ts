@@ -11,6 +11,7 @@ import { answerAskRpc, ownerAsksRpc, triageAskRpc, type OwnerAsk } from "../shar
 import type { BrowserOwnerAsk } from "../shared/decision-inbox";
 import { checkExtraction, type ExtractInput, type Extraction } from "./owner-ask-extract";
 import { PermissionReplies, type DeliveryOrigin, type DeliveryResult } from "./permission-replies";
+import { NeedsYouIssues } from "./needs-you";
 
 const at = "2026-10-09T12:00:00.000Z";
 const NOW = Date.parse(at);
@@ -74,7 +75,7 @@ async function setup(options: {
       complete: async (issueId) => { events.push(`complete ${issueId}`); },
       viewerId: async () => "owner-1",
     },
-    needsYou: { all: async () => state.needsYou, remove: async (id) => { events.push(`needsYou.remove ${id}`); } },
+    needsYou: { all: async () => state.needsYou, allStrict: async () => state.needsYou, remove: async (id) => { events.push(`needsYou.remove ${id}`); } },
     handover: { read: async (issueId) => state.records.get(issueId) ?? null },
     remoteAgent: async () => false,
     labels: async () => ({ needsYou: "paseo-needs-you", manual: "paseo-manual" }),
@@ -1021,3 +1022,69 @@ for (const parentField of ["parentId", "parentIdentifier"] as const) {
     assert.equal((await reloaded.snapshot(null)).history.length, 2);
   });
 }
+
+for (const retryBeforeRestart of [false, true]) {
+  test(`confirmed completion retries only tracking cleanup when the completed issue leaves open discovery${retryBeforeRestart ? " before and after restart" : " after restart"}`, async t => {
+    const h = await setup({ issues: [issue()] });
+    t.after(() => h.ownerAsks.stop());
+    const tracked = new NeedsYouIssues(join(h.directory, "needs-you"));
+    await tracked.add({ id: "i1", identifier: "TUC-1616", parentId: "p1", agentId: "a1" });
+    h.deps.needsYou = tracked;
+    const remove = tracked.remove.bind(tracked);
+    let failRemoval = true;
+    tracked.remove = async (...args: Parameters<NeedsYouIssues["remove"]>) => {
+      if (failRemoval) throw new Error("Tracking removal temporarily unavailable");
+      await remove(...args);
+    };
+    h.deps.linear.complete = async id => {
+      h.events.push(`complete ${id}`);
+      h.state.issues = h.state.issues.filter(current => current.id !== id);
+    };
+    const input = await inputFor(h);
+    await assert.rejects(h.ownerAsks.answer(input, h.paseo), /Tracking removal temporarily unavailable/);
+    assert.deepEqual(await h.deps.linear.ownerAskIssues(), [], "completed issues no longer appear in the actual discovery response");
+    failRemoval = false;
+    if (retryBeforeRestart) await h.ownerAsks.answer(input, h.paseo);
+    h.ownerAsks.stop();
+    h.ownerAsks = new OwnerAsks(h.deps);
+    await h.ownerAsks.answer(input, h.paseo);
+    await h.ownerAsks.answer(input, h.paseo);
+    assert.deepEqual(await tracked.allStrict(), [], "the original registered owner blocker is removed after confirmed completion");
+    assert.equal(h.continued.length, 1, "the confirmed answer/continuation is never dispatched again");
+    assert.deepEqual(h.events.filter(event => event.startsWith("complete ")), ["complete i1"], "tracking recovery never repeats Linear completion");
+  });
+}
+
+test("completed-answer cleanup cannot remove a replacement owner registration after the same issue reopens", async t => {
+  const h = await setup({ issues: [issue()] });
+  t.after(() => h.ownerAsks.stop());
+  const tracked = new NeedsYouIssues(join(h.directory, "needs-you"));
+  const registration = { id: "i1", identifier: "TUC-1616", parentId: "p1", agentId: "a1" };
+  await tracked.add(registration);
+  h.deps.needsYou = tracked;
+  const remove = tracked.remove.bind(tracked);
+  let failRemoval = true;
+  tracked.remove = async (...args: Parameters<NeedsYouIssues["remove"]>) => {
+    if (failRemoval) throw new Error("Tracking removal temporarily unavailable");
+    await remove(...args);
+  };
+  h.deps.linear.complete = async id => {
+    h.events.push(`complete ${id}`);
+    h.state.issues = h.state.issues.filter(current => current.id !== id);
+  };
+  const input = await inputFor(h);
+  await assert.rejects(h.ownerAsks.answer(input, h.paseo), /Tracking removal temporarily unavailable/);
+  await tracked.add(registration);
+  const replacement = await tracked.allStrict();
+  h.state.issues = [issue()];
+  failRemoval = false;
+  h.ownerAsks.stop();
+  h.ownerAsks = new OwnerAsks(h.deps);
+  await h.ownerAsks.answer(input, h.paseo);
+  await h.ownerAsks.answer(input, h.paseo);
+  assert.deepEqual(await tracked.allStrict(), replacement, "the prior completion does not authorize deletion of a new registration with the same issue/agent/parent");
+  const current = await untilAsk(h, ask => ask.sourceId === "description" && ask.extracted);
+  assert.notEqual(current.revision, input.revision, "a new registered wait cannot inherit old consent even with identical question text");
+  assert.equal(h.continued.length, 1);
+  assert.deepEqual(h.events.filter(event => event.startsWith("complete ")), ["complete i1"], "old exact retries do not complete reopened owner work");
+});

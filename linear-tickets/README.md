@@ -4730,7 +4730,17 @@ source remains unsettled; unknown/unclassified history blocks whole-issue comple
 answer settles its selected source only. Completion after the last confirmed source answer also
 checks the unchanged material source scope and other sources' receipts or cited reconciliation;
 posting that answer's own receipt does not count as a material source edit. Failed completion
-can retry its pending effect without reposting the answer. It does not invent bulk answers.
+can retry its pending effect without reposting the answer. Successful completion is durably
+checkpointed separately from removal of its saved "Needs you" registration: an exact retry,
+including after restart and disappearance from the open-issue inventory, retries only cleanup,
+never the answer or completion. Cleanup is bound to that registration's identity; a reopened
+issue's replacement registration is not deleted. Registration and checked removal share a local
+mutation lane, and fresh registrations receive a new identity even when issue, parent, agent and
+question text are unchanged. That identity participates in the material source scope, so the
+replacement cannot inherit old consent. Legacy completion progress without a saved tracking
+identity cannot remove an existing registration without verification. Fresh answer/completion
+authority reads the strict tracking inventory; unreadable or invalid records fail closed.
+This does not invent bulk answers.
 The shared reply arbiter, including receipt recovery, leaves completion for the durable
 `owner-ask:` namespace to this source-aware inbox path. On a
 parent ticket it only records the comment and leaves the state to the agent, whose next turn settles

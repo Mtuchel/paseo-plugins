@@ -3,6 +3,7 @@ import { mkdir, open, readFile, rename, rm } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { z } from "zod";
 import { decisionReceiptSchema, type DecisionReceipt } from "../shared/contracts";
+import { needsYouIssueSchema } from "./needs-you";
 
 const decisionRecordSchema = z.object({
   receipt: decisionReceiptSchema,
@@ -14,7 +15,11 @@ const decisionRecordSchema = z.object({
   disposition: z.enum(["research", "delegated", "deferred"]).nullable(),
   deferredUntil: z.string().datetime().nullable(),
   comment: z.object({ issueId: z.string(), body: z.string(), done: z.boolean() }).nullable(),
-  close: z.object({ issueId: z.string(), needsYou: z.boolean(), done: z.boolean() }).nullable(),
+  close: z.object({
+    issueId: z.string(), needsYou: z.boolean(), done: z.boolean(),
+    completed: z.boolean().optional(),
+    tracking: needsYouIssueSchema.nullable().optional(),
+  }).nullable(),
 });
 export type DecisionRecord = z.infer<typeof decisionRecordSchema>;
 const ledgerSchema = z.object({ version: z.literal(1), records: z.record(z.string(), decisionRecordSchema) });

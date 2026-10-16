@@ -6,7 +6,7 @@ import type { DecisionReceipt, OwnerAsk } from "../shared/contracts";
 import type { BrowserOwnerAsk } from "../shared/decision-inbox";
 import type { Handover, HandoverRecord } from "./handover";
 import type { LinearService, OwnerAskComment, OwnerAskIssue } from "./linear";
-import type { NeedsYouIssues } from "./needs-you";
+import type { NeedsYouIssue, NeedsYouIssues } from "./needs-you";
 import { askHash, EXTRACTION_VERSION, MAX_SOURCE_CHARS, type AskQuestion, type ExtractInput, type Extraction, type ExtractedAsk } from "./owner-ask-extract";
 import type { DeliveryOrigin, DeliveryResult } from "./permission-replies";
 import { LIVE_AGENT } from "./process-liveness";
@@ -32,7 +32,7 @@ const AGENT_PAGE = 200;
 // A decision always bypasses this cache before delivery; external edits appear within a minute.
 const LINEAR_SOURCE_CACHE_MS = 60_000;
 type Linear = Pick<LinearService, "ownerAskIssues" | "ownerAskIssuesByIds" | "ownerAskComments" | "commentBody" | "comment" | "complete" | "viewerId">;
-type NeedsYou = Pick<NeedsYouIssues, "all" | "remove">;
+type NeedsYou = Pick<NeedsYouIssues, "all" | "allStrict" | "remove">;
 
 export type ContinueOutcome = { kind: "started" | "live" | "deferred" | "failed" | "forwarded" | "skipped"; reason?: string; peer?: string };
 
@@ -71,7 +71,7 @@ type TriageAskResult = NonNullable<DecisionRecord["result"]>;
 // `request` fences the daemon request relayed by this exact wait source. "Retired" means no
 // request remains pending on this host, not proof that every underlying business question was
 // answered. Independently cited current owner evidence can retain attention, never old dispatch.
-type Draft = { issue: OwnerAskIssue; manual: boolean; text: string; sourceId: string; context: AskContext; needsYou: string | null; route: OwnerAsk["route"]; agentId: string | null; ticketAgentId: string | null; ticketId: string; ticketIdentifier: string; request: "pending" | "retired" | null };
+type Draft = { issue: OwnerAskIssue; manual: boolean; text: string; sourceId: string; context: AskContext; needsYou: string | null; tracking: NeedsYouIssue | null; route: OwnerAsk["route"]; agentId: string | null; ticketAgentId: string | null; ticketId: string; ticketIdentifier: string; request: "pending" | "retired" | null };
 type ExtractionState = { hash: string; value: ExtractedAsk | null; attempts: number; nextAt: number; running: boolean };
 type ExtractionJob = { issueId: string; hash: string; input: ExtractInput };
 type StoredExtraction = { hash: string; version: string; model: string; result: ExtractedAsk | null; attempts: number; nextAt: string | null; at: string };
@@ -147,6 +147,7 @@ function sourceScope(draft: Draft): string {
     sourceKind: draft.sourceId === "description" ? "description" : "comment",
     // A comment's unchanged words do not authorize a changed enclosing business scope.
     description: draft.issue.description, text: draft.text,
+    registrationId: draft.tracking?.registrationId,
   }));
 }
 
@@ -336,7 +337,10 @@ export class OwnerAsks {
       const sent = await this.dispatch(draft, input, value, text, key, paseo);
       record.result = sent.result;
       if (sent.commentIssueId) record.comment = { issueId: sent.commentIssueId, body: `Answered from the decision inbox: ${text}`, done: false };
-      if (!triage && draft.needsYou) record.close = { issueId: draft.issue.id, needsYou: true, done: false };
+      if (!triage && draft.needsYou) record.close = {
+        issueId: draft.issue.id, needsYou: true, done: false,
+        completed: sent.result.delivered === "closed", tracking: draft.tracking,
+      };
     }
     record.receipt.delivery = record.result.delivered;
     await this.ledger.put(key, record);
@@ -388,8 +392,7 @@ export class OwnerAsks {
   private async finishEffects(key: string, original: DecisionRecord, paseo: PaseoApi | null): Promise<TriageAskResult> {
     let record = original;
     if (record.close && !record.close.done) {
-      if (record.result?.delivered === "closed") await this.deps.needsYou.remove(record.close.issueId);
-      else {
+      if (!record.close.completed && record.result?.delivered !== "closed") {
         const drafts = (await this.collect(paseo, undefined, true)).filter(draft => draft.issue.id === record.receipt.issueId);
         const current = drafts.find(draft => record.sourceId === undefined || record.sourceId === draft.sourceId);
         // Posting our answer changes timeline/extraction context, not the source's material scope.
@@ -398,12 +401,24 @@ export class OwnerAsks {
           ? record.sourceId === current.sourceId && record.sourceHash === askHash(current.text) && record.sourceScope === sourceScope(current)
           : revision(current, (await this.extractionFor(extractionKey(current), extractionHash(current)))?.value ?? null) === record.receipt.revision);
         if (unchanged && await this.sourcesSettled(drafts)) {
-          // This is a durable retryable effect, not the shared best-effort closure helper.
+          // Commit confirmed completion before retryable cleanup; the issue leaves open
+          // discovery immediately, so neither absence nor redispatch can recover this fact.
           await this.deps.linear.complete(record.close.issueId);
-          await this.deps.needsYou.remove(record.close.issueId);
+          record = { ...record, close: { ...record.close, completed: true,
+            tracking: record.close.tracking === undefined ? current.tracking : record.close.tracking } };
+          await this.ledger.put(key, record);
         }
       }
-      record = { ...record, close: { ...record.close, done: true } };
+      if (record.close!.completed || record.result?.delivered === "closed") {
+        const tracking = record.close!.tracking;
+        if (tracking === undefined) {
+          // Old progress without a saved identity cannot authorize deleting current owner work.
+          if ((await this.deps.needsYou.allStrict()).some(entry => entry.id === record.close!.issueId)) {
+            throw new Error("Completed decision has no saved needs-you identity; tracking cleanup requires verification.");
+          }
+        } else if (tracking) await this.deps.needsYou.remove(record.close!.issueId, tracking);
+      }
+      record = { ...record, close: { ...record.close!, done: true } };
       await this.ledger.put(key, record);
     }
     if (record.comment && !record.comment.done) {
@@ -488,7 +503,7 @@ export class OwnerAsks {
       : await this.cachedIssues();
     const issues = issueId ? inventory.filter(issue => issue.id === issueId) : inventory;
     const [needsYou, labels, agents] = await Promise.all([
-      this.deps.needsYou.all(),
+      fresh ? this.deps.needsYou.allStrict() : this.deps.needsYou.all(),
       this.deps.labels(),
       this.agentIndex(paseo),
     ]);
@@ -541,7 +556,7 @@ export class OwnerAsks {
         // this historical source must still admit exact later resolution evidence.
         const context = askContext(sourceId, timeline, waiting?.commentId ?? null, currentWait && request !== "retired", false);
         const separate = (subIssue && !currentWait) || (waiting?.kind === "request" && !mirror);
-        drafts.push({ issue, manual: manual(issue), text, sourceId, context, needsYou: isNeedsYou(issue) ? issue.id : null,
+        drafts.push({ issue, manual: manual(issue), text, sourceId, context, needsYou: isNeedsYou(issue) ? issue.id : null, tracking: needsYouById.get(issue.id) ?? null,
           route: separate ? "comment" : route.route, agentId: separate ? null : route.agentId,
           ticketAgentId: separate ? null : agents.newest.get(ticketId) ?? null, ticketId, ticketIdentifier, request });
       }
