@@ -1,7 +1,8 @@
 import type { PaseoApi, PaseoClient } from "@getpaseo/client";
 import type { PluginServerContext } from "@getpaseo/plugin/server";
+import { randomUUID } from "node:crypto";
 import { branchesRpc, cachedOverviewRpc, capacityRpc, connectRpc, countIssuesRpc, dispatchStatusRpc, agentStatusRpc, focusRpc, getSettingsRpc, issueContextRpc, disconnectRpc, getDefaultPromptRpc, labelPullsRpc, listIssuesRpc, launchAgentRpc, planProjectRpc, presenceRpc, projectsStatusRpc, pullRequestsRpc, searchIssuesRpc, setCapacityRpc, setDefaultPromptRpc, setFocusRpc, setPresenceRpc, setSettingsRpc, skipPlanRpc, statusRpc, answerAskRpc, ownerAsksRpc, triageAskRpc, type CapacityState } from "./shared/contracts";
-import { parentsStatusRpc } from "./shared/contracts";
+import { deputyStatusRpc, parentsStatusRpc, reconcileDeputyRpc } from "./shared/contracts";
 import { projectBranches } from "./server/projects";
 import { LinearService } from "./server/linear";
 import { Launcher } from "./server/launch";
@@ -52,7 +53,7 @@ import { daemonServerId, decidePlannotatorReview, paseoAgentUrl, SessionRouter, 
 import { ParentStore } from "./server/parents";
 import { SmallRoutes } from "./server/small-route";
 import { LimitResumeStore, UsageReader } from "./server/limit-resume";
-import { isUntrusted, planSetup, TicketStarter } from "./server/starter";
+import { isUntrusted, planSetup, QUESTIONS_NOTE, TicketStarter } from "./server/starter";
 import { ShardAssignor } from "./server/worktree-shards";
 import { PLAN_TICKET_ENV } from "./server/plan-policy";
 import { AgentEnvs, sessionEnv } from "./server/agent-env";
@@ -269,6 +270,11 @@ export default function contribute(server: PluginServerContext) {
   const deputyDirectory = DEPUTY_DIRECTORY();
   const deputy = new Deputy({
     settings, log: decisions, linear, sessions,
+    ready: async () => {
+      if (!attachedPaseo) throw new Error("No daemon connection for owner-question restoration.");
+      replies.attach(attachedPaseo);
+      await restoreOwnerHolds();
+    },
     readers: hostReaders({ linear, log: decisions, home: paseoHome(), directory: deputyDirectory, template: async () => (await settings.read()).template ?? DEFAULT_PROMPT_TEMPLATE }),
     evaluate: (input, model) => evaluateWithOmp(input, model, deputyDirectory),
     directory: deputyDirectory,
@@ -522,13 +528,22 @@ export default function contribute(server: PluginServerContext) {
       .catch((error: unknown) => console.error("[linear-tickets] steward control pass failed:", error))
       .finally(() => { stewardRun = null; });
   };
+  const restoreOwnerHolds = (): Promise<void> => {
+    if (!holdSeed) {
+      const seed = sessions.seedHolds();
+      holdSeed = seed;
+      void seed.catch(() => { if (holdSeed === seed) holdSeed = null; });
+    }
+    return holdSeed;
+  };
+  let recoveredReplyEffects = false;
   const attach = (paseo: PaseoApi) => {
     const first = !attached;
     attached = true;
     attachedPaseo = paseo;
     replies.attach(paseo);
-    holdSeed ??= sessions.seedHolds();
-    void holdSeed.then(() => {
+    const ready = restoreOwnerHolds();
+    void ready.then(() => {
       if (stopped) return;
       browserDecisions.start();
       if (!controlTimer) {
@@ -538,7 +553,10 @@ export default function contribute(server: PluginServerContext) {
       }
       asCaller("deputy", () => deputy.attach(paseo));
       asCaller("session-sweep", () => sessions.attach(paseo));
-      if (first) asCaller("session-sweep", () => { void replies.recoverEffects().catch((error: unknown) => console.error(`[linear-tickets] recovering permission reply effects failed: ${error instanceof Error ? error.message : error}`)); });
+      if (!recoveredReplyEffects) asCaller("session-sweep", () => {
+        recoveredReplyEffects = true;
+        void replies.recoverEffects().catch((error: unknown) => console.error(`[linear-tickets] recovering permission reply effects failed: ${error instanceof Error ? error.message : error}`));
+      });
     }).catch((error: unknown) => console.error(`[linear-tickets] restoring owner question holds failed: ${error instanceof Error ? error.message : error}`));
     if (!stopped) {
       // The checked backend and the inbox frontdoor's private credential before the listener: a
@@ -559,6 +577,7 @@ export default function contribute(server: PluginServerContext) {
     asCaller("model-guard", () => modelGuard.attach(paseo));
     asCaller("plan-requests", () => planRequests.attach(paseo));
     void startAgent();
+    return ready;
   };
   const cacheIdentity = async () => {
     const connection = await credentials.read();
@@ -676,16 +695,31 @@ export default function contribute(server: PluginServerContext) {
     return {
       ...saved,
       activation: { ...saved.activation, secretConfigured: Boolean(await readActivationSecret()) },
-      deputy: { ...saved.deputy, recallConfigured: Boolean(await recallAccess(deputyDirectory)), live: { ready: !blockers.length, blockers } },
+      deputy: { ...saved.deputy, recallConfigured: Boolean(await recallAccess(deputyDirectory).catch(() => null)), live: { ready: !blockers.length, blockers, standingPolicyReady: saved.deputy.standingPolicy !== null && !(await deputy.liveBlockers(saved, true)).length } },
       builtin: DEFAULT_PROMPT_TEMPLATE,
     };
   };
   server.handle(getSettingsRpc, async () => settingsView(await settings.read()));
+  server.handle(deputyStatusRpc, (input) => deputy.status(input));
+  server.handle(reconcileDeputyRpc, async (_input, { paseo }) => {
+    await attach(paseo);
+    return deputy.reconcile();
+  });
   server.handle(setSettingsRpc, async (input, { paseo }) => {
     const saved = await settings.patch(input);
-    attach(paseo);
+    const ready = attach(paseo);
     if (input.dispatch) dispatcher.wake();
-    if (input.deputy) await deputy.settingsChanged();
+    const policyChanged = input.deputy !== undefined || input.template !== undefined;
+    const revoked = policyChanged ? await deputy.settingsChanged() : [];
+    if (input.deputy?.standingPolicy !== undefined) {
+      // An explicit host-owner settings write, not an inferred model/identity
+      // claim. Dispatch requires both this audit and the revision-bound setting.
+      await decisions.append({ kind: "deputy-activation", id: `settings:${randomUUID()}`, key: randomUUID(), at: new Date().toISOString(), policy: saved.deputy.standingPolicy, via: "settings-rpc", mode: saved.deputy.mode });
+    }
+    if (policyChanged) {
+      await ready;
+      await deputy.recheckPolicy(revoked, Boolean(input.deputy?.standingPolicy));
+    }
     return settingsView(saved);
   });
   server.handle(launchAgentRpc, async (input, { paseo }) => {
@@ -696,7 +730,7 @@ export default function contribute(server: PluginServerContext) {
     const { template, agentLinearAccess } = current;
     const setup = await planSetup(linear, input.id, input.provider, input.modeId, { tiers, routes: smallRoutes, settings: current });
     const model = tierModel(current, input.provider.split("/")[0], setup.tier?.tier ?? null, { provider: input.provider, ...(input.thinkingOptionId ? { thinkingOptionId: input.thinkingOptionId } : {}) });
-    const launch = { ...input, ...model, modeId: setup.modeId, instructions: [...setup.notes, input.instructions.trim()].filter(Boolean).join("\n\n") };
+    const launch = { ...input, ...model, modeId: setup.modeId, instructions: [...setup.notes, QUESTIONS_NOTE, input.instructions.trim()].filter(Boolean).join("\n\n") };
     const markInProgress = input.markInProgress && setup.policy !== "required";
     // The owner's own start ends any steward incident of the ticket first (README, "Ticket
     // steward"), so a failure of it is a new round with fresh retries.

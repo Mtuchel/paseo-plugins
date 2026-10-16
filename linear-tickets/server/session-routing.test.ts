@@ -18,7 +18,7 @@ type Ctx = { agent?: { kind?: string }; models: { current(): { provider: string;
 type Hook = (event: unknown, ctx: Ctx) => Promise<unknown> | unknown;
 
 const OPUS = { provider: "anthropic", id: "claude-opus-5-5" };
-const FLASH = { provider: "lithos", id: "deepseek-ai/DeepSeek-V4.1-Flash-ultra" };
+const FLASH = { provider: "lithos", id: "deepseek-ai/DeepSeek-V4.1-Flash" };
 
 // One loaded extension per session; `branch`: the session's entries when it starts (a resume).
 function session(model = OPUS, kind?: string, branch: Entry[] = []) {

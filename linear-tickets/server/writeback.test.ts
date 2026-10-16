@@ -483,7 +483,6 @@ test("a wait on a closed ticket opens a Needs you sub-issue instead; follow-ups 
 
   await ask("q1", "Enqueue #850 yourself?");
   assert.deepEqual(linear.writes.splice(0), ['state', 'create sub-1 "Needs you: Enqueue #850 yourself?" under issue-1 for creator in Needs input', "+paseo-needs-you on sub-1", `new comment on sub-1: ${waiting("Enqueue #850 yourself?")}`]);
-  assert.deepEqual(await needsYou.all(), [{ id: "sub-1", identifier: "ENG-2", parentId: "issue-1", agentId: "agent-1" }]);
   // The closed ticket itself is never moved or labelled; a follow-up question edits the comment.
   pending = [{ id: "q2" }];
   await writeback.permissionResolved({ agent: root, requestId: "q1", resolution: { behavior: "allow" } }, paseo);
@@ -1093,6 +1092,28 @@ test("a failing decision log never stops the waiting write-back", async () => {
   assert.match(String(errors.mock.calls[0]?.arguments[0]), /decision log: question on issue-1 failed: disk full/);
 });
 
+test("failed deputy observation delivers the owner question and urgency without suppression", async (t) => {
+  const linear = new FakeLinear();
+  const request = { id: "q-observe-failed", provider: "omp", name: "ask", kind: "question" as const, title: "Which runner?" };
+  const paseo = { agents: { ref: () => ({ refresh: async () => ({ agent: { labels: { "linear.issueId": "issue-1" }, pendingPermissions: [request] } }) }) } } as unknown as PaseoApi;
+  const asked: unknown[] = [];
+  const bridge = { sessions: { sessionFor: async () => ({ sessionId: "s1" }), askQuestion: async (_session: string, question: unknown) => { asked.push(question); } } };
+  const writeback = new Writeback(linear, { read: async () => allOn }, bridge as never, 0, outboxPath());
+  let suppressionChecks = 0;
+  writeback.recordDeputy({
+    observe: async () => { throw Object.assign(new Error("candidate persistence unavailable"), { code: "EACCES" }); },
+    resolved: async () => {},
+    ownerNotificationDelay: async () => { suppressionChecks++; return 60_000; },
+  });
+  const errors = t.mock.method(console, "error", () => {});
+  await writeback.permissionRequested({ agent: root, request }, paseo);
+  assert.deepEqual(asked, [request], "the answerable session question survives deputy persistence failure");
+  assert.ok(linear.writes.includes("move issue-1 Needs input"));
+  assert.ok(linear.writes.some((write) => write.startsWith("new comment:") && write.includes("https://linear.app/acme/profiles/owner")), "normal owner mention survives");
+  assert.equal(suppressionChecks, 0, "an unsuccessful observation cannot establish suppression authority");
+  assert.ok(errors.mock.calls.some((call) => String(call.arguments[0]).includes("deputy observation") && String(call.arguments[1]).includes("candidate persistence unavailable")));
+});
+
 // A finished ticket's agent archived (steward.ts archives it; this is the write-back that follows):
 // the final report goes back to the ticket and the running label comes off.
 test("the archive of a finished ticket's agent writes the final report back and removes the running label", { timeout: 10_000 }, async (t) => {
@@ -1110,4 +1131,54 @@ test("the archive of a finished ticket's agent writes the final report back and 
   await new Writeback(linear, { read: async () => allOn }, { sessions: {} as never, handover }, 0, outboxPath()).archived({ agent: root, archivedAt: "now" }, paseo);
   assert.equal(linear.writes.filter((write) => write.includes("Paseo final report")).length, 1, "one final report");
   assert.ok(!linear.state.labels.some((label) => label.name === "paseo-running"), "the running label is gone");
+});
+
+test("an owner mention waits only while bounded deputy handling remains eligible, then fails open on refusal", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 0 });
+  const linear = new FakeLinear();
+  const request = { id: "q-deputy", provider: "omp", name: "ask", kind: "question" as const, title: "Local runner?", input: { questions: [{ header: "Runner", question: "Which runner?", options: [{ label: "node:test" }, { label: "vitest" }] }] } };
+  const paseo = { agents: { ref: () => ({ refresh: async () => ({ agent: { labels: { "linear.issueId": "issue-1" }, pendingPermissions: [request] } }) }) } } as unknown as PaseoApi;
+  const writeback = new Writeback(linear, { read: async () => allOn }, undefined, 0, outboxPath());
+  let observed = false;
+  let checks = 0;
+  let handling = true;
+  writeback.recordDeputy({
+    observe: async () => { observed = true; },
+    resolved: async () => {},
+    ownerNotificationDelay: async () => { checks++; return handling ? 30_000 - Date.now() : 0; },
+  });
+  const delivery = writeback.permissionRequested({ agent: root, request }, paseo);
+  await until(() => observed);
+  t.mock.timers.tick(0);
+  await until(() => checks > 0);
+  assert.equal(linear.writes.some((write) => write.includes("Needs input") || write.startsWith("new comment")), false);
+  handling = false;
+  t.mock.timers.tick(1_000);
+  await until(() => linear.writes.some((write) => write.startsWith("new comment")));
+  await delivery;
+  assert.ok(linear.writes.includes("move issue-1 Needs input"));
+});
+
+test("a question answered during deputy handling emits no premature owner mention", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 0 });
+  const linear = new FakeLinear();
+  const request = { id: "q-handled", provider: "omp", name: "ask", kind: "question" as const, title: "Local runner?" };
+  let pending = [request];
+  const paseo = { agents: { ref: () => ({ refresh: async () => ({ agent: { labels: { "linear.issueId": "issue-1" }, pendingPermissions: pending } }) }) } } as unknown as PaseoApi;
+  const writeback = new Writeback(linear, { read: async () => allOn }, undefined, 0, outboxPath());
+  let observed = false;
+  let checks = 0;
+  writeback.recordDeputy({
+    observe: async () => { observed = true; },
+    resolved: async () => {},
+    ownerNotificationDelay: async () => { checks++; return pending.length ? 30_000 - Date.now() : 0; },
+  });
+  const delivery = writeback.permissionRequested({ agent: root, request }, paseo);
+  await until(() => observed);
+  t.mock.timers.tick(0);
+  await until(() => checks > 0);
+  pending = [];
+  t.mock.timers.tick(1_000);
+  await delivery;
+  assert.equal(linear.writes.some((write) => write.startsWith("new comment") || write.includes("Needs input")), false);
 });

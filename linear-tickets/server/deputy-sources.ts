@@ -4,16 +4,16 @@ import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
+import { AUTONOMY_POLICY, AUTONOMY_POLICY_REVISION } from "../shared/autonomy-policy";
 import type { LinearService } from "./linear";
 import type { Citation, CitationKind, DecisionLog, LogEntry } from "./owner-decisions";
 import { normalize } from "./owner-decisions";
 
-// Knowledge second (README, "Deputy for agent questions"): the recorded knowledge a question may be
-// decided from, read in the owner's order of authority, each source cut into short sections of
-// which only those that share words with the question are shown to the evaluator. A source the
-// deputy cannot read when it should exist makes it abstain: it never answers from less than the
-// owner would expect it to have read.
+// Standing delegation, complete approved-plan/local-rule constraints, and relevant
+// register/README/history excerpts. Missing configured evidence fails closed;
+// lexical relevance must never hide current task or repository constraints.
 //
+// 0. the owner's complete standing technical delegation, including its safety boundaries;
 // 1. the ticket's approved plan (its "Plan:" document, approved in Plannotator, on a plan-ready ticket);
 // 2. `docs/principles/` (approved.md, decisions.md, decision-queue.md) at one `origin/main` commit;
 // 3. the plugin README, the launch template and the agent repository's AGENTS.md;
@@ -43,7 +43,7 @@ export type Question = { id: string; issueId: string; identifier: string; cwd: s
 
 const SECTION_CHARS = 2_400;
 const TOTAL_CHARS = 40_000;
-const PER_SOURCE = { plan: 6, principles: 6, queue: 3, rules: 6, answers: 5, memories: 5 };
+const PER_SOURCE = { principles: 6, queue: 3, rules: 6, answers: 5, memories: 5 };
 const STOP = new Set("about above after again agent also because been before being below between both but can cannot could does doing down during each from further have having here how into its itself just more most must need only other over same should some such than that their them then there these they this those through under until very want what when where which while will with would your yours yourself the and for are was were not you our out any all".split(" "));
 
 export const hash = (text: string) => createHash("sha256").update(text).digest("hex").slice(0, 12);
@@ -137,10 +137,17 @@ function relevant(text: string, question: Set<string>, limit: number): { index: 
 
 const APPROVED_PLAN = /^> \*\*Approved\*\* in Plannotator/;
 const NOT_BINDING = /^-\s*Outcome:\s*(?:rejected|superseded|withdrawn|deferred)\b/im;
+export function standingSources(): Source[] {
+  return Object.entries(AUTONOMY_POLICY).map(([section, text]) => ({
+    id: `standing-policy:${section}`, kind: "rules", title: `Owner standing autonomy — ${section}`,
+    revision: `${AUTONOMY_POLICY_REVISION}/${hash(text)}`, text, decisive: true,
+  }));
+}
+
 
 export async function gatherSources(readers: SourceReaders, question: Question, principlesRepository: string | null): Promise<Snapshot> {
   const words = terms(question.text);
-  const sources: Source[] = [];
+  const sources = standingSources();
   const add = (source: Source) => sources.push({ ...source, text: source.text.slice(0, SECTION_CHARS) });
 
   // 1. The approved plan.
@@ -155,25 +162,24 @@ export async function gatherSources(readers: SourceReaders, question: Question, 
     // deputy without the plan's constraints: it abstains rather than decide from less.
     if (!plan || !APPROVED_PLAN.test(plan.content.trim())) return { sources: [], abstain: plan ? "the ticket's plan document is not marked approved" : "the ticket has no plan document to check the answer against" };
     const revision = hash(plan.content);
-    for (const section of relevant(plan.content, words, PER_SOURCE.plan)) {
-      add({ id: `plan#${section.index}`, kind: "plan", title: `Plan: ${question.identifier} — ${section.heading || "start"}`, revision, url: plan.url, text: section.body, decisive: true });
-    }
+    sources.push({ id: "plan:approved", kind: "plan", title: `Complete approved plan: ${question.identifier}`, revision, url: plan.url, text: plan.content, decisive: true });
   }
 
   // 2. The principles register at one commit.
-  if (!principlesRepository) return { sources, abstain: "no principles repository is configured (deputy.principlesRepository)" };
-  let principles: Principles;
-  try {
-    principles = await readers.principles(principlesRepository);
-  } catch (error) {
-    return { sources, abstain: `docs/principles on origin/main could not be read (${error instanceof Error ? error.message : error})` };
-  }
-  for (const [file, content] of Object.entries(principles.files)) {
-    const queue = file === "decision-queue.md";
-    const entries = registerEntries(content);
-    for (const section of relevant(content, words, queue ? PER_SOURCE.queue : PER_SOURCE.principles)) {
-      const entry = entries[section.index];
-      add({ id: `principles:${file}:${entry.id}`, kind: "principles", title: `docs/principles/${file} — ${section.heading || "start"}${queue ? " (open proposal, not binding)" : ""}`, revision: principles.commit, text: section.body, decisive: !queue && entry.binding });
+  if (principlesRepository) {
+    let principles: Principles;
+    try {
+      principles = await readers.principles(principlesRepository);
+    } catch (error) {
+      return { sources, abstain: `docs/principles on origin/main could not be read (${error instanceof Error ? error.message : error})` };
+    }
+    for (const [file, content] of Object.entries(principles.files)) {
+      const queue = file === "decision-queue.md";
+      const entries = registerEntries(content);
+      for (const section of relevant(content, words, queue ? PER_SOURCE.queue : PER_SOURCE.principles)) {
+        const entry = entries[section.index];
+        add({ id: `principles:${file}:${entry.id}`, kind: "principles", title: `docs/principles/${file} — ${section.heading || "start"}${queue ? " (open proposal, not binding)" : ""}`, revision: principles.commit, text: section.body, decisive: !queue && entry.binding });
+      }
     }
   }
 
@@ -186,6 +192,12 @@ export async function gatherSources(readers: SourceReaders, question: Question, 
   }
   for (const document of rules) {
     const revision = hash(document.text);
+    // Local instructions and effective launch template are small, authoritative
+    // documents. Include them whole so a nonmatching hold is still visible.
+    if (document.id !== "plugin-readme") {
+      sources.push({ id: `rules:${document.id}`, kind: "rules", title: document.title, revision, ...(document.url ? { url: document.url } : {}), text: document.text, decisive: true });
+      continue;
+    }
     for (const section of relevant(document.text, words, PER_SOURCE.rules)) {
       add({ id: `rules:${document.id}#${section.index}`, kind: "rules", title: `${document.title} — ${section.heading || "start"}`, revision, ...(document.url ? { url: document.url } : {}), text: section.body, decisive: true });
     }
@@ -199,6 +211,11 @@ export async function gatherSources(readers: SourceReaders, question: Question, 
     return { sources, abstain: `earlier owner answers could not be read (${error instanceof Error ? error.message : error})` };
   }
   const asked = new Map(entries.flatMap((entry) => entry.kind === "question" ? [[entry.id, entry] as const] : []));
+  for (const entry of entries) {
+    if (entry.kind !== "deputy-override" || !entry.userId?.trim() || asked.get(entry.id)?.issueId !== question.issueId) continue;
+    // A failed correction delivery does not revoke the owner's instruction.
+    sources.push({ id: `owner-override:${entry.id}:${entry.key}`, kind: "owner-answer", title: `Owner override (${entry.via})`, revision: entry.at, text: entry.text, decisive: true });
+  }
   const answered = entries.flatMap((entry) => {
     const asking = entry.kind === "owner-answer" && entry.userId && entry.id !== question.id ? asked.get(entry.id) : undefined;
     if (!asking || entry.kind !== "owner-answer") return [];
@@ -226,9 +243,8 @@ export async function gatherSources(readers: SourceReaders, question: Question, 
     add({ id: `memory:${memory.id}`, kind: "memory", title: `Remembered${memory.at ? ` (${memory.at.slice(0, 10)})` : ""}, not binding`, revision: memory.id, text: memory.text, decisive: false });
   }
 
-  let total = 0;
-  const kept = sources.filter((source) => (total += source.text.length) <= TOTAL_CHARS);
-  return { sources: kept, abstain: null };
+  if (sources.reduce((total, source) => total + source.text.length, 0) > TOTAL_CHARS) return { sources: [], abstain: "the complete authority/constraint snapshot exceeds the evaluator's source budget; no blocking context was silently omitted" };
+  return { sources, abstain: null };
 }
 
 // A citation the evaluator returned, checked against the snapshot it was given: the source must
@@ -293,15 +309,36 @@ export type RecallAccess = { url: string; bank: string; token: string };
 // user), else omp's configured `hindsight.apiUrl` with bank `omp` and HINDSIGHT_API_TOKEN. The
 // token never leaves this host: not in settings, prompts, citations or reports.
 export async function recallAccess(directory: string, env = process.env): Promise<RecallAccess | null> {
-  const stored: unknown = await readFile(join(directory, "recall.json"), "utf8").then((content) => JSON.parse(content), () => null);
-  if (stored && typeof stored === "object" && "url" in stored && "token" in stored && typeof stored.url === "string" && typeof stored.token === "string" && stored.token) {
-    return { url: stored.url.replace(/\/+$/, ""), bank: "bank" in stored && typeof stored.bank === "string" && stored.bank ? stored.bank : "omp", token: stored.token };
+  const content = await readFile(join(directory, "recall.json"), "utf8").catch((error: unknown) => {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw new Error("Hindsight recall configuration is unreadable");
+  });
+  if (content !== null) {
+    let stored: unknown;
+    try { stored = JSON.parse(content); }
+    catch { throw new Error("Hindsight recall configuration is invalid JSON"); }
+    if (!stored || typeof stored !== "object" || !("url" in stored) || typeof stored.url !== "string" || !("token" in stored) || typeof stored.token !== "string" || !stored.token.trim()
+      || ("bank" in stored && (typeof stored.bank !== "string" || !stored.bank.trim()))) {
+      throw new Error("Hindsight recall configuration requires a valid URL, token and optional bank");
+    }
+    let url: URL;
+    try { url = new URL(stored.url); }
+    catch { throw new Error("Hindsight recall configuration has an invalid URL"); }
+    if (!["http:", "https:"].includes(url.protocol)) throw new Error("Hindsight recall configuration requires an HTTP URL");
+    return { url: stored.url.replace(/\/+$/, ""), bank: "bank" in stored ? stored.bank as string : "omp", token: stored.token };
   }
   const token = env.HINDSIGHT_API_TOKEN;
   if (!token) return null;
-  const config = await readFile(join(homedir(), ".omp", "agent", "config.yml"), "utf8").catch(() => "");
+  const config = await readFile(join(homedir(), ".omp", "agent", "config.yml"), "utf8").catch(() => {
+    throw new Error("Hindsight token is configured but its OMP configuration is unreadable");
+  });
   const url = /^hindsight:\s*\n(?:[ \t]+.*\n)*?[ \t]+apiUrl:\s*["']?([^"'\s]+)/m.exec(config)?.[1];
-  return url ? { url: url.replace(/\/+$/, ""), bank: "omp", token } : null;
+  if (!url) throw new Error("Hindsight token is configured but its API URL is missing or invalid");
+  let parsed: URL;
+  try { parsed = new URL(url); }
+  catch { throw new Error("Hindsight configured API URL is invalid"); }
+  if (!["http:", "https:"].includes(parsed.protocol)) throw new Error("Hindsight configured API URL must use HTTP");
+  return { url: url.replace(/\/+$/, ""), bank: "omp", token };
 }
 
 export async function recall(access: RecallAccess | null, query: string): Promise<Memory[]> {
@@ -333,6 +370,9 @@ export function hostReaders(deps: { linear: Pick<LinearService, "issueDocument">
       return [await pluginReadme(deps.home), template, ...(instructions ? [instructions] : [])];
     },
     ownerAnswers: () => deps.log.entries(),
-    recall: async (query) => recall(await recallAccess(deps.directory), query),
+    recall: async (query) => {
+      const access = await recallAccess(deps.directory);
+      return access ? recall(access, query) : [];
+    },
   };
 }

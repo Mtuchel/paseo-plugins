@@ -1,17 +1,18 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
 import type { PaseoApi } from "@getpaseo/client";
 import type { AgentPermissionRequest } from "@getpaseo/protocol/agent-types";
 import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
+import { AUTONOMY_POLICY_REVISION } from "../shared/autonomy-policy";
 import { Deputy, fingerprint, overrideCommand, readCandidates, type ArbitratedOutcome, type PermissionArbiter } from "./deputy";
-import { checkVerdict, evaluationPrompt, policyVersion } from "./deputy-evaluator";
+import { checkVerdict, policyVersion } from "./deputy-evaluator";
 import { LIVE_MIN_CASES, shadowEvidence } from "./deputy-evidence";
 import { renderReport, verdict, waitStats } from "./deputy-report";
 import { assessRisk, type Part } from "./deputy-risk";
-import { gatherSources, registerEntries, type Source, type SourceReaders } from "./deputy-sources";
+import { gatherSources, hostReaders, recallAccess, registerEntries, standingSources, type Source, type SourceReaders } from "./deputy-sources";
 import type { IssueState } from "./linear";
 import { DecisionLog, type LogEntry } from "./owner-decisions";
 import { PermissionReplies } from "./permission-replies";
@@ -35,14 +36,14 @@ function question(id = "r1", options = ["node:test", "vitest"], extra: Partial<A
 
 // --- Risk first -----------------------------------------------------------------------------------
 
-test("only a trusted, plan-approved, unattended question with options for every required part gets past the risk floor", () => {
+test("trusted structured questions qualify independently of planning or attended metadata", () => {
   const verdict = assessRisk(question(), trusted);
   assert.deepEqual(verdict, { ok: true, parts: [{ key: "Runner", question: "Runner: Which test runner should the new module's tests use?", options: ["node:test", "vitest"], effects: {} }] }, "the optional empty comment stays empty");
   assert.equal(assessRisk({ ...question(), kind: "tool" }, trusted).ok, false, "tool approvals stay with the owner");
   assert.equal(assessRisk({ ...question(), kind: "plan" }, trusted).ok, false, "plan approvals stay with the owner");
   assert.deepEqual(assessRisk(question(), { ...trusted, trusted: false }), { ok: false, category: "untrusted", reason: "the ticket was not written by the owner" });
-  assert.equal(assessRisk(question(), { ...trusted, planning: true }).ok && "x", false, "a question while planning decides the plan");
-  assert.equal(assessRisk(question(), { ...trusted, attended: true }).ok, false);
+  assert.equal(assessRisk(question(), { ...trusted, planning: true }).ok, true);
+  assert.equal(assessRisk(question(), { ...trusted, attended: true }).ok, true);
   const free = question("r2", ["Other (type your own)"]);
   assert.equal((assessRisk(free, trusted) as { category: string }).category, "free-text", "a required free-text part leaves the whole request with the owner");
   const multi = question();
@@ -50,29 +51,30 @@ test("only a trusted, plan-approved, unattended question with options for every 
   assert.equal((assessRisk(multi, trusted) as { category: string }).category, "unsupported");
 });
 
-test("every owner-kept category is refused, wherever in the request it shows, including an option's effect", () => {
-  const cases: [string, string][] = [
-    ["business-decision", "Which discount applies to returning customers?"],
-    ["user-facing-wording", "Which button label should the dialog show?"],
-    ["production-data", "Run the backfill against production now?"],
-    ["external-accounts-or-spend", "Upgrade the plan to get more API credits?"],
-    ["security-or-permissions", "Should the service token get write permissions?"],
-    ["deleting-data-or-history", "Delete the old upload records?"],
-    ["irreversible", "Apply the change permanently?"],
-    ["destructive-git", "Force-push the rewritten branch?"],
-    ["owner-reserved", "Deploy the service to Railway now?"],
-  ];
-  for (const [category, text] of cases) {
-    const request = question("r", ["Yes", "No"]);
-    (request.input!.questions as Record<string, unknown>[])[0].question = text;
-    const verdict = assessRisk(request, trusted);
-    assert.equal(verdict.ok, false, text);
-    assert.equal((verdict as { category: string }).category, category, text);
+test("domain words and rejected options do not veto semantic action evaluation; descriptions remain intact", () => {
+  for (const description of [
+    "The PR is above/about the usual size; continue the approved fix.",
+    "Correct the purchase fixture without changing purchasing policy.",
+    "Repair merge-buffer enumeration and Git read-only branch listing.",
+    "Use authorized core-staging credentials in a scoped staging-only process.",
+    "Prepare a revised no-reset plan; do not execute the production cutover.",
+  ]) {
+    const result = assessRisk(question("r", undefined, { description }), trusted);
+    assert.equal(result.ok, true, description);
   }
-  // A harmless label with a risky effect.
-  const misleading = question("r", ["Option A", "Option B"]);
-  (misleading.input!.questions as { options: { label: string; description?: string }[] }[])[0].options[1].description = "also drops table uploads";
-  assert.equal((assessRisk(misleading, trusted) as { category: string }).category, "deleting-data-or-history");
+  const request = question("r", ["Read-only investigation", "Destructive production reset"]);
+  (request.input!.questions as { options: { label: string; description?: string }[] }[])[0].options[1].description = "DROP production tables and reset Git history";
+  const result = assessRisk(request, trusted);
+  assert.ok(result.ok);
+  assert.equal(result.parts[0].effects["Destructive production reset"], "DROP production tables and reset Git history", "the evaluator must see every bundled consequence, not a sanitized label");
+});
+
+test("ambiguous duplicate labels or part keys are ineligible for checked answer construction", () => {
+  assert.equal(assessRisk(question("r", ["Yes", "Yes"]), trusted).ok, false);
+  const request = question();
+  const items = request.input!.questions as Record<string, unknown>[];
+  items.push({ ...items[0] });
+  assert.equal(assessRisk(request, trusted).ok, false);
 });
 
 // --- The evaluator's answer -------------------------------------------------------------------------
@@ -83,11 +85,23 @@ const sources: Source[] = [
   { id: "principles:decision-queue.md:Q-3", kind: "principles", title: "queue", revision: "bbb", text: "Proposal: switch every module to vitest for watch mode.", decisive: false },
   { id: "memory:m1", kind: "memory", title: "Remembered", revision: "m1", text: "The owner once said vitest is nicer to use day to day.", decisive: false },
 ];
-const answer = (body: Record<string, unknown>) => JSON.stringify({ risk: "low", riskReason: "", decision: "answer", reason: "", ...body });
+const TECHNICAL_OUTCOME = { scope: "technical", effects: "Technical implementation only; no consequential business/user workflow or permission change." };
+const INTACT_INTEGRITY = Object.fromEntries(["preservation", "ownerArtifacts", "acceptance", "gates"].map(key => [key, { state: "not-implicated", reason: "This bounded local action leaves the requirement intact and claims no exception or missing prerequisite." }]));
+function answer(body: Record<string, unknown>): string {
+  const selections = body.selections && typeof body.selections === "object" ? Object.entries(body.selections) : [];
+  const actions = Object.fromEntries(selections.map(([part, option]) => [part, { option, actor: "agent", risk: "low", effects: `Use ${option} for the local test runner`, outcome: TECHNICAL_OUTCOME, integrity: INTACT_INTEGRITY, reason: "Authorized by the cited approved plan", authority: "specific" }]));
+  return JSON.stringify({ risk: "low", riskReason: "", decision: "answer", reason: "", actions, ...body });
+}
+
+function signal(): { promise: Promise<void>; resolve: () => void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>((ready) => { resolve = ready; });
+  return { promise, resolve };
+}
 
 test("an evaluator answer counts only with an offered option and a verbatim quote from a decisive source", () => {
   const good = checkVerdict(answer({ selections: { Runner: "node:test" }, citations: [{ part: "Runner", source: "plan#2", quote: "Tests use the node:test runner" }] }), parts, sources);
-  assert.deepEqual(good, { ok: true, selections: { Runner: "node:test" }, citations: [{ sourceId: "plan#2", kind: "plan", title: "Plan: TUC-1 — Verification", revision: "aaa", quote: "Tests use the node:test runner" }] });
+  assert.deepEqual(good, { ok: true, standing: false, selections: { Runner: "node:test" }, citations: [{ sourceId: "plan#2", kind: "plan", title: "Plan: TUC-1 — Verification", revision: "aaa", quote: "Tests use the node:test runner" }] });
   const refused = (raw: string) => {
     const result = checkVerdict(raw, parts, sources);
     assert.equal(result.ok, false, raw);
@@ -104,9 +118,6 @@ test("an evaluator answer counts only with an offered option and a verbatim quot
   refused("I would pick node:test.");
 });
 
-test("the evaluator sees what every option does, not only its label", () => {
-  assert.match(evaluationPrompt({ identifier: "TUC-1", parts, context: "", sources }), /"vitest" \(effect: "installs vitest and rewrites the test scripts"\)/);
-});
 
 // --- Knowledge second -------------------------------------------------------------------------------
 
@@ -127,22 +138,54 @@ function readers(over: Partial<SourceReaders> = {}, entries: LogEntry[] = []): S
 }
 const asked = { id: "a1:r1", issueId: "i1", identifier: "TUC-1", cwd: "/repo", text: "Which test runner should the new module's tests use? node:test vitest", planApproved: true };
 
-test("sources come in the owner's order; proposals, superseded decisions and memories can only block", async () => {
+test("standing delegation is always citable, while proposals, superseded decisions and memories remain blocking-only", async () => {
   const snapshot = await gatherSources(readers(), asked, "/repo/platform");
   assert.equal(snapshot.abstain, null);
-  assert.deepEqual(snapshot.sources.map((source) => [source.kind, source.decisive]), [["plan", true], ["principles", true], ["principles", false], ["principles", false], ["memory", false]]);
-  assert.match(snapshot.sources[1].title, /P-9/);
-  assert.equal((await gatherSources(readers(), { ...asked, planApproved: false }, "/repo/platform")).sources[0].kind, "principles", "a plan that is not approved is no source");
+  assert.equal(snapshot.sources.find((source) => source.id.includes("approved.md:P-9"))?.decisive, true);
+  assert.equal(snapshot.sources.find((source) => source.id.includes("decisions.md:D-4"))?.decisive, false);
+  assert.equal(snapshot.sources.find((source) => source.id.includes("decision-queue.md:Q-3"))?.decisive, false);
+  assert.equal(snapshot.sources.find((source) => source.kind === "memory")?.decisive, false);
+  const unrelated = await gatherSources(readers(), { ...asked, text: "xyzzy", planApproved: false }, null);
+  const authority = unrelated.sources.find((source) => source.id === "standing-policy:engineering")!;
+  const result = checkVerdict(answer({ selections: { Runner: "node:test" }, actions: { Runner: { option: "node:test", actor: "agent", risk: "low", effects: "Local behavioral test runner, no production changes", outcome: TECHNICAL_OUTCOME, integrity: INTACT_INTEGRITY, reason: "Routine engineering within the authorized outcome", authority: "standing" } }, citations: [{ part: "Runner", source: authority.id, quote: authority.text }] }), parts, unrelated.sources);
+  assert.ok(result.ok && result.standing, "standing authority survives zero keyword overlap and need not dictate the exact runner");
+  assert.equal(unrelated.sources.some((source) => source.kind === "plan"), false, "no unapproved plan authority");
 });
 
 test("an unreadable source that should exist makes the deputy abstain rather than answer from less", async () => {
   assert.match((await gatherSources(readers({ principles: async () => { throw new Error("fetch failed"); } }), asked, "/repo/platform")).abstain ?? "", /principles/);
-  assert.match((await gatherSources(readers(), asked, null)).abstain ?? "", /no principles repository/);
+  assert.equal((await gatherSources(readers(), asked, null)).abstain, null, "an unconfigured optional repository is not an unreadable configured source");
   assert.match((await gatherSources(readers({ recall: async () => { throw new Error("no Hindsight access is configured on this host"); } }), asked, "/repo/platform")).abstain ?? "", /Hindsight/);
   assert.match((await gatherSources(readers({ plan: async () => { throw new Error("HTTP 500"); } }), asked, "/repo/platform")).abstain ?? "", /plan/);
   assert.match((await gatherSources(readers({ plan: async () => null }), asked, "/repo/platform")).abstain ?? "", /no plan document/, "a plan-ready ticket without its plan");
   assert.match((await gatherSources(readers({ plan: async () => ({ url: "https://linear.app/doc/plan", content: "# Draft\n\nTests use node:test." }) }), asked, "/repo/platform")).abstain ?? "", /not marked approved/);
   assert.match((await gatherSources(readers({ ownerAnswers: async () => { throw new Error("journal unavailable"); } }), asked, "/repo/platform")).abstain ?? "", /earlier owner answers/);
+});
+
+test("only truly absent optional recall permits an authority snapshot; unreadable and invalid configured recall refuse", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "deputy-recall-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const previousToken = process.env.HINDSIGHT_API_TOKEN;
+  delete process.env.HINDSIGHT_API_TOKEN;
+  t.after(() => {
+    if (previousToken === undefined) delete process.env.HINDSIGHT_API_TOKEN;
+    else process.env.HINDSIGHT_API_TOKEN = previousToken;
+  });
+  const host = hostReaders({ linear: { issueDocument: async () => null }, log: { entries: async () => [] }, home: directory, directory, template: async () => "" });
+  const snapshot = () => gatherSources(readers({ recall: host.recall }), asked, "/repo/platform");
+  assert.equal(await recallAccess(directory, {}), null);
+  assert.equal((await snapshot()).abstain, null, "missing optional configuration is not a source failure");
+  await mkdir(join(directory, "recall.json"));
+  assert.match((await snapshot()).abstain ?? "", /Hindsight.*unreadable/, "a configured path that cannot be read must not become no recall");
+  await rm(join(directory, "recall.json"), { recursive: true });
+  for (const config of ["{secret-not-valid-json", "null", "{}", JSON.stringify({ url: "not-a-url", token: "private-test-token" }), JSON.stringify({ url: "https://recall.invalid", token: "" })]) {
+    await writeFile(join(directory, "recall.json"), config);
+    const result = await snapshot();
+    assert.match(result.abstain ?? "", /Hindsight.*(invalid|requires)/);
+    assert.ok(!result.abstain?.includes("secret-not-valid-json") && !result.abstain?.includes("private-test-token"), "source failure diagnostics cannot echo credentials");
+  }
+  await writeFile(join(directory, "recall.json"), JSON.stringify({ url: "https://recall.invalid/", bank: "test", token: "private-test-token" }));
+  assert.deepEqual(await recallAccess(directory, {}), { url: "https://recall.invalid", bank: "test", token: "private-test-token" });
 });
 
 test("a decision that is not binding stays so in every excerpt: its subsections and the cut-off rest of a long one", async () => {
@@ -233,11 +276,13 @@ async function harness(t: TestContext, deputy: Partial<DeputySettings> = {}, opt
   const said: string[] = [];
   const sent: string[] = [];
   const responses: string[] = [];
-  const daemon = { pending: options.pending ?? [question()], archived: false };
+  const daemon = { pending: options.pending ?? [question()], archived: false, inventory: false };
+  const currentAgent = (id: string) => ({ id, cwd: "/repo", title: "TUC-1: Add module", status: "running", createdAt: "2026-10-01T00:00:00Z", archivedAt: daemon.archived ? "2026-10-02T00:00:00Z" : null, labels: { "linear.issueId": "i1", "linear.identifier": "TUC-1" }, pendingPermissions: daemon.pending });
   const paseo = {
     agents: {
+      list: async () => ({ entries: daemon.inventory ? [{ agent: currentAgent("a1") }] : [], pageInfo: { hasMore: false } }),
       ref: (id: string) => ({
-        refresh: async () => ({ agent: { id, status: "running", archivedAt: daemon.archived ? "2026-10-02T00:00:00Z" : null, labels: { "linear.issueId": "i1" }, pendingPermissions: daemon.pending } }),
+        refresh: async () => ({ agent: currentAgent(id) }),
         send: async (text: string) => { sent.push(`${id}: ${text}`); },
         respondToPermission: async () => { responses.push("untagged"); },
       }),
@@ -258,7 +303,7 @@ async function harness(t: TestContext, deputy: Partial<DeputySettings> = {}, opt
     readers: readers(),
     evaluate: async (input) => {
       evaluations++;
-      return checkVerdict(answer({ selections: options.verdictSelections ?? { Runner: "node:test" }, citations: [{ source: input.sources.find((source) => source.kind === "plan")?.id, quote: "Tests use the node:test runner" }] }), input.parts, input.sources);
+      return checkVerdict(answer({ selections: options.verdictSelections ?? { Runner: "node:test" }, citations: [{ source: input.sources.find((source) => source.kind === "plan" && source.decisive)?.id, quote: "Tests use the node:test runner" }] }), input.parts, input.sources);
     },
     arbiter: async () => options.arbiter ?? null,
     directory,
@@ -375,7 +420,7 @@ test("an evaluator outage retries the same evidence without classifying it as mi
   assert.deepEqual(h.responses, []);
 });
 
-test("source recovery rechecks risk and does not relax the business or owner-reserved floor", async (t) => {
+test("source recovery permits attended technical continuation rather than blanket refusal", async (t) => {
   const h = await harness(t, { mode: "shadow" });
   h.deps.readers.recall = async () => { throw new Error("offline"); };
   await h.deputy.observe(h.agent, question(), { issueId: "i1", identifier: "TUC-1" });
@@ -384,14 +429,9 @@ test("source recovery rechecks risk and does not relax the business or owner-res
   h.state.labels.push({ id: "attended", name: `${h.settings.dispatch.label}-attended` });
   h.advance(5 * 60_000);
   await h.settle();
-  assert.equal((await h.candidate()).refusalCategory, "attended");
+  assert.equal((await h.candidate()).status, "predicted");
   assert.equal((await h.candidate()).retryAt, undefined);
-  assert.equal(h.evaluations(), 0);
-  for (const description of [
-    "The new mainAt contract breaks probes. Authorize an exception to the approved plan before merging.",
-    "The API contract changes customer pricing in production.",
-    "The technical contract test would drop the table.",
-  ]) assert.equal(assessRisk(question("r", undefined, { description }), trusted).ok, false);
+  assert.equal(h.evaluations(), 1);
 });
 
 for (const change of ["owner", "resolved", "changed", "gone", "off"] as const) {
@@ -1120,5 +1160,548 @@ for (const change of ["off", "model"] as const) {
     assert.equal((await kinds(h)).includes("deputy-answer"), false);
     finishRead();
     await changing;
+  });
+}
+
+test("each selected action requires its own low-consequence assessment and exact offered actor", () => {
+  const base = { option: "node:test", actor: "agent", risk: "low", effects: "Local runner only", outcome: TECHNICAL_OUTCOME, integrity: INTACT_INTEGRITY, reason: "Approved technical implementation", authority: "specific" };
+  for (const actions of [
+    {}, { Runner: { ...base, option: "vitest" } },
+    { Runner: { ...base, risk: "production-write" } },
+    ...[undefined, null, ["agent"], {}, true, "owner", "external", "mixed", "unknown"].map(actor => ({ Runner: { ...base, actor } })),
+    { Runner: { ...base, effects: "" } },
+    { Runner: { ...base, authority: "assumed" } },
+    { Runner: base, Unasked: base },
+  ]) {
+    assert.equal(checkVerdict(answer({ selections: { Runner: "node:test" }, actions, citations: [{ source: "plan#2", quote: "Tests use the node:test runner" }] }), parts, sources).ok, false);
+  }
+  const actorParts = [{ key: "Run", question: "Who runs the trigger?", options: ["Owner runs trigger", "Wait"], effects: {} }];
+  assert.equal(checkVerdict(answer({ selections: { Run: "Agent runs trigger" }, actions: { Run: { ...base, option: "Agent runs trigger" } }, citations: [{ source: "plan#2", quote: "Tests use the node:test runner" }] }), actorParts, sources).ok, false, "delegation does not create an unoffered answer");
+});
+
+test("preparing a PR cannot launder newly chosen business workflow effects, including one unsafe part in a mixed request", () => {
+  const authority = standingSources();
+  const engineering = authority.find(source => source.id === "standing-policy:engineering")!;
+  const businessParts: Part[] = [
+    { key: "Intake", question: "Keep intake off?", options: ["Keep off"], effects: {} },
+    { key: "Fields", question: "May staff edit invoice amount/VAT/currency? Build AC3 as a PR; historical approved scope is unavailable.", options: ["Build AC3"], effects: {} },
+    { key: "Save", question: "Change immediate record creation to mandatory check-before-save? Build AC4 as code only.", options: ["Build AC4"], effects: {} },
+  ];
+  const selections = { Intake: "Keep off", Fields: "Build AC3", Save: "Build AC4" };
+  const action = (option: string, scope: string) => ({ option, actor: "agent", risk: "low", effects: "Only prepare a PR; no business data is entered today", outcome: { scope, effects: scope === "technical" ? "Leave intake disabled" : "Choose editable financial fields or change when business records are saved" }, integrity: INTACT_INTEGRITY, reason: "Proposed task names an AC; approval is not available", authority: "standing" });
+  const actions = { Intake: action("Keep off", "technical"), Fields: action("Build AC3", "new-workflow-choice"), Save: action("Build AC4", "new-workflow-choice") };
+  const citations = businessParts.map(part => ({ part: part.key, source: engineering.id, quote: engineering.text }));
+  const result = checkVerdict(answer({ selections, actions, citations }), businessParts, authority);
+  assert.ok(!result.ok && result.abstention === "owner-boundary");
+  const missingScope = { ...actions, Fields: { ...actions.Fields, outcome: undefined } };
+  assert.equal(checkVerdict(answer({ selections, actions: missingScope, citations }), businessParts, authority).ok, false, "the old code-only assessment is not valid current-policy evidence");
+  const unknownScope = { ...actions, Fields: action("Build AC3", "unknown") };
+  const unknown = checkVerdict(answer({ selections, actions: unknownScope, citations }), businessParts, authority);
+  assert.ok(!unknown.ok && unknown.abstention === "investigate");
+});
+
+test("approved behavior-preserving invoice repair remains delegated, but baseline evidence must be real and cited for that part", () => {
+  const authority = standingSources();
+  const engineering = authority.find(source => source.id === "standing-policy:engineering")!;
+  const baseline: Source = { id: "plan:invoice", kind: "plan", title: "Approved invoice workflow", revision: "approved-1", decisive: true,
+    text: "Approved workflow: the linking drawer already permits staff to edit invoice number/date/amount/VAT/currency. Preserve existing save timing and validation while fixing the stale displayed amount." };
+  const invoiceParts: Part[] = [{ key: "Repair", question: "Fix the stale amount display without changing approved edit rights, required values or saving behavior?", options: ["Fix stale display"], effects: {} }];
+  const outcome = { scope: "preserves-authorized-workflow", effects: "Restore the existing displayed amount; no new edit rights, save timing or validation policy", source: baseline.id, quote: baseline.text };
+  const action = { option: "Fix stale display", actor: "agent", risk: "low", effects: "Behavior-preserving invoice UI repair", outcome, integrity: INTACT_INTEGRITY, reason: "Engineering inside the cited approved baseline", authority: "standing" };
+  const citations = [{ part: "Repair", source: engineering.id, quote: engineering.text }, { part: "Repair", source: baseline.id, quote: baseline.text }];
+  const evaluate = (current: unknown, listed = citations, evidence = [...authority, baseline]) => checkVerdict(answer({ selections: { Repair: "Fix stale display" }, actions: { Repair: current }, citations: listed }), invoiceParts, evidence);
+  const accepted = evaluate(action);
+  assert.ok(accepted.ok && accepted.standing);
+  assert.equal(evaluate(action, citations.slice(0, 1)).ok, false);
+  assert.equal(evaluate(action, citations, authority).ok, false);
+  assert.equal(evaluate({ ...action, outcome: { ...outcome, source: engineering.id, quote: engineering.text } }).ok, false, "standing engineering does not invent a workflow baseline");
+  assert.equal(evaluate({ ...action, outcome: { ...outcome, quote: "The owner approved all invoice changes." } }).ok, false);
+  const approvedChange: Source = { ...baseline, id: "plan:approved-change", text: "Owner approved: replace immediate invoice creation with mandatory check-before-save review and allow staff to correct the listed financial fields before saving." };
+  const changeParts: Part[] = [{ key: "Save", question: "Implement the specifically approved check-before-save workflow?", options: ["Implement approved workflow"], effects: {} }];
+  const changeOutcome = { scope: "authorized-workflow-change", effects: "Mandatory invoice review before creation under the cited approval", source: approvedChange.id, quote: approvedChange.text };
+  const change = { ...action, option: "Implement approved workflow", outcome: changeOutcome };
+  const changeCitations = [{ part: "Save", source: engineering.id, quote: engineering.text }, { part: "Save", source: approvedChange.id, quote: approvedChange.text }];
+  const checkChange = (current: unknown) => checkVerdict(answer({ selections: { Save: "Implement approved workflow" }, actions: { Save: current }, citations: changeCitations }), changeParts, [...authority, approvedChange]);
+  assert.equal(checkChange(change).ok, false, "consequential behavior changes cannot use standing-only activation");
+  const specificallyApproved = checkChange({ ...change, authority: "specific" });
+  assert.ok(specificallyApproved.ok && !specificallyApproved.standing);
+});
+
+test("a boundary-only citation cannot activate standing delegation, and mixed authority retains the empirical gate", () => {
+  const authority = standingSources();
+  const engineering = authority.find((source) => source.id === "standing-policy:engineering")!;
+  const boundaries = authority.find((source) => source.id === "standing-policy:boundaries")!;
+  const action = { option: "node:test", actor: "agent", risk: "low", effects: "Local runner only", outcome: TECHNICAL_OUTCOME, integrity: INTACT_INTEGRITY, reason: "Routine engineering", authority: "standing" };
+  const boundaryOnly = checkVerdict(answer({ selections: { Runner: "node:test" }, actions: { Runner: action }, citations: [{ source: boundaries.id, quote: boundaries.text }] }), parts, authority);
+  assert.equal(boundaryOnly.ok, false);
+  const mixedParts = [...parts, { key: "Second", question: "Second runner?", options: ["node:test", "vitest"], effects: {} }];
+  const mixed = checkVerdict(answer({
+    selections: { Runner: "node:test", Second: "node:test" },
+    actions: { Runner: action, Second: { ...action, authority: "specific" } },
+    citations: [{ part: "Runner", source: engineering.id, quote: engineering.text }, { part: "Second", source: "plan#2", quote: "Tests use the node:test runner" }],
+  }), mixedParts, [...authority, ...sources]);
+  assert.ok(mixed.ok && !mixed.standing);
+});
+
+test("complete plan constraints and authenticated owner overrides cannot be filtered away by lexical relevance", async () => {
+  const hold = "Owner security hold: do not expose the recovery vault.";
+  const snapshot = await gatherSources(readers({
+    plan: async () => ({ url: "https://linear.app/doc/plan", content: `> **Approved** in Plannotator\n\n## Test runner\nTests use the node:test runner\n\n## Unrelated authority\n${hold}` }),
+    rules: async () => [{ id: "agents-md", title: "Repository constraints", text: hold }],
+    ownerAnswers: async () => [
+      { kind: "question", id: "a0:r0", at: "2026-10-07T09:00:00Z", identifier: "TUC-1", issueId: "i1", questions: [] },
+      { kind: "deputy-override", id: "a0:r0", at: "2026-10-07T09:01:00Z", key: "c1", via: "linear-comment", userId: OWNER, text: hold, disposition: "failed" },
+    ],
+  }), { ...asked, text: "xyzzy" }, null);
+  assert.equal(snapshot.abstain, null);
+  assert.ok(snapshot.sources.some((source) => source.kind === "plan" && source.text.includes(hold)));
+  assert.ok(snapshot.sources.some((source) => source.id === "rules:agents-md" && source.text === hold));
+  assert.ok(snapshot.sources.some((source) => source.kind === "owner-answer" && source.text === hold && source.decisive));
+  const oversized = await gatherSources(readers({ plan: async () => ({ url: "https://linear.app/doc/plan", content: `> **Approved** in Plannotator\n${"constraint ".repeat(10_000)}` }) }), asked, null);
+  assert.match(oversized.abstain ?? "", /budget/);
+  assert.deepEqual(oversized.sources, [], "overflow refuses rather than silently dropping a hold");
+});
+
+for (const entry of ["startup", "activation"] as const) {
+  test(`${entry} discovers an already-pending exact request without a re-ask, evaluates fresh once and preserves full checked grace`, async t => {
+    const h = await standingHarness(t);
+    await h.settle();
+    assert.deepEqual(await readCandidates(h.directory), {});
+    let evaluations = 0;
+    const evaluate = h.deps.evaluate;
+    h.deps.evaluate = async (...args) => { evaluations++; return evaluate(...args); };
+    h.daemon.inventory = true;
+    let deputy = h.deputy;
+    if (entry === "startup") {
+      h.deputy.stop();
+      deputy = new Deputy(h.deps);
+      t.after(() => deputy.stop());
+      deputy.attach(h.paseo);
+    } else {
+      h.settings.deputy.mode = "off";
+      const canceled = await deputy.settingsChanged();
+      assert.deepEqual(await deputy.reconcile(), { observed: 0, skipped: 0, failed: 0 });
+      h.settings.deputy.mode = "live";
+      await deputy.recheckPolicy(canceled, true);
+    }
+    await Promise.all([deputy.reconcile(), deputy.reconcile(), deputy.reconcile()]);
+    await deputy.idle();
+    const waiting = (await readCandidates(h.directory))["a1:r1"];
+    assert.equal(waiting.status, "waiting");
+    assert.equal(waiting.version, VERSION);
+    assert.equal(waiting.requestId, h.daemon.pending[0].id);
+    assert.deepEqual(waiting.request, h.daemon.pending[0]);
+    assert.equal(evaluations, 1);
+    assert.deepEqual(h.calls, []);
+    h.advance(4 * 60_000);
+    await deputy.idle();
+    assert.deepEqual(h.calls, [], "discovery does not borrow grace from earlier history");
+    h.advance(60_000);
+    await deputy.idle();
+    assert.equal(h.calls.length, 1);
+    assert.equal((await readCandidates(h.directory))["a1:r1"].status, "applied");
+    await deputy.reconcile();
+    await deputy.idle();
+    assert.equal(evaluations, 1, "a daemon still listing the request cannot resurrect terminal work");
+    assert.equal(h.calls.length, 1);
+    assert.equal(shadowEvidence(await h.log.entries(), VERSION).pairs.length, 0);
+  });
+}
+
+test("startup inventory journals the exact question once and authenticated owner correction remains future source evidence", async t => {
+  const h = await standingHarness(t);
+  await h.settle();
+  h.daemon.inventory = true;
+  await Promise.all([h.deputy.reconcile(), h.deputy.reconcile()]);
+  await h.settle();
+  const entries = await h.log.entries();
+  assert.deepEqual(entries.filter(entry => entry.kind === "question").map(entry => ({ ...entry, at: "captured" })), [{
+    kind: "question", id: "a1:r1", at: "captured", issueId: "i1", identifier: "TUC-1",
+    questions: [
+      { key: "Runner", question: "Runner: Which test runner should the new module's tests use?", options: ["node:test", "vitest"] },
+      { key: "Comment", question: "Comment: Optional comment", options: [] },
+    ],
+  }]);
+  assert.equal(entries.some(entry => entry.kind === "owner-answer"), false, "inventory is not an owner answer");
+  h.advance(5 * 60_000);
+  await h.settle();
+  assert.equal((await h.deputy.correctLate("a1", "r1", "Owner hold: do not switch runners until the current release is complete.", {
+    activityId: "owner-correction", via: "linear-comment", userId: OWNER,
+  })).delivered, true);
+  await h.deputy.reconcile();
+  const sources = await gatherSources(readers({ ownerAnswers: () => h.log.entries() }), { ...asked, id: "later-agent:later-request", text: "xyzzy" }, null);
+  assert.equal(sources.abstain, null);
+  assert.ok(sources.sources.some(source => source.kind === "owner-answer" && source.decisive && source.text === "Owner hold: do not switch runners until the current release is complete."));
+  assert.equal((await h.log.entries()).filter(entry => entry.kind === "question").length, 1);
+  assert.equal((await h.log.entries()).filter(entry => entry.kind === "owner-answer").length, 0);
+});
+
+test("observation and recovery cannot evaluate until persisted owner holds are successfully restored", async t => {
+  const h = await standingHarness(t);
+  await h.settle();
+  const gate = signal();
+  let fail = true;
+  const deputy = new Deputy({ ...h.deps, ready: async () => { await gate.promise; if (fail) throw new Error("owner hold restore failed"); } });
+  t.after(() => deputy.stop());
+  deputy.attach(h.paseo);
+  const observed = deputy.observe(h.agent, question(), { issueId: "i1", identifier: "TUC-1" });
+  const rejected = assert.rejects(observed, /owner hold restore failed/);
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.deepEqual(await readCandidates(h.directory), {});
+  assert.deepEqual(h.calls, []);
+  gate.resolve();
+  await rejected;
+  await deputy.idle();
+  assert.deepEqual(await readCandidates(h.directory), {});
+  fail = false;
+  await deputy.observe(h.agent, question(), { issueId: "i1", identifier: "TUC-1" });
+  await deputy.idle();
+  assert.equal((await h.candidate()).status, "waiting");
+});
+
+async function standingHarness(t: TestContext, audit = true) {
+  const checked = arbiter();
+  const h = await harness(t, { mode: "live", standingPolicy: AUTONOMY_POLICY_REVISION }, { arbiter: checked.value });
+  h.deps.evaluate = async (input) => {
+    const source = input.sources.find((source) => source.id === "standing-policy:engineering")!;
+    return checkVerdict(answer({
+      selections: { Runner: "node:test" },
+      actions: { Runner: { option: "node:test", actor: "agent", risk: "low", effects: "Choose a local behavioral test runner; no production write", outcome: TECHNICAL_OUTCOME, integrity: INTACT_INTEGRITY, reason: "Routine engineering under current standing delegation", authority: "standing" } },
+      citations: [{ source: source.id, quote: source.text }],
+    }), input.parts, input.sources);
+  };
+  if (audit) await h.log.append({ kind: "deputy-activation", id: "activation", key: "activation", at: "2026-10-07T09:59:00Z", policy: AUTONOMY_POLICY_REVISION, via: "settings-rpc", mode: "live" });
+  return { ...h, calls: checked.calls };
+}
+
+test("explicit audited standing activation dispatches only checked standing actions without forging shadow readiness", async (t) => {
+  const h = await standingHarness(t);
+  assert.equal(shadowEvidence(await h.log.entries(), VERSION).ready, false);
+  assert.deepEqual(await h.deputy.liveBlockers(h.settings, true), []);
+  assert.notDeepEqual(await h.deputy.liveBlockers(h.settings), [], "specific-authority decisions retain empirical readiness");
+  await h.deputy.observe(h.agent, question(), { issueId: "i1", identifier: "TUC-1" });
+  await h.settle();
+  assert.equal((await h.candidate()).status, "waiting");
+  assert.deepEqual(h.calls, []);
+  h.advance(5 * 60_000);
+  await h.settle();
+  assert.equal(h.calls.length, 1);
+  assert.equal((await h.candidate()).status, "applied");
+  const applied = (await h.log.entries()).find((entry) => entry.kind === "deputy-answer");
+  assert.ok(applied?.kind === "deputy-answer" && applied.activation === AUTONOMY_POLICY_REVISION);
+  assert.equal(shadowEvidence(await h.log.entries(), VERSION).ready, false, "a deputy answer is not a real attributed owner pairing");
+});
+
+test("standing config alone, an audit alone, and a revoked activation cannot authorize dispatch", async (t) => {
+  const h = await standingHarness(t, false);
+  assert.notDeepEqual(await h.deputy.liveBlockers(h.settings, true), []);
+  for (const policy of ["owner-autonomy-2026-10-15-v1", "owner-autonomy-2026-10-15-v2"]) {
+    await h.log.append({ kind: "deputy-activation", id: policy, key: policy, at: "2026-10-07T09:58:00Z", policy, via: "settings-rpc", mode: "live" });
+    assert.notDeepEqual(await h.deputy.liveBlockers(h.settings, true), [], "old activation audits cannot authorize the current standing policy");
+  }
+  await h.log.append({ kind: "deputy-activation", id: "activation", key: "activation", at: "2026-10-07T09:59:00Z", policy: AUTONOMY_POLICY_REVISION, via: "settings-rpc", mode: "live" });
+  h.settings.deputy.standingPolicy = null;
+  assert.notDeepEqual(await h.deputy.liveBlockers(h.settings, true), []);
+  h.settings.deputy.standingPolicy = AUTONOMY_POLICY_REVISION;
+  await h.deputy.observe(h.agent, question(), { issueId: "i1", identifier: "TUC-1" });
+  await h.settle();
+  await h.log.append({ kind: "deputy-activation", id: "revoked", key: "revoked", at: "2026-10-07T10:01:00Z", policy: null, via: "settings-rpc", mode: "live" });
+  h.advance(5 * 60_000);
+  await h.settle();
+  assert.deepEqual(h.calls, []);
+  assert.equal((await h.candidate()).status, "blocked");
+});
+
+test("standing activation does not bypass selected-action authority or the checked arbiter", async (t) => {
+  const h = await standingHarness(t);
+  h.deps.evaluate = async (input) => checkVerdict(answer({ selections: { Runner: "node:test" }, citations: [{ source: input.sources.find((source) => source.kind === "plan" && source.decisive)?.id, quote: "Tests use the node:test runner" }] }), input.parts, input.sources);
+  await h.deputy.observe(h.agent, question(), { issueId: "i1", identifier: "TUC-1" });
+  await h.settle();
+  assert.equal((await h.deputy.status()).candidates[0].suppressUrgency, false);
+  h.advance(5 * 60_000);
+  await h.settle();
+  assert.equal((await h.candidate()).status, "blocked");
+  assert.deepEqual(h.calls, []);
+  const disconnected = new Deputy({ ...h.deps, arbiter: async () => null });
+  t.after(() => disconnected.stop());
+  assert.notDeepEqual(await disconnected.liveBlockers(h.settings, true), []);
+});
+
+test("status exposes the exact raw request and fixed deadlines, and fails open on stale same-ID input", async (t) => {
+  const h = await standingHarness(t);
+  const started = signal();
+  const finish = signal();
+  const evaluate = h.deps.evaluate!;
+  h.deps.evaluate = async (...args) => { started.resolve(); await finish.promise; return evaluate(...args); };
+  await h.deputy.observe(h.agent, question(), { issueId: "i1", identifier: "TUC-1" });
+  await started.promise;
+  const evaluating = (await h.deputy.status({ agentId: "a1", permissionId: "r1" })).candidates[0];
+  assert.equal(evaluating.state, "evaluating");
+  assert.equal(evaluating.suppressUrgency, true);
+  assert.deepEqual(evaluating.request, question());
+  h.advance(149_000);
+  const polled = (await h.deputy.status({ agentId: "a1", permissionId: "r1" })).candidates[0];
+  assert.equal(polled.expiresAt, evaluating.expiresAt, "polls cannot renew an evaluation lease");
+  h.advance(1_001);
+  assert.equal((await h.deputy.status()).candidates[0].suppressUrgency, false);
+  finish.resolve();
+  await h.settle();
+  const waiting = (await h.deputy.status()).candidates[0];
+  assert.equal(waiting.suppressUrgency, true);
+  assert.equal(Date.parse(waiting.expiresAt!), Date.parse((await h.candidate()).graceDeadline!) + 10_000);
+  h.daemon.pending = [question("r1", ["node:test", "Changed option"])];
+  assert.equal((await h.deputy.status()).candidates[0].suppressUrgency, false);
+  assert.deepEqual((await h.deputy.status({ agentId: "other" })).candidates, []);
+  assert.deepEqual(h.calls, [], "read-only status neither answers nor reschedules requests");
+});
+
+test("notification-only source checking is bounded to fifteen seconds and never claims deputy suppression", async (t) => {
+  const h = await standingHarness(t);
+  const started = signal();
+  const finish = signal();
+  h.deps.readers.recall = async () => { started.resolve(); await finish.promise; return []; };
+  await h.deputy.observe(h.agent, question(), { issueId: "i1", identifier: "TUC-1" });
+  await started.promise;
+  assert.equal((await h.deputy.status()).candidates[0].suppressUrgency, false);
+  assert.equal(await h.deputy.ownerNotificationDelay("a1", "r1"), 15_000);
+  h.advance(15_001);
+  assert.equal(await h.deputy.ownerNotificationDelay("a1", "r1"), 0);
+  finish.resolve();
+  await h.settle();
+  h.settings.deputy.mode = "off";
+  await h.deputy.settingsChanged();
+  assert.equal((await h.deputy.status()).candidates[0].suppressUrgency, false);
+  assert.equal(await h.deputy.ownerNotificationDelay("a1", "r1"), 0);
+});
+
+test("equivalent reissued questions revoke the old candidate and get fresh evaluation and grace, not a reused answer", async (t) => {
+  const h = await liveHarness(t);
+  await h.deputy.observe(h.agent, question(), { issueId: "i1", identifier: "TUC-1" });
+  await h.settle();
+  h.advance(60_000);
+  h.daemon.pending = [question("r2")];
+  const started = signal();
+  const finish = signal();
+  const evaluate = h.deps.evaluate!;
+  h.deps.evaluate = async (...args) => { started.resolve(); await finish.promise; return evaluate(...args); };
+  await h.deputy.observe(h.agent, question("r2"), { issueId: "i1", identifier: "TUC-1" });
+  await started.promise;
+  const store = await readCandidates(h.directory);
+  assert.equal(store["a1:r1"].status, "canceled");
+  assert.equal(store["a1:r2"].selections, undefined);
+  assert.equal(store["a1:r2"].graceDeadline, undefined);
+  finish.resolve();
+  await h.settle();
+  assert.equal(h.evaluations(), 2);
+  h.advance(4 * 60_000);
+  await h.settle();
+  assert.equal(h.calls.length, 0, "the original grace deadline cannot answer the replacement request");
+  h.advance(60_000);
+  await h.settle();
+  assert.deepEqual(h.calls.map((call) => call.requestId), ["r2"]);
+});
+
+for (const pending of ["fresh", "resolved", "changed"] as const) {
+  test(`a prior-policy refusal is freshly reevaluated only while its exact request remains pending: ${pending}`, async (t) => {
+    const h = await harness(t, { mode: "shadow" });
+    const evaluate = h.deps.evaluate!;
+    h.deps.evaluate = async () => ({ ok: false, category: "owner-reserved", reason: "Old blanket refusal" });
+    await h.deputy.observe(h.agent, question(), { issueId: "i1", identifier: "TUC-1" });
+    await h.settle();
+    h.deputy.stop();
+    const store = await readCandidates(h.directory);
+    store["a1:r1"] = { ...store["a1:r1"], version: "deputy-old", selections: { Runner: "stale answer" }, citations: [], graceDeadline: "2026-10-07T09:00:00Z" };
+    await writeFile(join(h.directory, "candidates.json"), JSON.stringify(store));
+    if (pending === "resolved") h.daemon.pending = [];
+    if (pending === "changed") h.daemon.pending = [question("r1", ["Changed", "Other"])];
+    h.deps.evaluate = evaluate;
+    const restarted = new Deputy(h.deps);
+    t.after(() => restarted.stop());
+    restarted.attach(h.paseo);
+    await restarted.idle();
+    const current = (await readCandidates(h.directory))["a1:r1"];
+    if (pending === "fresh") {
+      assert.equal(current.status, "predicted");
+      assert.deepEqual(current.selections, { Runner: "node:test" });
+      assert.equal(current.version, VERSION);
+      assert.equal(current.graceDeadline, undefined);
+      assert.equal(h.evaluations(), 1);
+    } else {
+      assert.ok(current.status === "resolved" || current.status === "canceled");
+      assert.equal(h.evaluations(), 0);
+    }
+    assert.deepEqual(h.responses, []);
+  });
+}
+
+test("exact offered labels are preserved, while visually ambiguous whitespace duplicates are refused", () => {
+  assert.equal(assessRisk(question("r", ["Continue", " Continue "]), trusted).ok, false);
+  const eligibility = assessRisk(question("r", [" Continue ", "Wait"]), trusted);
+  assert.ok(eligibility.ok);
+  const source = standingSources().find((source) => source.id === "standing-policy:engineering")!;
+  const result = (label: string) => checkVerdict(answer({
+    selections: { Runner: label },
+    actions: { Runner: { option: label, actor: "agent", risk: "low", effects: "Local bounded technical work", outcome: TECHNICAL_OUTCOME, integrity: INTACT_INTEGRITY, reason: "Standing engineering authority", authority: "standing" } },
+    citations: [{ source: source.id, quote: source.text }],
+  }), eligibility.parts, [source]);
+  assert.equal(result("Continue").ok, false, "the checked answer must not silently rewrite an offered label");
+  assert.equal(result(" Continue ").ok, true);
+});
+
+test("a current-version shadow prediction is reevaluated after restart into live mode, never silently left parked", async (t) => {
+  const h = await standingHarness(t);
+  h.settings.deputy.mode = "shadow";
+  await h.deputy.observe(h.agent, question(), { issueId: "i1", identifier: "TUC-1" });
+  await h.settle();
+  assert.equal((await h.candidate()).status, "predicted");
+  h.deputy.stop();
+  h.advance(60_000);
+  h.settings.deputy.mode = "live";
+  const reloaded = new Deputy(h.deps);
+  t.after(() => reloaded.stop());
+  reloaded.attach(h.paseo);
+  await reloaded.idle();
+  assert.equal((await h.candidate()).status, "waiting");
+  assert.equal((await h.candidate()).mode, "live");
+  assert.equal(h.calls.length, 0);
+  h.advance(5 * 60_000);
+  await reloaded.idle();
+  assert.equal((await h.candidate()).status, "applied");
+  assert.equal(h.calls.length, 1);
+});
+
+for (const phase of ["waiting", "blocked"] as const) {
+  test(`explicit standing activation freshly reevaluates ${phase} work after revocation and starts a new grace`, async (t) => {
+    const h = await standingHarness(t, false);
+    await h.deputy.observe(h.agent, question(), { issueId: "i1", identifier: "TUC-1" });
+    await h.settle();
+    const oldGrace = (await h.candidate()).graceDeadline;
+    h.advance(phase === "waiting" ? 60_000 : 5 * 60_000);
+    await h.settle();
+    assert.equal((await h.candidate()).status, phase);
+    const revoked = await h.deputy.settingsChanged();
+    await h.log.append({ kind: "deputy-activation", id: "new-activation", key: "new-activation", at: new Date(h.deps.now!()).toISOString(), policy: AUTONOMY_POLICY_REVISION, via: "settings-rpc", mode: "live" });
+    await h.deputy.recheckPolicy(revoked, true);
+    await h.settle();
+    assert.equal((await h.candidate()).status, "waiting");
+    assert.notEqual((await h.candidate()).graceDeadline, oldGrace);
+    h.advance(4 * 60_000);
+    await h.settle();
+    assert.equal(h.calls.length, 0, "activation cannot reuse an earlier grace or dispatch intent");
+    h.advance(60_000);
+    await h.settle();
+    assert.equal(h.calls.length, 1);
+    assert.equal((await h.candidate()).status, "applied");
+  });
+}
+
+for (const stale of ["resolved", "changed"] as const) {
+  test(`policy rechecking cannot revive a ${stale} request canceled during settings changes`, async (t) => {
+    const h = await standingHarness(t);
+    await h.deputy.observe(h.agent, question(), { issueId: "i1", identifier: "TUC-1" });
+    await h.settle();
+    const revoked = await h.deputy.settingsChanged();
+    h.daemon.pending = stale === "resolved" ? [] : [{ ...question(), title: "Different same-ID question" }];
+    await h.deputy.recheckPolicy(revoked, true);
+    await h.settle();
+    h.advance(5 * 60_000);
+    await h.settle();
+    assert.equal(h.calls.length, 0);
+    assert.equal((await h.deputy.status()).candidates[0].suppressUrgency, false);
+  });
+}
+
+for (const pause of ["settings-read", "candidate-lane"] as const) {
+  test(`settings revocation retains an in-flight evaluation that self-cancels during ${pause}, then starts fresh grace`, async (t) => {
+    const h = await standingHarness(t);
+    const evaluating = signal();
+    const finish = signal();
+    let calls = 0;
+    const evaluate = h.deps.evaluate;
+    h.deps.evaluate = async (...args) => {
+      if (++calls === 1) { evaluating.resolve(); await finish.promise; }
+      return evaluate(...args);
+    };
+    await h.deputy.observe(h.agent, question(), { issueId: "i1", identifier: "TUC-1" });
+    await evaluating.promise;
+    const oldObserved = (await h.candidate()).observedAt;
+    h.advance(60_000);
+    const readEntered = signal();
+    const finishRead = signal();
+    if (pause === "settings-read") {
+      let reads = 0;
+      t.mock.method(h.deps.settings, "read", async () => {
+        if (++reads === 1) { readEntered.resolve(); await finishRead.promise; }
+        return h.settings;
+      });
+    } else {
+      const candidates = h.deputy.candidates.bind(h.deputy);
+      t.mock.method(h.deputy, "candidates", async () => {
+        const snapshot = await candidates();
+        readEntered.resolve();
+        return snapshot;
+      });
+    }
+    const changing = h.deputy.settingsChanged();
+    await readEntered.promise;
+    finish.resolve();
+    await h.settle();
+    assert.equal((await h.candidate()).status, "canceled", "the old generation cannot publish its successful model result");
+    finishRead.resolve();
+    const revoked = await changing;
+    assert.ok(revoked.includes("a1:r1"), "self-cancellation must not erase this settings write's restart identity");
+    await h.deputy.recheckPolicy(revoked);
+    await h.settle();
+    const current = await h.candidate();
+    assert.equal(calls, 2, "the old successful answer is not reused");
+    assert.equal(current.status, "waiting");
+    assert.notEqual(current.observedAt, oldObserved);
+    assert.equal(Date.parse(current.graceDeadline!), h.deps.now!() + 5 * 60_000);
+    h.advance(4 * 60_000);
+    await h.settle();
+    assert.equal(h.calls.length, 0);
+    h.advance(60_000);
+    await h.settle();
+    assert.equal(h.calls.length, 1);
+  });
+}
+
+for (const change of ["refusal", "off", "revoke"] as const) {
+  test(`urgency status fails open when ${change} occurs during daemon refresh`, async (t) => {
+    const h = await standingHarness(t);
+    const evaluating = signal();
+    const finishEvaluation = signal();
+    if (change === "refusal") {
+      h.deps.evaluate = async () => {
+        evaluating.resolve();
+        await finishEvaluation.promise;
+        return { ok: false, category: "owner-reserved", reason: "Selected action requires owner authority" };
+      };
+    }
+    await h.deputy.observe(h.agent, question(), { issueId: "i1", identifier: "TUC-1" });
+    if (change === "refusal") await evaluating.promise;
+    else await h.settle();
+    const refreshing = signal();
+    const finishRefresh = signal();
+    const ref = h.paseo.agents.ref.bind(h.paseo.agents);
+    t.mock.method(h.paseo.agents, "ref", (id: string) => {
+      const handle = ref(id);
+      return { ...handle, refresh: async () => { refreshing.resolve(); await finishRefresh.promise; return handle.refresh(); } };
+    });
+    const pendingStatus = h.deputy.status({ agentId: "a1", permissionId: "r1" });
+    await refreshing.promise;
+    if (change === "refusal") {
+      finishEvaluation.resolve();
+      await h.settle();
+    } else {
+      if (change === "off") h.settings.deputy.mode = "off";
+      await h.deputy.settingsChanged();
+    }
+    finishRefresh.resolve();
+    const status = await pendingStatus;
+    assert.equal(status.candidates[0].suppressUrgency, false);
+    assert.equal(status.candidates[0].expiresAt, null);
+    assert.equal(status.candidates[0].state, change === "refusal" ? "refused" : "canceled");
+    assert.equal(status.mode, change === "off" ? "off" : "live");
   });
 }

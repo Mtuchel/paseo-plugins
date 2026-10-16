@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { z } from "zod";
 import type { LinearService } from "./linear";
 import { paseoHome } from "./ticket-mcp";
@@ -9,12 +9,14 @@ import { paseoHome } from "./ticket-mcp";
 // commit's "Closes" moves it to Done while the agent still watches the deploy or needs a hand).
 // The closed ticket stays done; the sub-issue carries the wait in Needs input, and replies on it
 // starting with "@paseo" reach `agentId`.
-export type NeedsYouIssue = { id: string; identifier: string; parentId: string; agentId: string };
-
-const needsYouIssueSchema = z.object({
+export const needsYouIssueSchema = z.object({
   id: z.string().min(1), identifier: z.string().min(1),
   parentId: z.string().min(1), agentId: z.string().min(1),
+  registrationId: z.string().min(1).optional(),
 });
+export type NeedsYouIssue = z.infer<typeof needsYouIssueSchema>;
+
+const mutations = new Map<string, Promise<void>>();
 
 // One private file per open sub-issue, so the comment relay can route replies after a restart.
 export class NeedsYouIssues {
@@ -41,17 +43,44 @@ export class NeedsYouIssues {
   }
 
   async add(entry: NeedsYouIssue): Promise<void> {
-    await mkdir(this.directory, { recursive: true, mode: 0o700 });
-    const path = join(this.directory, `${entry.id}.json`);
-    const temporary = `${path}.${randomUUID()}.tmp`;
-    try {
-      await writeFile(temporary, JSON.stringify(entry), { mode: 0o600, flag: "wx" });
-      await rename(temporary, path);
-    } finally { await rm(temporary, { force: true }); }
+    const registered = needsYouIssueSchema.parse({ ...entry, registrationId: randomUUID() });
+    await this.mutate(async () => {
+      await mkdir(this.directory, { recursive: true, mode: 0o700 });
+      const path = join(this.directory, `${registered.id}.json`);
+      const temporary = `${path}.${randomUUID()}.tmp`;
+      try {
+        await writeFile(temporary, JSON.stringify(registered), { mode: 0o600, flag: "wx" });
+        await rename(temporary, path);
+      } finally { await rm(temporary, { force: true }); }
+    });
   }
 
-  async remove(id: string): Promise<void> {
-    await rm(join(this.directory, `${id}.json`), { force: true });
+  async remove(id: string, expected?: NeedsYouIssue): Promise<void> {
+    if (expected && expected.id !== id) throw new Error("Needs-you cleanup identity does not match its issue");
+    await this.mutate(async () => {
+      const path = join(this.directory, `${id}.json`);
+      if (expected) {
+        let raw: string;
+        try { raw = await readFile(path, "utf8"); }
+        catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return; throw error; }
+        const current = needsYouIssueSchema.parse(JSON.parse(raw));
+        if (current.id !== id) throw new Error(`Needs-you record identity does not match ${id}`);
+        if (current.identifier !== expected.identifier || current.parentId !== expected.parentId
+          || current.agentId !== expected.agentId || current.registrationId !== expected.registrationId) return;
+      }
+      await rm(path, { force: true });
+    });
+  }
+
+  // Compare-and-remove must not interleave with a new registration, including another local
+  // store instance for this directory. A retry after replacement owns only the old generation.
+  private mutate(work: () => Promise<void>): Promise<void> {
+    const key = resolve(this.directory);
+    const next = (mutations.get(key) ?? Promise.resolve()).catch(() => {}).then(work);
+    mutations.set(key, next);
+    const release = () => { if (mutations.get(key) === next) mutations.delete(key); };
+    next.then(release, release);
+    return next;
   }
 }
 

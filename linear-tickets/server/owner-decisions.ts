@@ -84,13 +84,14 @@ export type LogEntry =
   | { kind: "question"; id: string; at: string; identifier: string; issueId: string; questions: LoggedQuestion[] }
   | { kind: "answer"; id: string; at: string; answers?: Record<string, string>; denyMessage?: string }
   | { kind: "owner-answer"; id: string; at: string; key: string; via: "linear-comment" | "linear-session" | "menu-bar"; userId: string; answers: Record<string, string> }
-  | { kind: "deputy-prediction"; id: string; at: string; identifier: string; issueId: string; version: string; mode: DeputyMode; selections: Record<string, string>; citations: Citation[] }
+  | { kind: "deputy-prediction"; id: string; at: string; identifier: string; issueId: string; version: string; mode: DeputyMode; selections: Record<string, string>; citations: Citation[]; key?: string; standing?: boolean }
   | { kind: "deputy-refusal"; id: string; at: string; identifier: string; issueId: string; version: string; mode: DeputyMode; reason: string; category?: string; key?: string }
-  | { kind: "deputy-answer"; id: string; at: string; identifier: string; issueId: string; version: string; key: string; answers: Record<string, string>; citations: Citation[] }
+  | { kind: "deputy-answer"; id: string; at: string; identifier: string; issueId: string; version: string; key: string; answers: Record<string, string>; citations: Citation[]; activation?: string }
   | { kind: "deputy-outcome"; id: string; at: string; key: "blocked" | "canceled" | "owner-won" | "unknown"; reason: string }
+  | { kind: "deputy-activation"; id: string; at: string; key: string; policy: string | null; via: "settings-rpc"; mode: DeputyMode | "off" }
   | { kind: "deputy-override"; id: string; at: string; key: string; via: "linear-comment" | "linear-session" | "menu-bar"; userId: string; text: string; disposition: "delivered" | "failed"; detail?: string };
 
-const KINDS: LogEntry["kind"][] = ["plan-feedback", "question", "answer", "owner-answer", "deputy-prediction", "deputy-refusal", "deputy-answer", "deputy-outcome", "deputy-override"];
+const KINDS: LogEntry["kind"][] = ["plan-feedback", "question", "answer", "owner-answer", "deputy-prediction", "deputy-refusal", "deputy-answer", "deputy-outcome", "deputy-override", "deputy-activation"];
 const entryKey = (entry: LogEntry) => `${entry.kind}\n${entry.id}\n${"key" in entry ? entry.key : ""}`;
 
 function validEntry(value: unknown): value is LogEntry {

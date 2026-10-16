@@ -3,14 +3,23 @@ import { mkdir, open, readFile, rename, rm } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { z } from "zod";
 import { decisionReceiptSchema, type DecisionReceipt } from "../shared/contracts";
+import { needsYouIssueSchema } from "./needs-you";
 
 const decisionRecordSchema = z.object({
   receipt: decisionReceiptSchema,
+  sourceId: z.string().optional(),
+  sourceHash: z.string().optional(),
+  // Material title/parent/ticket/source scope, independent of unrelated timeline progress.
+  sourceScope: z.string().optional(),
   result: z.object({ delivered: z.enum(["agent", "continued", "queued", "comment", "closed", "local"]), message: z.string() }).nullable(),
   disposition: z.enum(["research", "delegated", "deferred"]).nullable(),
   deferredUntil: z.string().datetime().nullable(),
   comment: z.object({ issueId: z.string(), body: z.string(), done: z.boolean() }).nullable(),
-  close: z.object({ issueId: z.string(), needsYou: z.boolean(), done: z.boolean() }).nullable(),
+  close: z.object({
+    issueId: z.string(), needsYou: z.boolean(), done: z.boolean(),
+    completed: z.boolean().optional(),
+    tracking: needsYouIssueSchema.nullable().optional(),
+  }).nullable(),
 });
 export type DecisionRecord = z.infer<typeof decisionRecordSchema>;
 const ledgerSchema = z.object({ version: z.literal(1), records: z.record(z.string(), decisionRecordSchema) });
@@ -46,6 +55,13 @@ export class DecisionLedger {
 
   latest(issueId: string, revision: string): DecisionRecord | undefined {
     return Object.values(this.records).reverse().find((record) => record.receipt.issueId === issueId && record.receipt.revision === revision);
+  }
+
+  // Never carry consent across material scope changes. Legacy body-only receipts can
+  // conservatively retain an unknown-delivery fence, but cannot approve another revision.
+  forSource(issueId: string, sourceId: string, sourceHash: string, sourceScope: string): DecisionRecord | undefined {
+    return Object.values(this.records).reverse().find(record => record.receipt.issueId === issueId && record.sourceId === sourceId && record.sourceHash === sourceHash
+      && (record.sourceScope === sourceScope || (record.sourceScope === undefined && record.result === null)));
   }
 
   history(): DecisionReceipt[] {

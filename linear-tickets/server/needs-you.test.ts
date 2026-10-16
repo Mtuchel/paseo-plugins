@@ -34,13 +34,38 @@ test("strict owner-question inventory never loses an unreadable or malformed reg
   }
 });
 
-test("strict owner-question inventory follows registration and removal", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "paseo-needs-you-"));
-  const questions = new NeedsYouIssues(directory);
-  try {
+
+for (const replacementFirst of [false, true]) {
+  test(`checked cleanup preserves a concurrent replacement registration ${replacementFirst ? "queued before" : "queued after"} removal`, async t => {
+    const directory = await mkdtemp(join(tmpdir(), "paseo-needs-you-"));
+    t.after(() => rm(directory, { recursive: true, force: true }));
+    const questions = new NeedsYouIssues(directory);
+    const another = new NeedsYouIssues(directory);
     await questions.add(question);
-    assert.deepEqual(await questions.allStrict(), [question]);
-    await questions.remove(question.id);
+    const original = (await questions.allStrict())[0];
+    const operations = replacementFirst
+      ? [another.add(question), questions.remove(question.id, original)]
+      : [questions.remove(question.id, original), another.add(question)];
+    await Promise.all(operations);
+    const current = (await questions.allStrict())[0];
+    await questions.remove(question.id, original);
+    assert.deepEqual(await questions.allStrict(), [current], "stale cleanup cannot delete the replacement even when issue, parent and agent are unchanged");
+    await questions.remove(question.id, current);
     assert.deepEqual(await questions.allStrict(), []);
-  } finally { await rm(directory, { recursive: true, force: true }); }
+  });
+}
+
+test("legacy registration cleanup cannot delete a new generation and invalid current tracking fails closed", async t => {
+  const directory = await mkdtemp(join(tmpdir(), "paseo-needs-you-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const questions = new NeedsYouIssues(directory);
+  await writeFile(join(directory, `${question.id}.json`), JSON.stringify(question));
+  const legacy = (await questions.allStrict())[0];
+  await questions.add(question);
+  const replacement = await questions.allStrict();
+  await questions.remove(question.id, legacy);
+  assert.deepEqual(await questions.allStrict(), replacement);
+  await writeFile(join(directory, `${question.id}.json`), "{");
+  await assert.rejects(questions.remove(question.id, replacement[0]), SyntaxError);
+  await assert.rejects(questions.allStrict(), SyntaxError, "failed identity verification cannot delete a registered owner blocker");
 });

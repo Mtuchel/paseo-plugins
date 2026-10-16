@@ -7,15 +7,11 @@ import { delimiter, dirname, join } from "node:path";
 import { promisify } from "node:util";
 import { z } from "zod";
 import { paseoHome } from "./ticket-mcp";
+import { normalizeModel, type FallbackChains } from "../shared/model-fallbacks";
 
 const MINUTE = 60_000;
 export const LIMIT_DAY = 24 * 60 * MINUTE;
 export const LIMIT_SPACING = 15 * MINUTE;
-export type FallbackChains = Record<string, string[]>;
-
-export function normalizeModel(model: string): string {
-  return model.trim().replace(/^omp\//, "").split(/\s+·\s+/)[0].replace(/:[^/:]+$/, "");
-}
 
 export function limitError(text: string): { provider: string | null; retryAfterMs: number | null } | null {
   if (!/\b429\b|rate.?limit|usage limit/i.test(text)) return null;
@@ -25,23 +21,6 @@ export function limitError(text: string): { provider: string | null; retryAfterM
   const hintSeconds = /retry-after\s*[:=]\s*(\d+(?:\.\d+)?)/i.exec(text)?.[1];
   const hint = hintMs ? Number(hintMs) : hintSeconds ? Number(hintSeconds) * 1000 : 0;
   return { provider: model.includes("/") ? model.split("/")[0] : null, retryAfterMs: hint > 0 && hint <= 30 * LIMIT_DAY ? hint : null };
-}
-
-export function candidates(chains: FallbackChains, model: string): string[] {
-  const first = normalizeModel(model);
-  if (!first.includes("/")) return [];
-  const result = new Set([first]);
-  for (const [key, entries] of Object.entries(chains)) {
-    if (!key.includes("/")) continue;
-    const match = normalizeModel(key);
-    if (match !== first && !(match.endsWith("*") && first.startsWith(match.slice(0, -1)))) continue;
-    for (const entry of entries) {
-      let next = normalizeModel(entry);
-      if (next.endsWith("/*")) next = next.slice(0, -1) + first.slice(first.indexOf("/") + 1);
-      if (next.includes("/") && !next.includes("*")) result.add(next);
-    }
-  }
-  return [...result];
 }
 
 export type UsageWindow = {

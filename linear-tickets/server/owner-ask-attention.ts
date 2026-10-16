@@ -1,6 +1,6 @@
 import type { OwnerAsk } from "../shared/contracts";
 import type { ExtractedAsk } from "./owner-ask-extract";
-import { ownerRequest } from "./writeback";
+import { assessmentReason, checkAssessment, type AskContext } from "./owner-ask-admission";
 
 type Attention = Pick<OwnerAsk, "attention" | "attentionReason" | "blockerIdentifier">;
 
@@ -28,27 +28,18 @@ export function blockerIdentifier(source: string): string | null {
   return found.size === 1 ? [...found][0] : null;
 }
 
-export function classifyAttention(source: string, value: ExtractedAsk | null, manual: boolean): Attention {
+export function classifyAttention(source: string, value: ExtractedAsk | null, context?: AskContext): Attention {
   const blocker = blockerIdentifier(source);
   const result = (attention: Attention["attention"], attentionReason: string): Attention => ({ attention, attentionReason, blockerIdentifier: blocker });
-  if (!value) return result("owner", "Extraction pending or uncertain; kept in your inbox.");
-  if (manual || value.kind === "manual") return result("owner", "An explicit manual step still needs you.");
-  const text = content(source);
-  const advisor = /\b(?:waiting (?:on|for) (?:the |an? )?advisor|advisor[^\n.!?]{0,60}(?:pending|has(?:n't| not) (?:answered|replied))|(?:once|when|after) the advisor (?:answers|replies|responds))\b/i.test(text);
-  const noInput = /\b(?:nothing (?:is )?(?:needed|required)(?: from you)? (?:yet|now|at this (?:time|point))|no (?:owner |user )?(?:input|action|decision|approval) (?:is )?(?:needed|required)(?: from you)?(?: yet| now)?|nothing (?:for you to do|needed from you yet))\b/i.test(text);
-  // Future approval/status language is not a current request. Test the remaining clauses for
-  // real questions/requests so "waiting for advisor; meanwhile please choose X" stays visible.
-  const current = text.split(/\n|(?<=[.!?])\s+/).filter((line) => {
-    if (/\?/.test(line)) return true;
-    if (/\b(?:please|can you|could you|choose|decide|confirm|approve now)\b/i.test(line)) return true;
-    return !/\b(?:advisor|nothing (?:is )?(?:needed|required)|no (?:owner |user )?(?:input|action|decision|approval)|once|after|later|will (?:need|require)|needs your approval|requires your approval)\b/i.test(line);
-  }).join("\n");
-  const request = current.split(/\n|(?<=[.!?])\s+/).find(line => /\?|\b(?:please\s+(?:choose|decide|approve|confirm|provide)|(?:choose|decide|approve|confirm)\b[^.\n]{0,80}\bnow)\b/i.test(line))
-    ?? ownerRequest(text);
-  if (request) return result("owner", `Source asks: ${request.trim().slice(0, 400)}`);
-  if (advisor) return result("advisor", "Waiting for the advisor; no current owner request is evidenced.");
-  if (noInput) return result("info", "The source explicitly says no input is needed yet.");
-  if (value.questions.length || value.kind === "decision") return result("owner", "The extracted question needs an explicit answer.");
-  if (blocker) return result("dependency", `Explicitly blocked by ${blocker}; decisions remain ticket-specific.`);
-  return result("owner", "No conclusive waiting-only evidence; kept in your inbox.");
+  if (context?.duplicateOf) return result("info", `Exact echo of source ${context.duplicateOf}; original ${context.sourceId} retained for nonurgent review. No independent decision or completion is inferred.`);
+  if (context?.liveRequest) return result("owner", `Exact current pending owner request at source ${context.sourceId}; extraction cannot remove live fail-open attention.`);
+  const assessment = checkAssessment(value?.assessment, context);
+  if (assessment) {
+    const reason = assessmentReason(assessment);
+    if (assessment.state === "owner") return result("owner", reason);
+    if (assessment.state === "advisor" || assessment.state === "dependency") return result(assessment.state, reason);
+    return result("info", `${reason} Retained for nonurgent review; no answer, authorization or ledger completion inferred.`);
+  }
+  if (context?.currentWait) return result("owner", `Current exact owner wait at source ${context.sourceId}; extraction pending, failed or lacks checked evidence. Original request remains visible.`);
+  return result("info", `Historical source ${context?.sourceId ?? "(unidentified)"} needs nonurgent source review: current unresolved owner attention is not independently evidenced${context && !context.complete ? "; timeline is incomplete" : ""}. Extraction or a question mark alone does not establish urgency.`);
 }

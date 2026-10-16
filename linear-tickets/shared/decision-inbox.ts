@@ -1,10 +1,8 @@
 import { z } from "zod";
 import { ownerAskSchema, decisionReceiptSchema, askQuestionSchema } from "./contracts";
 
-// Both browser and menu-bar clients operate on the existing revision-bound owner asks.
-// Browser-only source identity: the shared menu-bar contract remains unchanged.
+// Browser and menu-bar clients share source identity and revision-bound owner asks.
 export const browserOwnerAskSchema = ownerAskSchema.extend({
-  sourceId: z.string().optional(),
   deliveryUnknown: z.boolean().optional(),
 });
 export type BrowserOwnerAsk = z.infer<typeof browserOwnerAskSchema>;
@@ -83,6 +81,7 @@ export type BrowserDecisionAction = {
   operation: "answer" | "triage";
   issueId?: string;
   agentId?: string;
+  sourceId?: string;
   requestId?: string;
   revision: string;
   answers?: Record<string, string>;

@@ -45,9 +45,10 @@
 //   LINEAR_TICKETS_STRONG_MODEL, and a write to those paths from a session (the agent or one of its
 //   `task` subagents) whose live model is not that strong model is blocked. `ctx.models.current()`
 //   is per session: omp builds each subagent's extension context on the child session's own model.
-//   A `model: "@slow"` subagent passes because the `slow` role is the launch's strong model on
-//   every host (anthropic/claude-opus-5-5); a host whose role differs gets the block, which names
-//   the way out. `bash` writes are not checked: a guard against accidental routing, not isolation.
+//   A `model: "@slow"` subagent passes on the launch's strong model, or on the owner-approved
+//   Opus 5.5 → Sol/high substitute with a matching configured fallback chain and live high thinking.
+//   Other/unknown substitutes remain blocked. `bash` writes are not checked: a routing guard,
+//   not isolation.
 // - PASEO_AGENT_ID set, LINEAR_TICKETS_ISSUE not (a Paseo session the plugin did not start for a
 //   ticket): its first prompt carries the Flash-first routing note (shared/plan-model.ts
 //   `sessionRoutingNote`), once per session, never for `task` subagents. Returned as a
@@ -77,6 +78,7 @@ import { combinedRating, parsePlanRisk, sectionBody } from "../shared/plan-risk"
 import { parsePlanSections, ruleMismatch, sectionSteps } from "../shared/plan-sections";
 import { ESCALATE_TOOL, parsePlanModel, sessionRouting, TIERS } from "../shared/plan-model";
 import { blockedTestWrite, STRONG_MODEL_ENV, writtenPaths, type AcceptanceTests } from "../shared/acceptance-tests";
+import type { FallbackChains } from "../shared/model-fallbacks";
 import { layoutProblem, requiredParts } from "../shared/plan-layout";
 import { decisionText, parseDecision, parseRouteFacts, routeRefusals, SMALL_ROUTE_ENV, SMALL_ROUTE_TOOL, SMALL_ROUTE_WAIT_MS, smallRouteNote, type RouteDecision } from "../shared/small-route";
 
@@ -101,6 +103,7 @@ type ExtensionApi = {
   appendEntry(customType: string, data: unknown): void;
   sendMessage(message: { customType: string; content: string; display: boolean }, options: { deliverAs: "aside" }): void;
   registerTool(tool: { name: string; label: string; description: string; parameters: unknown; loadMode?: "essential" | "discoverable"; execute(id: string, params: Params, signal?: AbortSignal, onUpdate?: unknown, ctx?: Context): Promise<ToolResult> }): void;
+  getThinkingLevel?(): string;
   zod: Schema;
 };
 
@@ -141,6 +144,25 @@ const VERDICTS = ["agreed", "disagreements", "unavailable"] as const;
 const REQUEST_TIMEOUT_MS = 5_000;
 const INSPECT_TIMEOUT_MS = 15_000;
 const run = promisify(execFile);
+
+// Read only the existing chain setting, never credentials. A failed/unknown read grants nothing;
+// no positive cache survives a configured revocation. Child sessions inherit the same OMP profile.
+async function configuredFallbacks(cwd: string | undefined): Promise<FallbackChains | null> {
+  try {
+    const { stdout } = await run("omp", ["config", "get", "retry.fallbackChains", "--json"], { cwd, timeout: 5_000, maxBuffer: 128 * 1024 });
+    const parsed: unknown = JSON.parse(stdout);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    const value = "value" in parsed ? parsed.value : undefined;
+    if (value === undefined) return {};
+    if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+    const chains: FallbackChains = {};
+    for (const [key, entries] of Object.entries(value)) {
+      if (!Array.isArray(entries) || !entries.every((entry): entry is string => typeof entry === "string")) return null;
+      chains[key] = entries;
+    }
+    return chains;
+  } catch { return null; }
+}
 const OWNER_ASKED = "The owner added the `plan` label to this ticket, so you are now in Plannotator's plan mode. Stop implementing: investigate what is left, write a plan and submit it for review before any further change.";
 
 function text(message: string, details: Record<string, unknown> = {}): ToolResult {
@@ -551,7 +573,14 @@ export default function linearTicketsPlanFirst(pi: ExtensionApi): void {
     if (linearTool) {
       return { block: true, reason: `Stopped by the linear-tickets plugin: ${linearTool} would act as the owner. Ticket agents change Linear only through the ${TICKET_TOOL_PREFIX}* tools, which write as Paseo: comments and relations on any issue, status and links on your ticket and the issues you created, create_issue for follow-ups. Reading with the Linear tools is fine. For anything else in Linear, ask the owner (or add a manual task).` };
     }
-    const testWrite = writtenPaths(event.toolName, input).length ? blockedTestWrite(acceptanceTests(), event.toolName, input, ctx?.models?.current(), process.env[STRONG_MODEL_ENV]) : null;
+    const tests = writtenPaths(event.toolName, input).length ? acceptanceTests() : null;
+    let testWrite = blockedTestWrite(tests, event.toolName, input, ctx?.models?.current(), process.env[STRONG_MODEL_ENV]);
+    if (testWrite && pi.getThinkingLevel?.() === "high") {
+      const chains = await configuredFallbacks(ctx?.cwd);
+      // Re-read model, thinking and launch authority after the asynchronous read: a model switch
+      // during lookup must not lend the previous strong session's capability to a cheap session.
+      testWrite = blockedTestWrite(acceptanceTests(), event.toolName, input, ctx?.models?.current(), process.env[STRONG_MODEL_ENV], { chains, thinking: pi.getThinkingLevel?.() });
+    }
     if (testWrite) {
       return { block: true, reason: `Stopped by the linear-tickets plugin: ${testWrite} is one of this plan's acceptance tests, which the strong model writes. Make the implementation pass it; if the test itself is wrong, hand the change to a subagent on the strong model (the \`task\` tool with \`model: "@slow"\`) with the reason, or call \`${ESCALATE_TOOL}\` when the work needs the strong model.` };
     }

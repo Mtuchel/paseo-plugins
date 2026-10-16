@@ -890,7 +890,7 @@ When the approved plan is implemented, the agent starts on the strongest of: the
 plugin on approval; change it to override), the ticket's latest decided tier (an approved plan or
 an escalation; an escalation stays), and the plan's tier, which its risk rating raises to `strong`
 when a rule above requires it. The cheap tier runs the provider's model in `cheapModels` (default
-for omp: `lithos/deepseek-ai/DeepSeek-V4.1-Flash-ultra`, thinking `max`, through the Lithos
+for omp: `lithos/deepseek-ai/DeepSeek-V4.1-Flash`, thinking `max`, through the Lithos
 account, with the official `deepseek/deepseek-flash` API behind it in omp's
 `retry.fallbackChains`); a provider without one implements on the launch model. After
 **Approve & split**, each sub-issue plans again and picks its own tier; a sub-issue of a strong
@@ -906,6 +906,15 @@ session that is not on the strong model. It is a guard against accidental routin
 shell can still write those files, a launch that never recorded the strong model is not blocked,
 and `escalate_model` lifts the block by moving the agent to the
 strong model — a cheap session that turns out to need the tests changed asks for the strong model.
+The owner-approved Opus 5.5 → GPT-6.1 Sol/high substitution also counts as strong for this test
+guard, but only when that launch model's configured `retry.fallbackChains` contains
+`openai-codex/gpt-6.1-sol:high` and the acting session currently reports thinking `high`. The
+extension reads that setting through the existing read-only `omp config get` command before a
+protected substitute write (five-second bound, no positive cache); unreadable/invalid configuration,
+unknown or different thinking, and an unrelated chain do not grant authority. Exact and prefix
+selectors follow the same shared matching rules as model drift and usage recovery. Flash and
+arbitrary other fallback targets remain blocked even if configured. The live model, thinking,
+launch authority and protected paths are read again after the asynchronous lookup.
 A cheap plan's premises — the existing functions, fields, behavior and data shapes it builds on —
 are verified against the current code by a cheap scout before the plan is submitted, so an
 implementation round is not spent on a wrong premise. The agent calls `escalate_model` with a
@@ -4206,61 +4215,184 @@ queued messages that host delivers to its agents are sent and recorded the same 
 
 ## Deputy for agent questions
 
-Routine questions ticket agents ask the owner can be answered by a deputy, but only when recorded
-knowledge decides the answer. Risky, unsupported or ambiguous questions wait for the owner exactly
-as before, and the owner always has the last word. Plan, tool and mode approvals are never
-delegated.
+The agent owns completion of an authorized outcome. The deputy can answer trusted structured
+ticket questions using current owner standing delegation and evidence-based technical judgement;
+the sources need not dictate one exact choice. Recommendations are advisory, not instructions.
+The directional aim of 5–10% owner decisions is observational, **never a quota or safety target**.
+Plan, tool and mode approvals remain outside this question-answer path.
 
-**Order.** A question is first logged and shown to the owner as before (write-back's settle
-window and "waiting for an answer" comment are unchanged). Then, in the background, it becomes a
-candidate in `$PASEO_HOME/linear-tickets/deputy/candidates.json` (directory `0700`, file `0600`,
-one per agent and request, kept 14 days):
+**Authority and consequences.** The versioned owner contract is
+`shared/autonomy-policy.ts` (`owner-autonomy-2026-10-15-v3`). Routine engineering, independent
+review, repairing prerequisites, meaningful fixture/test maintenance, the documented lifecycle
+on the task's own branches, and safe capable model fallback are delegated. Unavailable Opus 5.5
+does not require an owner exception: use available `openai-codex/gpt-6.1-sol`, high thinking.
+This does not configure host retry chains or authorize additional material spend.
 
-1. **Risk first.** Only a `question` from an agent linked to a ticket the owner wrote (or the
-   Paseo app in a flow he started; not `feedback`), whose plan is approved (`plan-ready`) and that
-   is not marked attended, qualifies. Every required part needs at least two offered options;
-   free text ("Other (type your own)"), multiple choice and parts without options leave the whole
-   request with the owner (an optional empty comment stays empty). Words in the title,
-   description, any question or any option (label and description, English and German) put it in
-   an owner-kept category and refuse it: open business decisions, user-facing wording or layout,
-   production data, external accounts or spend, security or permissions, deleting data or
-   history, irreversible operations, destructive git, and what the launch template or AGENTS.md
-   reserve for the owner (approvals, pushes, labels, settings, manual steps, plans, deploys,
-   anything sent outside). The evaluator rates the risk too; anything but `low` refuses, and
-   unknown counts as high.
-2. **Knowledge second.** Sources, in this order of authority: the ticket's approved `Plan:`
-   document; `docs/principles/` (`approved.md`, `decisions.md`, `decision-queue.md`) at one
-   `origin/main` commit of `deputy.principlesRepository`; this README, the effective launch template (custom or built-in) and the
-   agent repository's `AGENTS.md`; earlier owner answers the plugin itself delivered for the
-   authenticated owner (`owner-answer` log entries); Hindsight recall. Only sections sharing words
-   with the question are shown. Open proposals (the decision queue), rejected, superseded,
-   withdrawn or deferred decisions (every excerpt of such an entry, its subsections included) and
-   memories can only block an answer, never decide one. An earlier source that should exist but
-   is missing or cannot be read (the plan document of the plan-ready ticket, or one not marked
-   approved; the register; recall without access) makes the deputy abstain.
-3. **Evaluation.** One OMP call (`deputy.model`, thinking `low`, 150 s deadline) with no tools, MCP
-   servers, extensions, skills, rules, memory or saved session, from an empty directory under a
-   private OMP agent directory (`deputy/omp-agent/`, only the isolated configuration plus the
-   owner's `auth:` block), with no Paseo, Linear or GitHub credentials in its environment. It sees
-   only the question, each option with what it says it does (its description), and the excerpts,
-   and returns per part an offered option and the sources that
-   decide it. Every selection must be an offered option verbatim, every citation must name a
-   source that can decide and quote it verbatim (at least 12 characters); a tool event, timeout,
-   oversized or unreadable answer, abstention or one failed check refuses the whole request. The
-   agent's own "(Recommended)" never decides.
+Known least-privilege, reversible **task-scoped staging access/setup**, including acquisition and
+use of existing approved credentials through approved channels, is delegated without an owner
+click. This never authorizes inventing credentials, printing secrets, dumping a recovery vault,
+impersonation, bypassing MFA, broad new production/admin privileges or a security-policy change.
+The owner retains consequential business policy/workflow, major architecture, missing business
+facts, legal/financial commitments, external supplier/customer communication on the owner's
+behalf, material spend/outage/data loss, unauthorized production business-system writes and
+irreversible/destructive production actions. Existing business/security/destructive holds,
+do-not-merge, cancellations and owner overrides remain binding. Technical repair counts, size
+thresholds, planning/attended metadata and superseded technical-only “ask owner” caps are not
+new holds. Never weaken meaningful tests merely to turn CI green.
 
-Citations store the source's id, revision (document hash, commit or memory id) and the quote, so
-they keep saying what they relied on after the source changes.
+Consequences include the intended **merged/deployed behavior**, not merely today's file writes,
+PR preparation or absence of immediate business-data entry. New invoice-editing rights, required
+financial values, validation or check-before-save/record-creation timing need evidenced workflow
+authority; an AC number or unavailable historical plan is not approval. Safe parts of a multipart
+request do not license its unresolved business parts. An evidenced behavior-preserving invoice
+repair remains technical delegation; financial vocabulary alone does not prohibit it.
 
-Readiness evidence is versioned by the `deputy-4` policy and model; old-policy predictions cannot
-satisfy the live gate. Evaluator outages are retryable unavailable evidence, not permanent
-knowledge refusals. Dispatch rebuilds and fingerprints the complete evaluator input, including
-source order and blocking-only sources. Missing or changed fingerprints cancel the prediction,
-even when the original quotation still appears verbatim. Settings changes synchronously revoke
-unsent work, including change-away/change-back. The checked reply arbiter tests that authority
-immediately before the response call, after asynchronous admission. Revoked intents never replay;
-responses already on the wire retain their actual outcome. Shadow mode remains appropriate until
-current-policy paired owner evidence meets the readiness threshold.
+The complete standing passages also preserve Git/work ownership, owner-only artifacts and
+verification integrity. Record branch/HEAD/tree before writes. A temporary unverified patch is
+not durable recovery for deleting the sole uncommitted copy; shared user work may not be
+auto-committed/stashed or edited/installed over without established safe ownership. Isolation
+must preserve the required user overlay. Verified complete durable preservation permits owned
+cleanup; retention or a technical reframe does not inherently require an owner decision.
+
+Delegated test retirement is not permission to mint a personal owner approval or owner-only
+label/receipt. Core's current `approved-test-change` restriction still forbids agent
+self-application. Truthful standing-authority records and coverage-preserving removal of obsolete
+wording/mock-echo tests remain allowed. This does **not** reserve ordinary authorized
+least-privilege reversible staging grants to the owner.
+
+Honest “unproven” disclosure does not satisfy an acceptance requirement or authorize closing
+incomplete work. Collect proof, keep requirements intact, or establish supported documented N/A.
+A gate's semantic scope still binds when its parser has a loophole: hiding required coverage in
+ungated prose is not compliant slicing. Reviewed technical gate repair and fulfilled technical
+closeout remain delegated. Concrete nonbinding logistics/business recommendations for later
+approval remain allowed when they make no connection/permission mutation and claim no approval;
+this does not license implementing an unapproved consequential workflow as mergeable code.
+
+**Evaluation order.** The question is logged and observed before write-back's settle window.
+Candidates live in `$PASEO_HOME/linear-tickets/deputy/candidates.json` (directory `0700`, file
+`0600`, one per agent/request, kept 14 days).
+
+1. **Structural/trust eligibility.** The agent must remain linked to a ticket created by the
+   owner, or by a trusted Paseo app in an owner-started flow (not feedback). Planning and attended
+   questions can qualify; an existing approved plan, when required by the ticket, must still be
+   readable and approved. Every required part needs at least two unique offered options and a
+   unique key. Required free text, ambiguous labels, multiselect and unsupported requests
+   abstain; an optional empty comment stays empty.
+2. **Evidence.** Complete standing-policy passages are always included, with revision and source
+   IDs, regardless of keywords. Relevant register/README excerpts and attributed earlier owner
+   answers supplement them. The complete approved plan, repository instructions and effective
+   launch template are included whole so a nonmatching hold remains visible. Authenticated current-ticket
+   overrides remain authoritative even if correction delivery failed. Open proposals,
+   rejected/superseded/withdrawn/deferred decisions and memories can block but never authorize.
+   An unconfigured optional principles repository or recall service is not a failure; a
+   configured unreadable source, required missing/unapproved plan, or complete source snapshot
+   exceeding the input budget makes the deputy abstain rather than silently drop constraints.
+3. **Semantic selection.** One isolated OMP call (`deputy.model`, thinking `high`, 150 s deadline)
+   chooses a safe capable offered completion/research/preparation path before considering a
+   pause. It assesses the **selected actions**, individually and together, including descriptions,
+   actors, prerequisites and actual environment/effects—not rejected risky options or keywords.
+   “above/about” PR size is not spend; a purchase fixture is not purchasing policy; a merge buffer
+   or Git enumeration repair is not a destructive reset. Preparing a no-reset plan or collecting
+   evidence is not executing a cutover or inventing tax/package/contract facts.
+4. **Checked verdict.** Each selected part needs an exact offered label, a low-consequence action
+   assessment and a decisive verbatim citation (at least 12 characters). Each action declares
+   `standing` or `specific` authority; standing authority needs a current positive
+   completion/engineering/access/models policy citation for that part, not a boundaries passage
+   alone. A safe offered investigation can win over a risky production mutation or recommended
+   pause. An owner-labelled “I run/provide” option cannot be reinterpreted as agent execution.
+   Each action must also declare primitive `actor: "agent"`; owner/external/mixed execution
+   refuses, and missing/unknown/malformed actors require investigation. A human audit handoff
+   is not autonomous merely because an agent heartbeat waits afterward. Ordinary attribution
+   to an already authorized tool account is distinct from forging a personal owner approval.
+   Mandatory owner handback on a conditional technical failure is mixed execution too; selecting
+   the label cannot rewrite that branch. Only labels reach the working agent: hidden evaluator
+   reasoning cannot supply revision instructions or other required free text. Such choices
+   require a technical reframe, not a fabricated answer.
+   When there is no safe exact offered choice, the deputy transparently abstains; there is no
+   checked corrective-guidance/reframing side channel in this implementation. No coverage quota
+   can fabricate a selection or missing business fact.
+   Every action also declares `outcome.scope` and eventual `outcome.effects`. A claimed
+   `preserves-authorized-workflow` or `authorized-workflow-change` must quote a decisive
+   **non-standing** baseline/approval source and include that same citation for the same part.
+   Specifically approved consequential workflow changes require `specific` authority, so they
+   cannot use the standing-only activation shortcut. Missing/unknown outcome scope abstains;
+   a new unapproved workflow choice remains an owner boundary.
+   Ordinary model selection, described technical corrections, review repairs and resuming delegated
+   work do not require the complete historical plan or every future review finding. This is not
+   permission to release a hold or invent an approved baseline.
+   Substantive commitments still include the eventual effects of referenced PRs/stacks bundled
+   with a technical retry, publish or enqueue, and literal plan/amendment adoption. A PR number,
+   green check, unchanged patch or commitment shared by every offered alternative is not evidence
+   of authorized scope. Known authorized technical delivery remains delegated through its gates;
+   private reasoning cannot turn a delivered plan approval into preparation or a release into a hold.
+   V3 additionally requires `integrity.preservation`, `.ownerArtifacts`, `.acceptance` and `.gates`
+   for **each** selected part. Each includes a reason and primitive string state: `not-implicated` (no affected
+   requirement/material prerequisite), `satisfied`, `unknown` or `violated`. Missing, unknown or
+   violated assessments refuse the request even under a top-level low-risk summary.
+   `satisfied` needs decisive **non-standing** prerequisite evidence, verified verbatim and cited
+   for that same part. A larger cited passage may cover a proof only when it contains that complete
+   verified quote; unrelated or partial text from the same source does not qualify. Standing authority
+   cannot manufacture a checkpoint, user-work ownership, personal owner consent, fulfilled acceptance
+   or a gate exception. These are checked source
+   bindings, not a claim that JSON assertions mechanically prove their semantic truth; isolated
+   evaluator review and current-policy boundary replay remain required.
+   `guarded` additionally permits an explicitly conditional factual prerequisite for preservation,
+   acceptance or gates, never owner artifacts. Its `guard.question` and/or `guard.effect` must equal
+   the complete current question/selected description; no other guard fields or source/quote proof
+   are accepted. Unknown prerequisites stay unknown: safe investigation may proceed, but the
+   conditional operation remains prohibited until positively established. Other states cannot carry
+   a guard. Anchoring checks provenance, not semantic sufficiency. Guards cannot approve unknown
+   workflow or delivery scope, invent consent, waive holds or rewrite a release/acceptance requirement.
+   Preservation also covers shared non-Git artifacts: “unused” does not establish ownership or
+   recoverability. Conditional factual reporting may proceed after collecting the required
+   evidence; that authorization neither invents present measurements nor claims acceptance.
+   Citations must name supplied source IDs, never synthetic `QUESTION` or context identifiers.
+   Bounded coordination does not grant every possible subsequent incident-remediation action.
+   Future measurement and diagnosis-first correction may collect missing facts without claiming
+   present proof; independent business holds remain intact. A current tool-role limitation alone
+   is not proof that the owner personally must perform the work.
+   Persistent/live host resource changes require known environment, authorized host scope and
+   operational consequences; a smaller increase or unchanged RAM ceiling is not that proof.
+   Unavailable checker plans need actual semantic scope, not just review/process adjectives.
+   Non-waiving dependency waits remain delegated without approving the prerequisite's unknown
+   implementation. Safe preparation/deferral is not whole-ticket completion or owner approval.
+   Temporarily holding unapproved planning is not cancellation and needs no personal cancellation
+   instruction. It authorizes no abandonment of approved work, business choice or unknown delivery;
+   offered bounded investigation, nonbinding preparation and prerequisite coordination may continue.
+   Historical deadline/process eligibility stays unknown without authoritative timing and process
+   evidence, including immediate actions that depend on a still-waiting job. Today's date or another
+   monitor's expiration cannot prove it. Actual live deadlines still bind.
+   Task/component ownership is not inherently human: an otherwise explicit agent action is not
+   contradicted by an ambiguous "existing owner" role. Reporting or asking a later technical
+   question through the same answer channel is agent work, not inherently human execution.
+   An ambiguous "you" or missing tool proves neither a human recipient nor a capable parent agent.
+   The recipient's execution is separate from the asking agent sending that request. The deputy
+   cannot promise to perform a later review merely by delivering a label. Existing identity evidence,
+   including personal owner-only approval acts, still binds; technical delegability alone does not
+   establish a capable agent recipient or rewrite a literal assignment.
+   Actual human assignments and personal approval boundaries still bind; actor interpretation
+   supplies no missing task authority.
+   Fully described bounded UI state/navigation and regression corrections remain technical when
+   they change no material permission, business validation/value or record-creation policy.
+   Separate workflow-baseline proof applies to material boundaries, not every UI transition;
+   unknown bundled PR effects and consequential behavior-preservation claims still need evidence.
+
+The evaluator has no tools, MCP servers, extensions, skills, rules, memory or saved session. It
+runs from an empty directory with private isolated configuration and the owner's `auth:` broker
+block, without Paseo, Linear or GitHub credentials in its environment. A tool event, timeout,
+unreadable/oversized answer, abstention or failed check refuses the whole request. Citations
+retain source ID, revision and quote.
+
+Evidence is versioned as `deputy-16-executable-actors/owner-autonomy-2026-10-15-v3/<model>/high`.
+Old-policy predictions never satisfy current empirical readiness. On restart, an old-version
+refusal/prediction is reevaluated only after the exact unanswered request is freshly verified;
+old selections, citations, intent and grace are discarded. An equivalent new request ID retires
+the old candidate and gets fresh evaluation/grace, never a copied answer. Interrupted/unknown
+dispatches are never replayed. Unavailable sources/evaluators retry at most every five minutes.
+Dispatch fingerprints the complete evaluator input, including blocking-only sources. Changed
+input cancels even if an old quotation remains. Settings changes synchronously revoke unsent
+work, including change-away/change-back; the checked arbiter checks revocation after async
+admission immediately before sending. A response already on the wire retains its real outcome.
 
 **Modes** (`deputy.mode`):
 
@@ -4276,20 +4408,33 @@ current-policy paired owner evidence meets the readiness threshold.
   recorded first: an answer interrupted by a reload or without a confirmation is never submitted
   again (`unknown`), and it is not reported as applied.
 
-**Live gate.** Live answers need both: at least 30 real paired shadow cases at 90% agreement or
-more for the current evaluator version (`deputy-2/<model>/low`; a model or policy change starts
-over), and a submission path that applies a response only while no owner response for the request
-is in, bound to the request, idempotent, and reports what happened to it. The owner accepted the
-plugin's own checked path ([Answers to agent questions](#answers-to-agent-questions)) in place of
-the daemon half (2026-10-07): for the answers it submits for the deputy, that path holds the
-owner's answer ahead of it, binds the submission to the request whose content it last read, records
-one outcome per Linear activity, and never submits an unconfirmed answer again. What Paseo itself
-would have to provide stays outside the promise: the daemon names no responder, so answers from the
-Paseo app remain unattributed and can win a race against a deputy answer, and it takes no expected
-fingerprint. On a host whose plugin has no checked connection to its Paseo daemon the deputy cannot
-answer at all (blocker "no checked answer connection to the local Paseo daemon"); there a live
-candidate ends `blocked` with the reason and the question stays with the owner. The settings show
-`deputy.live.ready` and `deputy.live.blockers`.
+**Live gate: two distinct authority paths, not two kinds of empirical evidence.**
+
+- **Specific/mixed authority:** at least 30 real current-version shadow predictions paired with
+  attributed owner answers, at least 90% agreement, exactly as below.
+- **Explicit owner-authorized standing activation:** `deputy.standingPolicy` must equal
+  `owner-autonomy-2026-10-15-v3`, and the latest private `deputy-activation` audit entry must record
+  that same revision through `linear.set-settings`. This bypasses **only** the empirical threshold,
+  **only** when every selected action has checked current positive standing-policy authority.
+  Default is `null`; an unknown/old non-null revision normalizes to `null` **and mode `off`**,
+  never silently upgrades or falls through to live empirical dispatch.
+  A missing/revoked audit fails closed. Normal 60-day journal retention also bounds the audit:
+  explicitly reassert the authorized opt-in through the RPC to renew it when required.
+
+**Both paths** still require the exact pending request, trusted sources, unchanged complete
+evidence, grace, current settings/version, owner override and the plugin's checked local-daemon
+connection. No checked connection means no live answer. `deputy.live.ready` and `.blockers`
+continue to describe the generic empirical path; `.standingPolicyReady` separately reports
+audited standing-path capability, not a claim that a particular action is safe. Predictions,
+replays, synthetic smoke cases and deputy answers cannot manufacture empirical readiness.
+
+Plugin-mediated owner answers reserve priority before deputy dispatch and preserve attributed
+evidence/corrections. **Native direct daemon answers do not use that reservation or attribution
+path:** observed resolution ends the candidate and the daemon rejects a gone request, but a native
+answer already racing on the wire has no plugin owner-priority guarantee. The daemon names no
+responder and accepts no expected fingerprint. Native late answers do not automatically enter the
+plugin's correction path; keep the normal native answer/override UI visible. The linked comment
+or `override D-…` remains the supported explicit correction mechanism.
 
 **Evidence.** A pair is a prediction recorded before the owner answered and the owner's answer to
 the same request, delivered by the plugin for the authenticated owner (a Linear comment written
@@ -4325,9 +4470,10 @@ questions**).
 
 **Log and weekly review.** The decision log (`owner-decisions/log.jsonl`, see [Decision
 candidates](#decision-candidates)) gains `owner-answer` (an answer the plugin delivered for the
-owner), `deputy-prediction`, `deputy-refusal`, `deputy-answer` (with version and citations),
-`deputy-outcome` (blocked, canceled, owner won, unknown) and `deputy-override` (with delivery
-result). Existing entries are kept as they are. `collect` lists deputy answers and overrides in
+owner), `deputy-prediction`, `deputy-refusal`, `deputy-answer` (with version, citations and the
+standing activation revision used at dispatch), `deputy-activation` (explicit settings-RPC opt-in
+or revocation), `deputy-outcome` (blocked, canceled, owner won, unknown) and `deputy-override` (with
+delivery result). Existing entries are kept as they are. `collect` lists deputy answers and overrides in
 their own section as review evidence: a deputy answer cannot be cited as the owner's decision;
 an override can (the owner's words).
 
@@ -4349,14 +4495,142 @@ archived in `deputy/reports/`, so cases outlive the log's 60 days.
 **Recall access.** `deputy/recall.json` (`{ "url", "bank", "token" }`, `0600`), else omp's
 `hindsight.apiUrl` with bank `omp` and `HINDSIGHT_API_TOKEN` in the daemon's environment. The
 token stays on the host: never in settings, prompts, citations or reports. `deputy.recallConfigured`
-says whether access exists.
+says whether access exists. Only an absent optional `recall.json` with no fallback token means
+no recall source. An unreadable or invalid existing file (including missing credentials/invalid
+URL), or an unusable configured token fallback, blocks the deputy rather than dropping possible
+owner constraints. Diagnostics never echo configuration contents or credentials.
 
-**Setup and rollout.** Set through `linear.set-settings`, for example
-`{ "deputy": { "mode": "shadow", "model": "openai-codex/gpt-6.1-sol", "principlesRepository": "/home/mirko/paseo/tuchel-platform" } }`,
-or edit `deputy` in `settings.json`. Start in shadow on one host, link a report with at least 30
-real paired cases, and switch to live once the checked path ([Answers to agent
-questions](#answers-to-agent-questions)) is deployed on that host. The deputy stays off by
-default.
+**Settings and explicit authorized activation.** Read `linear.get-settings`, then use the
+authenticated plugin RPC, not a direct file edit, for the opt-in:
+
+```json
+{
+  "deputy": {
+    "mode": "live",
+    "model": "openai-codex/gpt-6.1-sol",
+    "standingPolicy": "owner-autonomy-2026-10-15-v3"
+  }
+}
+```
+
+Send to `linear.set-settings` on **each actual agent host** only after independent safety review
+and current-policy boundary replay. V1/v2 opt-ins normalize off: v3 requires a new explicit
+audited opt-in. Offline cache keys must include current policy, implementation and complete
+evaluator input; v1/v2 replay verdicts cannot authorize or satisfy readiness under v3.
+The RPC persists settings, revokes unsent work and appends a private activation audit. An audit
+write failure is reported, not forged; retry the explicit RPC. Read back settings and
+`deputy.live.standingPolicyReady`; a false generic `live.ready` remains truthful until real paired
+evidence exists. Optional `principlesRepository` remains host-specific. The deputy stays off
+by default; this source change does not enable a running host.
+After recording the audit, relevant settings/template changes freshly reevaluate exact still-pending
+work revoked by that write; a current-version shadow prediction is also reevaluated when mode
+changes. Explicit standing activation can reconsider a blocked standing prediction, but cannot
+promote it directly. Sources, selection and the full grace period start afresh, including an
+in-flight evaluation that notices revocation before the settings handler reaches its lane.
+Arbitrary canceled work, answered/changed requests and interrupted/unknown dispatches are not revived.
+
+**Already-open live questions.** Initial daemon attachment and deputy settings/activation
+reconciliation paginate this host's unarchived agents, refresh each ticket-linked agent with
+pending structured questions, and observe the current exact requests even if they arrived before
+plugin startup. Call `linear.reconcile-deputy` with `{}` on **both actual agent hosts** for a
+supported bounded inventory pass after activation. Its `{ observed, skipped, failed }` counts
+are observation attempts, not approvals or answers; collection failures are reported. Concurrent
+passes share discovery and candidates retain per-request evaluation/dispatch serialization.
+The shared daemon initialization attaches the checked reply SDK and awaits successful persisted
+multipart owner-hold restoration before any startup, settings or explicit-RPC deputy recovery,
+inventory or observation. Deferred restoration cannot grant dispatch; failure refuses deputy
+work and a later attaching operation retries restoration. Only a missing optional session file
+means no stored holds; unreadable/invalid files and malformed multipart identities fail closed,
+and a repaired file can be re-read. Ordinary owner delivery retains its failure path.
+Inventory writes the existing idempotent exact question/ticket/parts journal entry
+before observing, so later authenticated answers and overrides remain ticket-bound source
+evidence; discovery never manufactures owner answers.
+Off mode evaluates nothing. Current-policy recovery freshly verifies pending identity, sources,
+trust and settings; old-version refusals/selections do not block eligible fresh evaluation.
+The full grace and checked once-only delivery gates still apply. Terminal owner-resolved,
+arbitrarily canceled, changed or unknown-dispatch candidates are never blindly resurrected.
+
+**Linear-only delivery boundary.** A comment or continuation ask without a currently pending
+daemon structured question has no autonomous checked deputy delivery path. Historical Linear
+sources first undergo the source-currentness admission below; they are not mass-answered, and
+replay outputs are never imported as live answers. `linear.answer-ask`/`linear.triage-ask` remain
+explicit authenticated owner actions, not a deputy impersonation or corrective-guidance channel.
+Technical-but-unanswerable menus and genuinely missing business facts remain visible for review.
+
+**Persisted launch-template migration.** Updating `DEFAULT_PROMPT_TEMPLATE` or source notes does
+not rewrite an existing `settings.json` template. On each host read `linear.get-settings` and
+privately retain the exact old `template` (which can be `null`). Preserve custom task/context
+placeholders and business/security/production/verification constraints; replace only obsolete
+technical “second merge queue drop / fix budget / owner manual task / old publish wording”
+restrictions with current standing delegation. Apply through:
+
+```json
+{ "expectedTemplate": "<exact template just read>", "template": "<reviewed complete replacement>" }
+```
+
+`expectedTemplate: null` compares against the source-default state. Comparison and replacement
+are serialized/atomic with all settings patches; a concurrent change rejects the **entire**
+patch, so refresh/review rather than overwrite. An explicitly reviewed `template: ""` restores
+the source default; never use it to silently discard host customizations. Read back and compare
+the full result, including unrelated settings. This affects newly launched agents; it does not
+rewrite existing prompts. Automatic and manual ticket launches additionally include the current
+standing-authority/access notes. Parent rollout owns host migration and activation.
+
+**Read-only native urgency status.** On the actual agent host call
+`DaemonConnection.invokePlugin("linear-tickets", method: "linear.deputy-status",
+input: {agentId, permissionId}, timeout: 2s)`. Output:
+
+```text
+{ mode, policyVersion: string|null, updatedAt,
+  candidates: [{ agentId, permissionId, requestFingerprint, request,
+    state, observedAt, updatedAt, expiresAt: string|null, suppressUrgency }] }
+```
+
+`request` is the complete original raw permission payload, including `kind`, `title`,
+`description` and `input`; clients compare it to their local request, never IDs or wording alone.
+Top-level `updatedAt` is lookup time; candidate timestamps describe transitions, not heartbeats.
+Only exact current requests with trusted eligible live handling can return
+`suppressUrgency: true`: evaluating expires at the original observation +150 s;
+waiting/dispatching at grace deadline +10 s settlement allowance. Polls never renew these
+deadlines. A terminal/refused/unhandled/off/shadow/no-evaluator/error/stale or relinked request
+fails open. After asynchronous gate/daemon reads, status rechecks current settings, revocation
+and candidate state; a concurrent refusal or off switch cannot keep the earlier suppression.
+Status is read-only and never sends an answer.
+
+An initial **notification-only** checking debounce may retry missing/evaluating-false evidence
+within one fixed 15 s window (poll 1 s, RPC timeout 2 s). During checking the ordinary urgent,
+answerable card stays visible with honest checking text—not a quiet badge or invented deputy
+handling. Only confirmed exact `true` permits moving to a deputy-handling section or suppressing
+interrupting urgency. Preserve answer/override controls, fail open immediately on terminal/off/
+shadow/no-policy/errors, use a short freshness lease and a 10-minute total cap, and never renew
+the initial deadline. Source/network latency can exceed 15 s; no measured host latency guarantee
+is implied. Plugin ticket mentions use the same bounded initial check, then confirmed handling
+only; if unanswered at the deadline or refused they notify normally. A failed deputy observation
+(for example candidate persistence failure) is logged locally and never prevents the session's
+owner question, Needs input state or owner mention, and cannot defer that notification.
+
+**Safe current-policy replay.** The exported evaluator API is
+`evaluateWithOmp({identifier, parts, context, sources}, model, privateDirectory)`; `standingSources()`
+returns actual complete standing authority. Use isolated temporary directories and no live
+`Deputy`, daemon, `PermissionReplies`, activation or decision-journal writes. For the historical
+exact question corpus, preserve raw `header` (falling back to logged `key` only when absent),
+exact keys/options/descriptions, and normalize raw `multi:true` to unsupported multi-select.
+Carry zero-based `recommended` indexes and their actual offered labels as advisory question
+metadata, not new choices or authority. Explicitly label task/plan/environment context as
+unavailable; question claims and invented task facts are not source evidence.
+Inspect checked selections/refusals and semantic boundary reasons, not a target acceptance
+ratio. A replay is exploratory safety/coverage evidence, **not real-time shadow readiness**.
+Abstentions may report `owner-boundary`, `technical-reframe` (delegated technical work but no
+literal offered agent-executable choice), or `investigate` (missing material task/environment
+facts). An absent classification is unclassified, not automatically an owner decision. These
+diagnostics cannot authorize an answer or bypass any live gate. Actor-mismatched menus remain
+unanswered; there is no reinterpretation of an owner-labelled choice and no unchecked corrective
+guidance side channel. The parent runs the historical last-2000 replay after independent review
+and before rollout. A replay harness can inject the existing `runOmp`-compatible runner through
+the fourth `evaluateWithOmp` argument; output must identify a custom runner rather than claim
+unverified provider execution. For resumable offline caching, key the complete evaluation input,
+model/thinking, system prompt and evaluator/validator AND normalization source revision; recheck
+cached raw model output with current `checkVerdict`, and never write replay rows to the live journal.
 
 **Off switch.** `"deputy": { "mode": "off" }` stops new evaluations and ends candidates waiting
 for their grace period at once; `shadow` ends waiting live candidates too. Neither undoes an
@@ -4441,8 +4715,9 @@ incomplete coverage, not an empty successful inbox. Descriptions, source comment
 `needs-you/` records and handover records provide distinct revision-bound decision sources.
 The plugin's wait comment is read directly when necessary. Comment edits are visible within
 60 seconds even when the ticket's `updatedAt` has not changed; the browser's periodic owner
-collection and answer validation read them immediately. Equal ticket IDs or wording alone do
-not merge independent decisions, and unanswered extraction remains visible for source review.
+collection and answer validation read them immediately. Every source has a stable `sourceId`;
+equal ticket IDs do not merge independent decisions. Unclassified historical text remains in
+explicit nonurgent source review, not a presumed current owner wait.
 An ask's ticket is the parent of a "Needs you" sub-issue or manual task, else the issue itself (a ticket under an epic is
 still its own ticket). Each ask carries its route from this host's view: `agent` (the live asking
 agent), `continue` (the ticket's agent is gone: an answer starts a continuation agent through the
@@ -4451,32 +4726,54 @@ starter's handover path), or `comment`.
 **Asks that repeat a live question.** A ticket whose wait was opened by a permission request (the
 agent's question or approval, wait kind `request`) and that has a live root agent on this host
 carries `mirrorsLiveRequest: true` while one of its live agents (subagents included) still holds a
-pending request: the ask is the Linear copy of that live question. Once none does, the question was
-answered — in the browser, the menu bar or on Linear — and the ask is left out of the snapshot and
-refused by `linear.answer-ask` ("not waiting for you"), the same stale-wait rule the steward
-applies; write-back moves the ticket out of Needs input moments later. A `turn-end` wait (the agent
-ended its turn with a question) and a `decision` wait are unaffected. The browser inbox caches the
-owner snapshot for fifteen minutes but reads live agents on every view. Explicit refresh and
-answers invalidate collection; the background collector runs even with the page closed. It drops a mirroring
-ask as soon as its live question is gone. When the agents cannot all be read, nothing is taken for
-answered.
+pending request. This is a routing hint, not proof that arbitrary text equals that live request:
+native consumers require a unique complete question/options match before collapsing twins.
+Once no request remains, the original wait source stays available for nonurgent review unless
+independently cited current owner evidence still earns owner attention. Absence of a live request
+does not answer an underlying business question, even in the same source. `linear.answer-ask`
+still refuses the retired request rather than dispatching it again; use the original ticket to
+establish a current delivery path. A `turn-end` or `decision` wait is unaffected.
+The browser caches the owner snapshot for fifteen minutes but reads live agents on every view.
+Explicit refresh/answers invalidate collection; the background collector runs with the page
+closed. When agents cannot all be read, absence is not treated as proof of resolution.
 
-**The extraction.** `linear.owner-asks` never waits for a model. An ask whose ask text is new (or
-whose earlier extraction failed) is returned right away with `extracted: false`; manual
-classification is preserved. Extraction runs in the background: one isolated, tool-less OMP call per ask text
-(no MCP servers, extensions, skills, rules or memory; the ask is data, never instructions), thinking
-`low`, on `deputy.model` when set, else the cheap tier's `cheapModels.omp` model. Strict JSON is
-accepted: kind `decision` (with questions and options), `manual` (the owner does something outside
-Linear) or `info`; anything else, an unreadable or oversized answer, or a tool event leaves the ask
-unextracted and the call is retried after 15 s, 60 s and 5 minutes, then given up. Two calls run at
-a time. Results are cached in `$PASEO_HOME/linear-tickets/owner-asks/extract/<issueId>.json`
-(directory `0700`, file `0600`, keyed by the ask text and the extraction version), so a restart or a
-second refresh re-runs nothing.
+**The extraction and admission.** `linear.owner-asks` never waits for a model. New or failed
+extractions are returned immediately with `extracted: false`. Only independently evidenced
+current owner waits fail open to owner urgency; unknown historical text is `attention: info`
+with an explicit nonurgent review reason. A manual label, punctuation, age or status does not
+establish human-only work or currentness. Descriptions and all source comments remain discoverable.
+Exact relay echoes have one canonical source; originals remain inspectable with its source ID.
+Later progress never settles an independent business/identity/explicit owner-hold question.
 
-**Where an answer goes.** `linear.answer-ask` takes `{ issueId, revision, answers, note?, done? }`,
-where `revision` identifies the displayed source and question choices. A changed ask rejects the
-old answer; refresh and choose again. `answers` maps each question key to the chosen option label
-or free text, and answers like an
+Background extraction gets the source and bounded timeline context. Checked currentness must
+cite exact source IDs and verbatim quotes. Historical owner admission additionally requires a
+positive business, personal-identity or explicit owner-hold boundary and complete timeline
+context. Resolution/supersession requires a distinct later cited source explicitly linking the
+original source ID or quoted question; unrelated newer progress is insufficient. Missing,
+truncated or invalid evidence remains source review. No model assessment dispatches an answer,
+marks a ledger entry completed, or deletes the original history.
+
+One isolated, tool-less OMP call per source/context uses thinking `low`, `deputy.model` when set,
+else the cheap tier's `cheapModels.omp` model; no MCP, extensions, skills, rules or memory.
+Strict JSON includes kind `decision`/`manual`/`info` and the source-grounded assessment. Invalid,
+oversized or tool-event responses stay unextracted and retry with backoff before giving up.
+Two calls run at a time. Private `owner-asks/extract/` cache files (`0700` directory, `0600`
+files) bind source text, current timeline/wait context and `owner-ask-4-source-currentness`;
+old extraction labels cannot silently restore urgency after this policy change.
+
+**Where an answer goes.** `linear.answer-ask` takes
+`{ issueId, sourceId?, revision, answers, note?, done? }`. Shared validated RPC output preserves
+`sourceId`; browser/native callers send it when present. Both it and the exact source/context
+revision must match; mismatched receipt retries and stale or reconciled sources reject without
+delivery. Legacy callers may omit `sourceId` but must still supply the exact revision. Refresh
+and choose again after a change.
+
+Independent comments on a Needs-you/manual sub-issue do **not** inherit the description's agent
+route. Unless they are the actual tracked wait source, answers remain scoped comments only:
+an identical `Yes` label cannot consent to a different live question. The original tracked
+source retains its established live/continuation route.
+
+`answers` maps question keys to exact option labels or free text, and answers like an
 `@paseo` reply: to the live agent that asked through the checked relay path (its pending question is
 answered, else the text is a prompt), else a continuation agent on the ticket (the answer is its
 lead, as an owner comment on a waiting ticket would start), else a comment on the issue. When the
@@ -4484,15 +4781,45 @@ continuation cannot start now (no free agent slot, blockers, a start or a proces
 hand-over held), the answer joins the wait line instead of failing: the plugin opens a thread on
 the ticket that waits with the answer as its message, exactly like an `@paseo` thread that could
 not start (see *Waiting their turn*), and the menu bar shows `queued` with the reason. `done:
-true` completes a `paseo-manual` issue and a "Needs you" sub-issue and moves them to Done; on a
+true` completes a `paseo-manual` issue and a "Needs you" sub-issue only when no other independent
+source remains unsettled. The completion read must also re-match the selected source's accepted
+revision, including registration identity and material scope: a same-ID replacement or edit
+requires fresh consent, not exclusion merely by source ID. Unknown/unclassified history blocks
+whole-issue completion. An ordinary answer settles its selected source only.
+Completion after the last confirmed source answer also
+checks the unchanged material source scope and other sources' receipts or cited reconciliation;
+posting that answer's own receipt does not count as a material source edit. Failed completion
+can retry its pending effect without reposting the answer. Successful completion is durably
+checkpointed separately from removal of its saved "Needs you" registration: an exact retry,
+including after restart and disappearance from the open-issue inventory, retries only cleanup,
+never the answer or completion. Cleanup is bound to that registration's identity; a reopened
+issue's replacement registration is not deleted. Registration and checked removal share a local
+mutation lane, and fresh registrations receive a new identity even when issue, parent, agent and
+question text are unchanged. That identity participates in the material source scope, so the
+replacement cannot inherit old consent. Legacy completion progress without a saved tracking
+identity cannot remove an existing registration without verification. Every issue-specific answer,
+Done and triage collection, plus fresh completion collection, reads the strict tracking inventory
+before dispatch or completion; unreadable or invalid records fail closed. Only background display
+uses tolerant tracking reads. Repairing invalid tracking permits retry, but material identity
+changes still require a fresh source revision. This does not invent bulk answers.
+The shared reply arbiter, including receipt recovery, leaves completion for the durable
+`owner-ask:` namespace to this source-aware inbox path. On a
 parent ticket it only records the comment and leaves the state to the agent, whose next turn settles
 the wait. Every answer records "Answered from the decision inbox: …" on the issue. The durable ledger
 binds each action to its source revision and exact answer/scope. An exact retry returns its recorded
 result instead of repeating delivery, including after a restart. An unconfirmed delivery is never
 replayed automatically; its error asks the owner to inspect the ticket or agent. A delivered answer,
-including a queued continuation, hides only that exact revision. A changed source or extraction
-appears immediately; unrelated questions on the same ticket are not suppressed. Failures throw
-with a sentence the menu bar shows.
+including a queued continuation, fences an unchanged material source scope across unrelated timeline
+or extraction revisions. Scope includes title, parent/ticket identity, source kind and enclosing
+description as well as the source text. That material scope is also part of every source revision,
+including parent-only changes on an ordinary ticket; exact-revision receipt lookup cannot bypass
+it. Changed business scope requires a fresh explicit answer, even when its question words are
+unchanged; independent questions are not suppressed. Legacy
+body-only receipts cannot approve another revision and retain only conservative unknown-delivery
+fences across revisions.
+Unknown delivery remains fenced across context/extraction changes and cannot be resent by
+changing an answer, source ID or action.
+Failures throw a sentence the menu bar shows.
 
 **Host choice.** The menu bar calls `linear.owner-asks` on its canonical tickets host (server087 by
 default). It answers through a live Mac agent only when the Mac snapshot matches the displayed
@@ -4501,12 +4828,15 @@ The existing activation claims route scoped continuation instructions to a peer 
 preserving the decision identity and restricted triage intent. Both hosts must run this version
 before forwarding research/delegation. Deferral and other Linear triage always use the tickets host.
 
-**Attention and shared blockers.** Each ask carries `attention` (`owner`, `advisor`, `dependency`,
-or `info`) and an explanation. An uncertain or not-yet-extracted ask stays visible as an owner item.
-Future plan approval while an advisor is still reviewing is not a current owner decision; the
-turn-end detector also avoids opening new owner waits for that report. A separate concrete owner
-question still takes precedence. Other waits remain inspectable in the menu bar rather than being
-deleted or marked Done. Failed planners are labelled separately from decisions.
+**Attention and shared blockers.** `attention` remains `owner`, `advisor`, `dependency`, or `info`.
+`owner` means evidenced current human attention, including failed extraction of a tracked current
+owner wait. Explicit `info` means nonurgent review even when `extracted: false`; it does not claim
+completion, approval or deferral. Browser owner priority/counts follow attention rather than an
+old task priority, manual label, generated summary or extraction status. Unknown history stays
+discoverable under **Needs source review**. Advisor/dependency waits stay separate and nonurgent.
+The browser initially renders 50 source-review rows, with explicit load-more controls and the full
+review count. Search still covers every discovered source, including rows not yet rendered.
+The direct live permission fail-open/answer UI and deputy owner boundaries remain unchanged.
 
 An explicitly evidenced blocking ticket can supply `blockerIdentifier`. The menu bar groups
 related tickets under that blocker, without inferring that their approvals are interchangeable.
@@ -4518,7 +4848,7 @@ There is no "approve all related tickets" operation, no automatic recommended an
 change to repository permission, production, spending or business-policy rules.
 
 **Research, delegation and deferral.** `linear.triage-ask` accepts
-`{ issueId, revision, action, note?, until? }`. Actions:
+`{ issueId, sourceId?, revision, action, note?, until? }`. Actions:
 
 - `research`: send the owner's specific evidence request through the existing agent/continuation
   route. Research is not permission to implement or settle the business decision.
