@@ -4321,8 +4321,10 @@ Candidates live in `$PASEO_HOME/linear-tickets/deputy/candidates.json` (director
    “above/about” PR size is not spend; a purchase fixture is not purchasing policy; a merge buffer
    or Git enumeration repair is not a destructive reset. Preparing a no-reset plan or collecting
    evidence is not executing a cutover or inventing tax/package/contract facts.
-4. **Checked verdict.** Each selected part needs an exact offered label, a low-consequence action
-   assessment and a decisive verbatim citation (at least 12 characters). Each action declares
+4. **Checked verdict.** An ordinary answer needs an exact offered label per selected part;
+   the separate bounded technical-continuation fallback below uses only its code-owned directive.
+   Both need a low-consequence action assessment and decisive verbatim citations (at least 12
+   characters). Each action declares
    `standing` or `specific` authority; standing authority needs a current positive
    completion/engineering/access/models policy citation for that part, not a boundaries passage
    alone. A safe offered investigation can win over a risky production mutation or recommended
@@ -4332,12 +4334,29 @@ Candidates live in `$PASEO_HOME/linear-tickets/deputy/candidates.json` (director
    is not autonomous merely because an agent heartbeat waits afterward. Ordinary attribution
    to an already authorized tool account is distinct from forging a personal owner approval.
    Mandatory owner handback on a conditional technical failure is mixed execution too; selecting
-   the label cannot rewrite that branch. Only labels reach the working agent: hidden evaluator
-   reasoning cannot supply revision instructions or other required free text. Such choices
-   require a technical reframe, not a fabricated answer.
-   When there is no safe exact offered choice, the deputy transparently abstains; there is no
-   checked corrective-guidance/reframing side channel in this implementation. No coverage quota
-   can fabricate a selection or missing business fact.
+   the label cannot rewrite that branch. For ordinary answers only labels reach the working agent:
+   hidden evaluator reasoning cannot supply revision instructions or other required free text.
+   Such choices require a technical reframe, not a fabricated answer.
+   **Bounded technical continuation:** when no safe exact choice can accomplish useful delegated
+   work, the evaluator may instead return `technical-continuation` with the closed
+   `read-only-investigation-v1` template, a concrete relevant read-only step using existing material
+   and access, and why no safe offered choice suffices. Those explanations are audit data, never
+   executable model prose. Delivery is one fixed directive identifying the automated deputy,
+   expressly not personal owner approval or selection of any bundled release. It permits only
+   read-only investigation/review under current standing authority, preserves actual holds,
+   cancellations and every acceptance/release gate, and prohibits writes/repairs, pushes,
+   approval/PASS markers, paid workers/new spend, private uploads, publication/enqueue/merge/deploy,
+   access changes and external commitments. Findings must distinguish scoped technical work from
+   retained business/owner decisions. A current no-further-review stop still forbids review; a
+   missing business fact or no useful permitted technical step still requires abstention.
+   Safe exact offered choices remain preferred. Every actor, consequence, integrity and citation
+   fence applies to the complete directive; continuation additionally requires `standing`
+   authority and `technical` outcome scope. No quota can fabricate a selection or business fact.
+   This fallback requires the known OMP ask adapter shape: provider `omp`, name `OMP ask`,
+   `metadata.ompAsk: true`, `answerHeader: Response`, exactly one `Response` part with
+   `allowOther: true`, **boolean** `multiSelect: false`, and matching offered `optionLabels`.
+   Generic select/editor, unknown providers, missing/malformed capability flags and multi-select
+   cannot inherit it. The fixed directive must not already be an offered label.
    Every action also declares `outcome.scope` and eventual `outcome.effects`. A claimed
    `preserves-authorized-workflow` or `authorized-workflow-change` must quote a decisive
    **non-standing** baseline/approval source and include that same citation for the same part.
@@ -4410,15 +4429,31 @@ block, without Paseo, Linear or GitHub credentials in its environment. A tool ev
 unreadable/oversized answer, abstention or failed check refuses the whole request. Citations
 retain source ID, revision and quote.
 
-Evidence is versioned as `deputy-17-ticket-own-history/owner-autonomy-2026-10-15-v3/<model>/high`.
+Evidence is versioned as `deputy-18-bounded-technical-continuation/owner-autonomy-2026-10-15-v3/<model>/high`.
 Old-policy predictions never satisfy current empirical readiness. On restart, an old-version
 refusal/prediction is reevaluated only after the exact unanswered request is freshly verified;
 old selections, citations, intent and grace are discarded. An equivalent new request ID retires
 the old candidate and gets fresh evaluation/grace, never a copied answer. Interrupted/unknown
 dispatches are never replayed. Unavailable sources/evaluators retry at most every five minutes.
+Pre-rollout unsent candidates using the known older question hash migrate only after a fresh
+daemon read verifies the same still-pending request ID on the linked agent and the **complete
+stored raw request** matches, including provider/name, metadata and custom-answer capability.
+Matching only the old hash is insufficient. Recovery discards the old verdict, evidence, dispatch
+intent and deadline, then reevaluates current policy with a full new grace period. Unknown hash
+formats, changed raw payloads and withdrawn or already-answered requests do not migrate.
+If the daemon refresh or recorded-answer check is unavailable, recovery keeps the legacy
+fingerprint and records a retryable refusal; it never persists an unverified migration. The
+five-minute refusal retry repeats the same fresh complete-raw-request verification before
+migrating, discarding old evidence/intent/grace and starting a full new grace period.
+Terminal/applied/canceled history is not revived; interrupted dispatches retain their existing
+receipt-only settlement path. Persisted owner holds must be restored before recovery and still
+veto the checked submission.
 Dispatch fingerprints the complete evaluator input, including blocking-only sources. Changed
-input invalidates the prediction even if an old quotation remains. The exact still-pending
-question is reconsidered after the five-minute retry interval, with fresh sources and evaluation;
+input invalidates the prediction even if an old quotation remains. The pending-request fingerprint
+includes raw input, provider/name and metadata, so custom-answer capability changes also invalidate
+a prediction. The checked arbiter refreshes again after asynchronous pre-submit work, then applies
+its synchronous owner-hold/revocation checks before sending. The exact still-pending question is
+reconsidered after the five-minute retry interval, with fresh sources and evaluation;
 a replacement prediction receives a full new grace period. An edited, deleted or new owner
 constraint can therefore refuse the earlier answer, never be outrun by it. Each evidence-bound
 prediction remains journaled; retries add no empirical cases. Missing-snapshot predictions and
@@ -4505,10 +4540,22 @@ questions**).
 candidates](#decision-candidates)) gains `owner-answer` (an answer the plugin delivered for the
 owner), `deputy-prediction`, `deputy-refusal`, `deputy-answer` (with version, citations and the
 standing activation revision used at dispatch), `deputy-activation` (explicit settings-RPC opt-in
-or revocation), `deputy-outcome` (blocked, canceled, owner won, unknown) and `deputy-override` (with
-delivery result). Existing entries are kept as they are. `collect` lists deputy answers and overrides in
-their own section as review evidence: a deputy answer cannot be cited as the owner's decision;
-an override can (the owner's words).
+or revocation), `deputy-continuation` (exact intended directive, template/assessed step, checked
+intent, request fingerprint, version, citations and activation), `deputy-outcome` (blocked,
+canceled, owner won, unknown) and `deputy-override` (with delivery result). Existing entries are
+kept as they are. Continuations are neither `owner-answer` nor `deputy-answer`; their predictions
+earn no empirical paired calibration and their daemon echoes earn no substantive-answer or
+owner-decision credit, including the interval before receipt settlement. Reports list them
+separately. `collect` lists deputy answers and owner overrides as review evidence: neither a deputy
+answer nor instruction is owner authority; the owner's actual correction remains citable.
+
+The actual OMP 0.11.4 adapter delivers custom text through two RPCs: the checked initial response
+selects **Other**, and its in-memory pending text is consumed by the next editor request. The
+receipt proves only that initial response was accepted, not editor consumption or agent execution.
+Notices say **Checked technical instruction submitted**, not “answered”. An adapter restart
+between hops loses that pending text: the new generic editor stays visible and cannot inherit or
+reconstruct the prior instruction. Durable plugin recovery settles a confirmed receipt once,
+never resubmits it, and preserves the owner's correction path.
 
 **Report.** From the plugin folder, read-only:
 
@@ -4639,6 +4686,9 @@ deadlines. A terminal/refused/unhandled/off/shadow/no-evaluator/error/stale or r
 fails open. After asynchronous gate/daemon reads, status rechecks current settings, revocation
 and candidate state; a concurrent refusal or off switch cannot keep the earlier suppression.
 Status is read-only and never sends an answer.
+For a confirmed continuation, `state` is
+`technical-instruction-submitted-editor-unobserved` and `suppressUrgency` is false; the durable
+internal `applied` state records only the first checked response, not substantive completion.
 
 An initial **notification-only** checking debounce may retry missing/evaluating-false evidence
 within one fixed 15 s window (poll 1 s, RPC timeout 2 s). During checking the ordinary urgent,

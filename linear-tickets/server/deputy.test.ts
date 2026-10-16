@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
@@ -7,14 +8,16 @@ import type { PaseoApi } from "@getpaseo/client";
 import type { AgentPermissionRequest } from "@getpaseo/protocol/agent-types";
 import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
 import { AUTONOMY_POLICY_REVISION } from "../shared/autonomy-policy";
-import { Deputy, fingerprint, overrideCommand, readCandidates, type ArbitratedOutcome, type PermissionArbiter } from "./deputy";
-import { checkVerdict, policyVersion } from "./deputy-evaluator";
+import { Deputy, fingerprint, overrideCommand, readCandidates, type ArbitratedOutcome, type Candidate, type PermissionArbiter } from "./deputy";
+import { checkVerdict, policyVersion, type EvaluationInput } from "./deputy-evaluator";
+import { TECHNICAL_CONTINUATION, TECHNICAL_CONTINUATION_TEMPLATE, supportsTechnicalContinuation, type TechnicalContinuation } from "./deputy-continuation";
 import { LIVE_MIN_CASES, shadowEvidence } from "./deputy-evidence";
 import { renderReport, verdict, waitStats } from "./deputy-report";
 import { assessRisk, type Part } from "./deputy-risk";
 import { gatherSources, hash, hostReaders, recallAccess, registerEntries, standingSources, verifyCitation, type Source, type SourceReaders, type TicketHistory } from "./deputy-sources";
 import type { IssueState, TicketComment } from "./linear";
-import { DecisionLog, type LogEntry } from "./owner-decisions";
+import { DecisionLog, questionEntry, type LogEntry } from "./owner-decisions";
+import { questionsOf } from "./relay";
 import { PermissionReplies } from "./permission-replies";
 import { DEFAULT_ACTIVATION, DEFAULT_DEPUTY, DEFAULT_BACKSTOP, DEFAULT_DISPATCH, DEFAULT_WATCHDOG, DEFAULT_STEWARD, DEFAULT_WRITEBACK, DEFAULT_WORKTREE_SHARDS, type DeputySettings, type PluginSettings } from "./settings";
 
@@ -2088,4 +2091,502 @@ test("a coalesced reconciliation failure reaches every caller and a repaired hol
   assert.equal(h.evaluations(), 1);
   assert.equal((await h.candidate()).status, "predicted");
   assert.deepEqual(h.responses, []);
+});
+
+// Reconstructed from the parent's captured TUC-2108 / #5798 facts, not a claim
+// that the complete live request or a capable independent reviewer was captured here.
+function bundledReview(): AgentPermissionRequest {
+  const options = [
+    { label: "Agent: gebundener Astra-Recheck (Recommended)", description: "Push head 875b6db8b5; review 65c621fd10..875b6db8b5; record a PASS marker, then CI/enqueue/queue/staging for #5798." },
+    { label: "Owner handles release", description: "The owner reviews and approves the release." },
+  ];
+  return { id: "15a8b43698b1fdd8", provider: "omp", name: "OMP ask", kind: "question",
+    title: "#5798 was restacked twice; full release scope and AC18 activation are unavailable.",
+    input: { questions: [{ header: "Response", question: "How should the agent proceed?", options, allowOther: true, multiSelect: false }] },
+    metadata: { ompAsk: true, answerHeader: "Response", optionLabels: options.map(option => option.label) } };
+}
+
+function continuationAnswer(input: EvaluationInput) {
+  const source = input.sources.find(source => source.id === "standing-policy:engineering")!;
+  return {
+    risk: "low", decision: "technical-continuation",
+    continuation: { template: TECHNICAL_CONTINUATION_TEMPLATE, step: "Read the local 65c621fd10..875b6db8b5 diff and identify the five conflict-resolution changes without modifying files or dispatching workers.", whyNoSafeOption: "The agent option also commits to an unknown release; the other assigns approval to the owner." } satisfies TechnicalContinuation,
+    selections: { Response: TECHNICAL_CONTINUATION },
+    actions: { Response: { option: TECHNICAL_CONTINUATION, actor: "agent", risk: "low", effects: "Read-only inspection of existing local diff; no release or marker.", outcome: { scope: "technical", effects: "Findings and a scoped technical reframe, not approval or delivery of #5798." }, integrity: INTACT_INTEGRITY, reason: "Existing read-only engineering authority; no owner hold is released.", authority: "standing" } },
+    citations: [{ part: "Response", source: source.id, quote: source.text }],
+  };
+}
+
+function continuationInput(request = bundledReview()): EvaluationInput {
+  const risk = assessRisk(request, trusted);
+  assert.ok(risk.ok);
+  return { identifier: "TUC-2108", parts: risk.parts, context: request.title ?? "", sources: standingSources(), request };
+}
+
+test("a bundled unknown release can receive only the checked literal read-only continuation, not a narrowed offered approval", () => {
+  const input = continuationInput();
+  const raw = continuationAnswer(input);
+  const checked = checkVerdict(JSON.stringify(raw), input.parts, input.sources, input.request);
+  assert.ok(checked.ok && checked.continuation);
+  assert.deepEqual(checked.selections, { Response: TECHNICAL_CONTINUATION });
+  assert.equal(checked.standing, true);
+  for (const altered of [
+    { ...raw, decision: "answer" },
+    { ...raw, selections: { Response: `${TECHNICAL_CONTINUATION} Then enqueue.` } },
+    { ...raw, continuation: { ...raw.continuation, template: "approve-release" } },
+    { ...raw, continuation: { ...raw.continuation, step: "" } },
+    { ...raw, continuation: { ...raw.continuation, whyNoSafeOption: "" } },
+    { ...raw, selections: { Response: input.parts[0].options[0] } },
+  ]) assert.equal(checkVerdict(JSON.stringify(altered), input.parts, input.sources, input.request).ok, false);
+});
+
+test("continuation retains actor, consequence, integrity, and positive authority checks", () => {
+  const input = continuationInput();
+  const raw = continuationAnswer(input);
+  for (const action of [
+    { ...raw.actions.Response, actor: "owner" },
+    { ...raw.actions.Response, risk: "external-accounts-or-spend", effects: "Launch a paid worker and upload a private diff." },
+    { ...raw.actions.Response, outcome: { scope: "new-workflow-choice", effects: "Invent missing tax facts." } },
+    { ...raw.actions.Response, outcome: { scope: "unknown", effects: "No useful technical path is established." } },
+    { ...raw.actions.Response, integrity: { ...INTACT_INTEGRITY, ownerArtifacts: { state: "violated", reason: "Creates approved-test-change as personal owner approval." } } },
+    { ...raw.actions.Response, integrity: { ...INTACT_INTEGRITY, gates: { state: "violated", reason: "TUC-2115 owner stop 84cd05b1 permits exactly one extra review 820ebb01d8..4d4145a41e, failed 279c5405; no further fix/review/paid worker." } } },
+  ]) assert.equal(checkVerdict(JSON.stringify({ ...raw, actions: { Response: action } }), input.parts, input.sources, input.request).ok, false);
+  assert.equal(checkVerdict(JSON.stringify({ ...raw, citations: [] }), input.parts, input.sources, input.request).ok, false);
+  assert.equal(checkVerdict(JSON.stringify(raw), input.parts, input.sources).ok, false, "no inferred provider capability");
+});
+
+test("only actual single-part OMP ask custom-answer capability enables continuation", () => {
+  const good = bundledReview();
+  assert.equal(supportsTechnicalContinuation(good), true);
+  const part = questionsOf(good)[0];
+  for (const request of [
+    { ...good, provider: "unknown" }, { ...good, name: "OMP select" },
+    { ...good, metadata: { extensionUiMethod: "editor", answerHeader: "Response" } },
+    { ...good, metadata: { ...good.metadata, answerHeader: "Different" } },
+    { ...good, metadata: { ...good.metadata, optionLabels: ["forged"] } },
+    ...[{ allowOther: false }, { multiSelect: true }, { multiSelect: "true" }, { multiSelect: 1 }, { multiSelect: undefined }, { multiple: "true" }, { header: "Different" }].map(change => ({ ...good, input: { questions: [{ ...part, ...change }] } })),
+    { ...good, input: { questions: [{ header: part.header, question: part.question, options: part.options, allowOther: true }] } },
+    { ...good, input: { questions: [part, part] } },
+    { ...good, input: { questions: [part, null] } },
+    { ...good, input: { questions: [{ ...part, options: [{ label: TECHNICAL_CONTINUATION }, { label: "Wait" }] }] }, metadata: { ...good.metadata, optionLabels: [TECHNICAL_CONTINUATION, "Wait"] } },
+  ]) {
+    assert.equal(supportsTechnicalContinuation(request), false);
+    const input = continuationInput();
+    assert.equal(checkVerdict(JSON.stringify(continuationAnswer(input)), input.parts, input.sources, request).ok, false);
+  }
+});
+
+async function continuationHarness(t: TestContext) {
+  const request = bundledReview();
+  let replies: PermissionReplies;
+  const arbiter: PermissionArbiter = { respond: intent => replies.respond(intent), outcome: intentId => replies.outcome(intentId) };
+  const h = await harness(t, { mode: "live", standingPolicy: AUTONOMY_POLICY_REVISION }, { pending: [request], arbiter });
+  const submitted: unknown[] = [];
+  replies = new PermissionReplies({ directory: join(h.directory, "replies"), daemon: async () => ({
+    respondToPermissionAndWait: async (_agentId, _requestId, response) => { submitted.push(response); h.daemon.pending = []; },
+  }) });
+  replies.attach(h.paseo);
+  t.after(() => replies.stop());
+  h.deps.arbiter = async () => replies;
+  h.deps.evaluate = async input => checkVerdict(JSON.stringify(continuationAnswer(input)), input.parts, input.sources, input.request);
+  await h.log.append({ kind: "deputy-activation", id: "activation", key: "activation", at: "2026-10-07T09:59:00Z", policy: AUTONOMY_POLICY_REVISION, via: "settings-rpc", mode: "live" });
+  const entry = questionEntry(h.agent.id, request, { id: "i1", identifier: "TUC-2108" }, "2026-10-07T10:00:00Z");
+  assert.ok(entry);
+  await h.log.append(entry);
+  return { ...h, request, replies, submitted };
+}
+
+test("checked continuation waits full grace, journals truthfully, recovers once, and leaves owner correction available", async t => {
+  const h = await continuationHarness(t);
+  await h.deputy.observe(h.agent, h.request, { issueId: "i1", identifier: "TUC-2108" });
+  await h.settle();
+  h.advance(5 * 60_000 - 1);
+  await h.settle();
+  assert.deepEqual(h.submitted, []);
+  h.advance(1);
+  await h.settle();
+  assert.deepEqual(h.submitted, [{ behavior: "allow", updatedInput: { answers: { Response: TECHNICAL_CONTINUATION } } }]);
+  const entries = await h.log.entries();
+  const continuation = entries.find(entry => entry.kind === "deputy-continuation");
+  assert.ok(continuation?.kind === "deputy-continuation");
+  assert.equal(continuation.directive, TECHNICAL_CONTINUATION);
+  assert.equal(continuation.fingerprint, fingerprint(h.request));
+  assert.equal(continuation.key, (await h.candidate()).intentId);
+  assert.equal(entries.some(entry => entry.kind === "deputy-answer" || entry.kind === "owner-answer"), false);
+  const status = (await h.deputy.status({ agentId: "a1", permissionId: h.request.id })).candidates[0];
+  assert.equal(status.state, "technical-instruction-submitted-editor-unobserved");
+  assert.equal(status.suppressUrgency, false);
+  assert.match(h.comments[0], /Checked technical instruction submitted/);
+  assert.match(h.comments[0], /editor consumption.*unobserved/i);
+  assert.doesNotMatch(h.comments[0], /Answered by the deputy/);
+  assert.deepEqual(h.sent, []);
+  await h.deputy.stop();
+  const restarted = new Deputy(h.deps);
+  t.after(() => restarted.stop());
+  restarted.attach(h.paseo);
+  await restarted.reconcile();
+  await restarted.idle();
+  assert.equal(h.submitted.length, 1);
+  assert.equal((await h.log.entries()).filter(entry => entry.kind === "deputy-continuation").length, 1);
+  const candidate = (await restarted.candidates())[0];
+  assert.equal((await restarted.correct(candidate, "Keep the release blocked.", { via: "menu-bar", activityId: "correction", userId: OWNER })).delivered, true);
+  assert.match(h.sent[0], /technical instruction/);
+  assert.doesNotMatch(h.sent[0], /on the owner's behalf/);
+});
+
+for (const fence of ["owner-hold", "revoked", "metadata", "request", "owner-stop"] as const) {
+  test(`technical continuation preserves ${fence} at dispatch`, async t => {
+    const h = await continuationHarness(t);
+    await h.deputy.observe(h.agent, h.request, { issueId: "i1", identifier: "TUC-2108" });
+    await h.settle();
+    if (fence === "owner-hold") h.replies.holdForOwner(h.agent.id, h.request.id);
+    if (fence === "revoked") { h.settings.deputy.mode = "off"; await h.deputy.settingsChanged(); }
+    if (fence === "metadata") h.daemon.pending = [{ ...h.request, metadata: { ...h.request.metadata, ompAsk: false } }];
+    if (fence === "request") h.daemon.pending = [{ ...h.request, id: "new-request" }];
+    if (fence === "owner-stop") h.deps.readers.ticketHistory = async () => history([{ ...OWNER_COMMENT, body: "TUC-2115 owner stop 84cd05b1: no further fix/review/paid worker after failed 279c5405." }]);
+    h.advance(5 * 60_000);
+    await h.settle();
+    assert.deepEqual(h.submitted, []);
+    assert.equal((await kinds(h)).includes("deputy-continuation"), false);
+  });
+}
+
+test("continuation predictions and daemon echoes earn no empirical or substantive-answer credit", async t => {
+  const h = await continuationHarness(t);
+  h.settings.deputy.mode = "shadow";
+  await h.deputy.observe(h.agent, h.request, { issueId: "i1", identifier: "TUC-2108" });
+  await h.settle();
+  const candidate = await h.candidate();
+  await h.log.append({ kind: "owner-answer", id: candidate.key, key: "owner", at: "2026-10-07T10:01:00Z", via: "menu-bar", userId: OWNER, answers: { Response: TECHNICAL_CONTINUATION } });
+  assert.equal(shadowEvidence(await h.log.entries(), VERSION).pairs.length, 0);
+  const continuation: LogEntry = { kind: "deputy-continuation", id: candidate.key, at: "2026-10-07T10:05:00Z", identifier: "TUC-2108", issueId: "i1", version: VERSION, key: "intent", fingerprint: candidate.fingerprint, directive: TECHNICAL_CONTINUATION, continuation: continuationAnswer(continuationInput()).continuation, citations: [] };
+  const entries: LogEntry[] = [(await h.log.entries()).find(entry => entry.kind === "question")!, continuation,
+    { kind: "answer", id: candidate.key, at: "2026-10-07T10:05:00Z", answers: { Response: TECHNICAL_CONTINUATION } }];
+  const stats = waitStats(entries, { since: "2026-10-07T10:00:00Z", until: "2026-10-07T11:00:00Z" }, 1);
+  assert.deepEqual([stats.resolved, stats.byDeputy, stats.ownerAnswers, stats.unresolved], [0, 0, 0, [candidate.key]]);
+  const report = renderReport({ entries, candidates: [], version: VERSION, now: "2026-10-07T11:00:00Z" });
+  assert.match(report, /Checked technical instructions submitted: 1/);
+  assert.match(report, /Answered by the deputy: 0/);
+});
+
+test("an eligible OMP ask still delivers a safe exact option as an ordinary answer, never as a continuation", () => {
+  const request = bundledReview();
+  const part = questionsOf(request)[0];
+  const options = [{ label: "Read existing diff without writes", description: "Inspect the existing local range and report findings only." }, { label: "Owner reviews", description: "The owner performs review." }];
+  request.input = { questions: [{ ...part, options }] };
+  request.metadata = { ...request.metadata, optionLabels: options.map(option => option.label) };
+  const input = continuationInput(request);
+  const { continuation: _continuation, ...raw } = continuationAnswer(input);
+  const option = options[0].label;
+  const result = checkVerdict(JSON.stringify({ ...raw, decision: "answer", selections: { Response: option },
+    actions: { Response: { ...raw.actions.Response, option } } }), input.parts, input.sources, request);
+  assert.ok(result.ok);
+  assert.deepEqual(result.selections, { Response: option });
+  assert.equal(result.continuation, undefined);
+  const bundled = continuationInput();
+  assert.equal(checkVerdict(JSON.stringify({ ...raw, decision: "answer", selections: { Response: bundled.parts[0].options[0] },
+    actions: { Response: { ...raw.actions.Response, option: bundled.parts[0].options[0], outcome: { scope: "unknown", effects: "Unknown release and AC18 activation." } } } }),
+  bundled.parts, bundled.sources, bundled.request).ok, false);
+});
+
+test("persisted continuation template mutation fails closed before checked submission", async t => {
+  const h = await continuationHarness(t);
+  await h.deputy.observe(h.agent, h.request, { issueId: "i1", identifier: "TUC-2108" });
+  await h.settle();
+  const candidate = await h.candidate();
+  assert.ok(candidate.continuation);
+  const file = join(h.directory, "candidates.json");
+  const store = JSON.parse(await readFile(file, "utf8"));
+  store[candidate.key].continuation.template = "approve-release";
+  await writeFile(file, JSON.stringify(store));
+  h.advance(5 * 60_000);
+  await h.settle();
+  assert.deepEqual(h.submitted, []);
+  assert.equal((await h.candidate()).status, "canceled");
+});
+
+test("interrupted continuation receipt settlement recovers without resubmission and a fresh editor stays independently visible", async t => {
+  const h = await continuationHarness(t);
+  const append = h.log.append.bind(h.log);
+  let blocked = true;
+  h.log.append = async entry => {
+    if (blocked && entry.kind === "deputy-continuation") throw new Error("journal unavailable after checked receipt");
+    return append(entry);
+  };
+  await h.deputy.observe(h.agent, h.request, { issueId: "i1", identifier: "TUC-2108" });
+  await h.settle();
+  h.advance(5 * 60_000);
+  await h.settle();
+  assert.equal((await h.candidate()).status, "dispatching");
+  assert.deepEqual(h.submitted, [{ behavior: "allow", updatedInput: { answers: { Response: TECHNICAL_CONTINUATION } } }]);
+  h.deputy.stop();
+  await h.replies.stop();
+  blocked = false;
+  const replies = new PermissionReplies({ directory: join(h.directory, "replies"), daemon: async () => ({
+    respondToPermissionAndWait: async () => { throw new Error("must not resubmit an applied receipt"); },
+  }) });
+  replies.attach(h.paseo);
+  t.after(() => replies.stop());
+  h.deps.arbiter = async () => replies;
+  const editor: AgentPermissionRequest = { id: "fresh-editor", kind: "question", provider: "omp", name: "OMP editor", title: "Response",
+    input: { questions: [{ header: "Response", question: "Response", options: [], allowOther: true }] }, metadata: { extensionUiMethod: "editor", answerHeader: "Response" } };
+  h.daemon.pending = [editor];
+  const restarted = new Deputy(h.deps);
+  t.after(() => restarted.stop());
+  restarted.attach(h.paseo);
+  await restarted.reconcile();
+  await restarted.idle();
+  assert.equal((await readCandidates(h.directory))[`a1:${h.request.id}`]?.status, "applied");
+  assert.equal((await h.log.entries()).filter(entry => entry.kind === "deputy-continuation").length, 1);
+  await restarted.observe(h.agent, editor, { issueId: "i1", identifier: "TUC-2108" });
+  await restarted.idle();
+  const current = (await restarted.candidates()).find(candidate => candidate.requestId === editor.id);
+  assert.ok(current);
+  assert.equal(current.status, "refused");
+  assert.equal(current.continuation, undefined);
+  assert.equal(current.intentId, undefined);
+  assert.deepEqual(h.daemon.pending, [editor]);
+  assert.equal((await restarted.status({ agentId: "a1", permissionId: editor.id })).candidates[0].suppressUrgency, false);
+  assert.equal(h.submitted.length, 1);
+});
+
+test("continuation resolution echoes do not become another question's ticket constraint, even before receipt settlement", async () => {
+  const input = continuationInput();
+  const id = "a1:previous";
+  const question: LogEntry = { kind: "question", id, at: "2026-10-07T09:00:00Z", identifier: "TUC-2108", issueId: "i1",
+    questions: [{ key: "Response", question: "Release or owner?", options: ["Ship", "Owner"] }] };
+  const echo: LogEntry = { kind: "answer", id, at: "2026-10-07T09:05:00Z", answers: { Response: TECHNICAL_CONTINUATION } };
+  const result = await gatherSources(readers({}, [question, echo]), { ...asked, id: "a1:new", identifier: input.identifier, text: "Read the release diff?" }, null);
+  assert.equal(result.abstain, null);
+  assert.equal(result.sources.some(source => source.id === `resolution:${id}` || source.id === `owner-answer:${id}`), false);
+  const stats = waitStats([question, echo], { since: "2026-10-07T09:00:00Z", until: "2026-10-07T10:00:00Z" }, 1);
+  assert.deepEqual([stats.resolved, stats.ownerAnswers, stats.unresolved], [0, 0, [id]]);
+});
+
+async function persistedLegacyContinuation(t: TestContext, status: Candidate["status"]) {
+  const h = await continuationHarness(t);
+  await h.settle();
+  h.deputy.stop();
+  const request = structuredClone(h.request);
+  const candidate: Candidate = {
+    key: `a1:${request.id}`, ref: "D-15a8b436", agentId: "a1", requestId: request.id,
+    issueId: "i1", identifier: "TUC-2108", agentTitle: h.agent.title, cwd: h.agent.cwd,
+    request, fingerprint: createHash("sha256").update(JSON.stringify({ kind: request.kind, title: request.title ?? "", description: request.description ?? "", questions: questionsOf(request) })).digest("hex").slice(0, 24),
+    mode: "live", observedAt: "2026-10-07T09:00:00Z", updatedAt: "2026-10-07T09:01:00Z",
+    status, version: "deputy-17-ticket-own-history/owner-autonomy-2026-10-15-v3/omp/test-model/high",
+    reason: "old verdict", refusalCategory: "no-knowledge", eligible: true, standing: true,
+    selections: { Response: "Agent: gebundener Astra-Recheck (Recommended)" }, citations: [],
+    evidenceFingerprint: "old-evidence", graceDeadline: "2026-10-07T09:05:00Z",
+    intentId: "discard-this-unsent-intent",
+  };
+  await writeFile(join(h.directory, "candidates.json"), JSON.stringify({ [candidate.key]: candidate }));
+  h.daemon.inventory = true;
+  const restart = () => {
+    const deputy = new Deputy(h.deps);
+    t.after(() => deputy.stop());
+    deputy.attach(h.paseo);
+    return deputy;
+  };
+  return { ...h, legacy: candidate, restart };
+}
+
+for (const status of ["refused", "waiting"] as const) {
+  test(`legacy fingerprint migration reevaluates persisted ${status} with fresh full grace before checked continuation`, async t => {
+    const h = await persistedLegacyContinuation(t, status);
+    let evaluations = 0;
+    const evaluate = h.deps.evaluate;
+    h.deps.evaluate = async (input, model) => {
+      evaluations++;
+      const cleared = await h.candidate();
+      assert.equal(cleared.intentId, undefined);
+      assert.equal(cleared.selections, undefined);
+      assert.equal(cleared.graceDeadline, undefined);
+      assert.notEqual(cleared.evidenceFingerprint, h.legacy.evidenceFingerprint);
+      return evaluate(input, model);
+    };
+    const restarted = h.restart();
+    await restarted.reconcile();
+    await restarted.idle();
+    const fresh = await h.candidate();
+    assert.equal(fresh.status, "waiting");
+    assert.equal(fresh.version, VERSION);
+    assert.equal(fresh.fingerprint, fingerprint(h.request));
+    assert.equal(fresh.graceDeadline, "2026-10-07T10:05:00.000Z");
+    assert.equal(evaluations, 1);
+    h.advance(5 * 60_000 - 1);
+    await restarted.idle();
+    assert.deepEqual(h.submitted, []);
+    h.advance(1);
+    await restarted.idle();
+    assert.deepEqual(h.submitted, [{ behavior: "allow", updatedInput: { answers: { Response: TECHNICAL_CONTINUATION } } }]);
+    assert.notEqual((await h.candidate()).intentId, h.legacy.intentId);
+    await restarted.reconcile();
+    await restarted.idle();
+    assert.equal(h.submitted.length, 1);
+    assert.equal(evaluations, 1);
+  });
+}
+
+for (const change of ["raw-input", "raw-envelope", "metadata", "provider", "gone", "already-answered", "unknown-hash"] as const) {
+  test(`legacy fingerprint migration refuses ${change} instead of treating it as an unchanged request`, async t => {
+    const h = await persistedLegacyContinuation(t, "waiting");
+    if (change === "raw-input") h.daemon.pending = [{ ...h.request, input: { ...h.request.input, undisplayedCapability: true } }];
+    if (change === "raw-envelope") h.daemon.pending = [Object.assign({ ...h.request }, { unrecognizedRouting: true })];
+    if (change === "metadata") h.daemon.pending = [{ ...h.request, metadata: { ...h.request.metadata, ompAsk: false } }];
+    if (change === "provider") h.daemon.pending = [{ ...h.request, provider: "unknown-provider" }];
+    if (change === "gone") h.daemon.pending = [];
+    if (change === "already-answered") await h.log.append({ kind: "owner-answer", id: h.legacy.key, at: "2026-10-07T09:59:00Z", key: "owner-already-answered", via: "menu-bar", userId: OWNER, answers: { Response: "Keep the release held" } });
+    if (change === "unknown-hash") await writeFile(join(h.directory, "candidates.json"), JSON.stringify({ [h.legacy.key]: { ...h.legacy, fingerprint: "unrecognized-hash" } }));
+    let evaluations = 0;
+    h.deps.evaluate = async () => { evaluations++; throw new Error("must not evaluate changed or unknown legacy request"); };
+    const restarted = h.restart();
+    await restarted.reconcile();
+    await restarted.idle();
+    h.advance(10 * 60_000);
+    await restarted.idle();
+    await restarted.observe(h.agent, h.daemon.pending[0] ?? h.request, { issueId: "i1", identifier: "TUC-2108" });
+    await restarted.idle();
+    assert.equal(evaluations, 0);
+    assert.equal((await h.candidate()).status, ["gone", "already-answered"].includes(change) ? "resolved" : "canceled");
+    assert.deepEqual(h.submitted, []);
+  });
+}
+
+for (const status of ["canceled", "applied", "resolved", "owner-answered", "owner-won", "unknown"] as const) {
+  test(`legacy fingerprint migration never resurrects terminal ${status}`, async t => {
+    const h = await persistedLegacyContinuation(t, status);
+    let evaluations = 0;
+    h.deps.evaluate = async () => { evaluations++; throw new Error("terminal candidate must not be reevaluated"); };
+    const restarted = h.restart();
+    await restarted.reconcile();
+    await restarted.idle();
+    h.advance(10 * 60_000);
+    await restarted.idle();
+    assert.equal((await h.candidate()).status, status);
+    assert.equal(evaluations, 0);
+    assert.deepEqual(h.submitted, []);
+  });
+}
+
+test("legacy fingerprint migration waits for owner-hold restoration and retains checked owner priority", async t => {
+  const h = await persistedLegacyContinuation(t, "waiting");
+  const restore = signal();
+  let restored = false;
+  let evaluations = 0;
+  const evaluate = h.deps.evaluate;
+  h.deps.ready = async () => { await restore.promise; h.replies.holdForOwner("a1", h.request.id); restored = true; };
+  h.deps.evaluate = async (input, model) => { assert.equal(restored, true); evaluations++; return evaluate(input, model); };
+  const restarted = h.restart();
+  await Promise.resolve();
+  assert.equal(evaluations, 0);
+  assert.equal((await h.candidate()).fingerprint, h.legacy.fingerprint);
+  restore.resolve();
+  await restarted.reconcile();
+  await restarted.idle();
+  assert.equal(evaluations, 1);
+  h.advance(5 * 60_000);
+  await restarted.idle();
+  assert.equal((await h.candidate()).status, "owner-won");
+  assert.deepEqual(h.submitted, []);
+});
+
+async function interruptedLegacyMigration(t: TestContext, status: "refused" | "waiting", outage: "refresh-null" | "refresh-throws" | "decision-log") {
+  const h = await persistedLegacyContinuation(t, status);
+  let unavailable = true;
+  const ref = h.paseo.agents.ref.bind(h.paseo.agents);
+  t.mock.method(h.paseo.agents, "ref", (...args: Parameters<typeof ref>) => {
+    const agent = ref(...args);
+    return { ...agent, refresh: async () => {
+      if (unavailable && outage === "refresh-null") return null;
+      if (unavailable && outage === "refresh-throws") throw new Error("daemon unavailable during migration");
+      return agent.refresh();
+    } };
+  });
+  const entries = h.log.entries.bind(h.log);
+  h.log.entries = async () => {
+    if (unavailable && outage === "decision-log") throw new Error("decision log unavailable during migration");
+    return entries();
+  };
+  let evaluations = 0;
+  const evaluate = h.deps.evaluate;
+  h.deps.evaluate = async (input, model) => { evaluations++; return evaluate(input, model); };
+  const restarted = h.restart();
+  await restarted.reconcile();
+  await restarted.idle();
+  const deferred = await h.candidate();
+  assert.equal(deferred.status, "refused");
+  assert.equal(deferred.refusalCategory, "source-unavailable");
+  assert.equal(deferred.fingerprint, h.legacy.fingerprint);
+  assert.equal(deferred.retryAt, "2026-10-07T10:05:00.000Z");
+  assert.equal(evaluations, 0);
+  assert.deepEqual(h.submitted, []);
+  return { ...h, restarted, evaluations: () => evaluations, repair: () => { unavailable = false; } };
+}
+
+for (const status of ["refused", "waiting"] as const) {
+  for (const outage of ["refresh-null", "refresh-throws", "decision-log"] as const) {
+    test(`legacy fingerprint migration retries ${status} after ${outage} with verified raw request and full new grace`, async t => {
+      const h = await interruptedLegacyMigration(t, status, outage);
+      h.repair();
+      h.advance(5 * 60_000 - 1);
+      await h.restarted.idle();
+      assert.equal(h.evaluations(), 0);
+      assert.equal((await h.candidate()).fingerprint, h.legacy.fingerprint);
+      h.advance(1);
+      await h.restarted.idle();
+      const fresh = await h.candidate();
+      assert.equal(fresh.status, "waiting");
+      assert.equal(fresh.fingerprint, fingerprint(h.request));
+      assert.equal(fresh.version, VERSION);
+      assert.equal(fresh.graceDeadline, "2026-10-07T10:10:00.000Z");
+      assert.equal(fresh.intentId, undefined);
+      assert.equal(h.evaluations(), 1);
+      h.advance(5 * 60_000 - 1);
+      await h.restarted.idle();
+      assert.deepEqual(h.submitted, []);
+      h.advance(1);
+      await h.restarted.idle();
+      assert.equal((await h.candidate()).status, "applied");
+      assert.notEqual((await h.candidate()).intentId, h.legacy.intentId);
+      assert.deepEqual(h.submitted, [{ behavior: "allow", updatedInput: { answers: { Response: TECHNICAL_CONTINUATION } } }]);
+      await h.restarted.reconcile();
+      h.advance(5 * 60_000);
+      await h.restarted.idle();
+      assert.equal(h.submitted.length, 1);
+      assert.equal(h.evaluations(), 1);
+    });
+  }
+}
+
+for (const boundary of ["raw-envelope", "metadata", "gone", "canceled", "answered"] as const) {
+  test(`legacy fingerprint migration retry preserves ${boundary} boundary after an unavailable initial check`, async t => {
+    const h = await interruptedLegacyMigration(t, "waiting", "refresh-null");
+    h.repair();
+    if (boundary === "raw-envelope") h.daemon.pending = [Object.assign({ ...h.request }, { unrecognizedRouting: true })];
+    if (boundary === "metadata") h.daemon.pending = [{ ...h.request, metadata: { ...h.request.metadata, ompAsk: false } }];
+    if (boundary === "gone") h.daemon.pending = [];
+    if (boundary === "canceled") await writeFile(join(h.directory, "candidates.json"), JSON.stringify({ [h.legacy.key]: { ...await h.candidate(), status: "canceled", reason: "owner canceled this work" } }));
+    if (boundary === "answered") await h.log.append({ kind: "owner-answer", id: h.legacy.key, at: "2026-10-07T10:04:00Z", key: "owner-answered-during-outage", via: "menu-bar", userId: OWNER, answers: { Response: "Keep the release held" } });
+    h.advance(5 * 60_000);
+    await h.restarted.idle();
+    h.advance(5 * 60_000);
+    await h.restarted.idle();
+    assert.equal((await h.candidate()).status, ["gone", "answered"].includes(boundary) ? "resolved" : "canceled");
+    assert.equal(h.evaluations(), 0);
+    assert.deepEqual(h.submitted, []);
+  });
+}
+
+test("legacy fingerprint migration retry retains owner hold restored during the outage", async t => {
+  const h = await interruptedLegacyMigration(t, "waiting", "decision-log");
+  h.repair();
+  h.replies.holdForOwner("a1", h.request.id);
+  h.advance(5 * 60_000);
+  await h.restarted.idle();
+  assert.equal((await h.candidate()).status, "waiting");
+  h.advance(5 * 60_000);
+  await h.restarted.idle();
+  assert.equal((await h.candidate()).status, "owner-won");
+  assert.equal(h.evaluations(), 1);
+  assert.deepEqual(h.submitted, []);
 });

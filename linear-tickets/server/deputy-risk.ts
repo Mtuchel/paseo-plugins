@@ -18,7 +18,7 @@ export const RISK_CATEGORIES = [
 export type RiskCategory = (typeof RISK_CATEGORIES)[number];
 
 
-// The label omp adds for free text ("Other (type your own)"): the deputy never writes free text.
+// The generic Other label is never a selectable answer; custom continuation has a separate checked verdict.
 export const FREE_TEXT_OPTION = /^\s*other\b.*\btype\b.*$/i;
 
 export type RiskFacts = {

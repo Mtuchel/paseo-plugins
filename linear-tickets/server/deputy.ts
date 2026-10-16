@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import type { PaseoApi } from "@getpaseo/client";
 import type { AgentPermissionRequest, AgentPermissionResponse } from "@getpaseo/protocol/agent-types";
 import { AUTONOMY_POLICY_REVISION } from "../shared/autonomy-policy";
@@ -8,6 +9,7 @@ import { dispatchLabels } from "./dispatch";
 import { assessRisk, type Part } from "./deputy-risk";
 import { evidenceSummary, shadowEvidence } from "./deputy-evidence";
 import { policyVersion, type EvaluationInput, type Verdict } from "./deputy-evaluator";
+import { supportsTechnicalContinuation, TECHNICAL_CONTINUATION, TECHNICAL_CONTINUATION_TEMPLATE, type TechnicalContinuation } from "./deputy-continuation";
 import { gatherSources, verifyCitation, type Source, type SourceReaders } from "./deputy-sources";
 import type { LinearService } from "./linear";
 import { logQuietly, questionEntry, type Citation, type DecisionLog, type LogEntry } from "./owner-decisions";
@@ -72,6 +74,7 @@ export type Candidate = {
   standing?: boolean;
   activation?: string;
   selections?: Record<string, string>;
+  continuation?: TechnicalContinuation;
   citations?: Citation[];
   intentId?: string;
   notice?: { comment: boolean; session: boolean; commentId: string | null };
@@ -90,10 +93,10 @@ export function overrideCommand(message: string): { ref: string; text: string } 
 }
 
 export function fingerprint(request: AgentPermissionRequest): string {
-  // Bound browser permission answers must fence command/input and action changes too.
-  // Preserve existing question identities used by the deputy's durable candidates.
+  // Provider routing and custom-answer capability are part of the action.
+  // Legacy pending candidates migrate only after a fresh full raw-request match.
   if (request.kind !== "question") return createHash("sha256").update(JSON.stringify(request)).digest("hex").slice(0, 24);
-  return createHash("sha256").update(JSON.stringify({ kind: request.kind, title: request.title ?? "", description: request.description ?? "", questions: questionsOf(request) })).digest("hex").slice(0, 24);
+  return createHash("sha256").update(JSON.stringify({ kind: request.kind, title: request.title ?? "", description: request.description ?? "", input: request.input, provider: request.provider, name: request.name, metadata: request.metadata })).digest("hex").slice(0, 24);
 }
 
 // What the sources are searched with: everything the request shows, the same at prediction and
@@ -398,6 +401,17 @@ export class Deputy {
     const generation = this.settingsGeneration;
     let candidate = (await this.readStore())[key];
     if (!candidate || this.stopped || (retry ? !this.retryable(candidate) : candidate.status !== "evaluating")) return;
+    // Refusal retries enter evaluation directly, without startup recovery.
+    // An interrupted legacy migration must repeat its full raw verification
+    // before the normal current-format freshness checks can run.
+    const legacyFingerprint = this.legacyFingerprint(candidate);
+    if (legacyFingerprint) {
+      const { mode } = (await this.deps.settings.read()).deputy;
+      if (mode === "off") { await this.patch(key, { status: "canceled", reason: "the deputy was switched off" }); return; }
+      const migrated = await this.resetEvaluation(candidate, mode, legacyFingerprint);
+      if (!migrated) return;
+      candidate = migrated;
+    }
     // A prior prediction's grace and retry category survive interrupted evaluation.
     // A refreshed answer must not borrow that earlier prediction's elapsed grace.
     const freshGrace = Boolean(candidate.graceDeadline) && RETRYABLE_REFUSALS[candidate.refusalCategory ?? ""] === true;
@@ -409,7 +423,7 @@ export class Deputy {
     const assessed = await this.assess(candidate, settings);
     if (!assessed.ok) { await this.refuse(candidate, version, assessed.reason, assessed.category); return; }
     if (!model) { await this.refuse(candidate, version, "no evaluator model is configured (deputy.model)", "no-evaluator"); return; }
-    const input: EvaluationInput = { identifier: candidate.identifier, parts: assessed.parts, context: assessed.context, sources: assessed.sources };
+    const input: EvaluationInput = { identifier: candidate.identifier, parts: assessed.parts, context: assessed.context, sources: assessed.sources, request: candidate.request };
     const evidenceFingerprint = createHash("sha256").update(JSON.stringify([version, input])).digest("hex");
     if (retry && candidate.refusalCategory === "no-knowledge" && candidate.evidenceFingerprint === evidenceFingerprint) {
       await this.patch(key, { retryAt: new Date(this.now() + SETTLEMENT_RETRY_MS).toISOString() });
@@ -431,15 +445,15 @@ export class Deputy {
     if ((await this.readStore())[key]?.status !== "evaluating") return;
     // Preserve each evidence-bound prediction. Empirical evidence still counts only
     // the first shadow prediction per question, never retries or live answers.
-    await this.deps.log.append({ kind: "deputy-prediction", id: key, key: `${version}:${evidenceFingerprint}`, at: new Date(this.now()).toISOString(), identifier: candidate.identifier, issueId: candidate.issueId, version, mode: candidate.mode, selections: verdict.selections, citations: verdict.citations, standing: verdict.standing });
+    await this.deps.log.append({ kind: "deputy-prediction", id: key, key: `${version}:${evidenceFingerprint}`, at: new Date(this.now()).toISOString(), identifier: candidate.identifier, issueId: candidate.issueId, version, mode: candidate.mode, selections: verdict.selections, citations: verdict.citations, standing: verdict.standing, ...(verdict.continuation ? { continuation: verdict.continuation } : {}) });
     const latest = (await this.readStore())[key];
     if (!latest || latest.status !== "evaluating") return;
     if (now.deputy.mode !== "live") {
-      await this.patch(key, { status: "predicted", reason: undefined, refusalCategory: undefined, version, selections: verdict.selections, citations: verdict.citations, standing: verdict.standing });
+      await this.patch(key, { status: "predicted", reason: undefined, refusalCategory: undefined, version, selections: verdict.selections, citations: verdict.citations, standing: verdict.standing, continuation: verdict.continuation });
       return;
     }
     const graceDeadline = new Date((freshGrace ? this.now() : Date.parse(candidate.observedAt)) + now.deputy.graceMinutes * 60_000).toISOString();
-    const waiting = await this.patch(key, { status: "waiting", reason: undefined, refusalCategory: undefined, version, selections: verdict.selections, citations: verdict.citations, standing: verdict.standing, graceDeadline });
+    const waiting = await this.patch(key, { status: "waiting", reason: undefined, refusalCategory: undefined, version, selections: verdict.selections, citations: verdict.citations, standing: verdict.standing, continuation: verdict.continuation, graceDeadline });
     if (waiting) this.schedule(waiting, generation);
   }
 
@@ -500,7 +514,8 @@ export class Deputy {
           expiresAt = new Date(deadline).toISOString();
         }
       }
-      candidates.push({ agentId: candidate.agentId, permissionId: candidate.requestId, requestFingerprint: candidate.fingerprint, request: candidate.request, state: candidate.status, observedAt: candidate.observedAt, updatedAt: candidate.updatedAt, expiresAt, suppressUrgency });
+      const state: string = candidate.status;
+      candidates.push({ agentId: candidate.agentId, permissionId: candidate.requestId, requestFingerprint: candidate.fingerprint, request: candidate.request, state, observedAt: candidate.observedAt, updatedAt: candidate.updatedAt, expiresAt, suppressUrgency });
     }
     // Async gate/daemon reads may overlap refusals, revocations or settings
     // writes. Drain earlier writes and validate one final store snapshot; any
@@ -523,7 +538,9 @@ export class Deputy {
         entry.expiresAt = null;
       }
       if (current) {
-        entry.state = current.status;
+        // The durable state is a first-response receipt, not editor consumption.
+        // The native RPC already accepts descriptive state strings.
+        entry.state = current.status === "applied" && current.continuation ? "technical-instruction-submitted-editor-unobserved" : current.status;
         entry.updatedAt = current.updatedAt;
       }
     }
@@ -563,13 +580,25 @@ export class Deputy {
     const pending = (agent.pendingPermissions ?? []).find((request) => request.id === candidate.requestId);
     if (!pending) { await this.outcome(candidate, "resolved", "the request was answered or withdrawn during the grace period"); return; }
     if (fingerprint(pending) !== candidate.fingerprint) { await this.outcome(candidate, "canceled", "the request changed since the prediction"); return; }
+    if (candidate.continuation && (!supportsTechnicalContinuation(pending)
+      || candidate.continuation.template !== TECHNICAL_CONTINUATION_TEMPLATE
+      || typeof candidate.continuation.step !== "string" || !candidate.continuation.step.trim()
+      || typeof candidate.continuation.whyNoSafeOption !== "string" || !candidate.continuation.whyNoSafeOption.trim()
+      || candidate.standing !== true || Object.keys(candidate.selections).length !== 1 || candidate.selections.Response !== TECHNICAL_CONTINUATION)) {
+      await this.outcome(candidate, "canceled", "the technical-continuation template or custom-answer capability changed");
+      return;
+    }
+    if (!candidate.continuation && Object.values(candidate.selections).includes(TECHNICAL_CONTINUATION)) {
+      await this.outcome(candidate, "canceled", "a technical instruction is not an offered-choice answer");
+      return;
+    }
     const blockers = await this.liveBlockers(settings, candidate.standing === true);
     if (blockers.length) { await this.outcome(candidate, "blocked", blockers.join("; ")); return; }
     // Ticket constraints and knowledge again; every cited passage must still be
     // in today's sources and the complete evaluator input must be unchanged.
     const assessed = await this.assess(candidate, settings);
     if (!assessed.ok) { await this.outcome(candidate, "canceled", `the question no longer qualifies: ${assessed.reason}`); return; }
-    const input: EvaluationInput = { identifier: candidate.identifier, parts: assessed.parts, context: assessed.context, sources: assessed.sources };
+    const input: EvaluationInput = { identifier: candidate.identifier, parts: assessed.parts, context: assessed.context, sources: assessed.sources, request: candidate.request };
     const evidenceFingerprint = createHash("sha256").update(JSON.stringify([candidate.version, input])).digest("hex");
     // Quotes alone are insufficient: amended policy can retain the quote, and a new
     // blocking-only source can contradict it. Legacy predictions without a snapshot fail closed.
@@ -617,8 +646,12 @@ export class Deputy {
       if (result === "owner-first") { await this.outcome(candidate, "owner-won", "the owner answered first"); return; }
       if (result === "revoked") { await this.outcome(candidate, "canceled", "the deputy authorization was revoked before submission"); return; }
       if (result === "gone") { await this.outcome(candidate, "resolved", "the request was gone when the answer arrived"); return; }
-      await this.deps.log.append({ kind: "deputy-answer", id: candidate.key, at: new Date(this.now()).toISOString(), identifier: candidate.identifier, issueId: candidate.issueId, version: candidate.version ?? "", key: candidate.intentId ?? "", answers: candidate.selections ?? {}, citations: candidate.citations ?? [], ...(candidate.activation ? { activation: candidate.activation } : {}) });
-      const applied = await this.patch(candidate.key, { status: "applied", notice: { comment: false, session: false, commentId: null } });
+      if (candidate.continuation) {
+        await this.deps.log.append({ kind: "deputy-continuation", id: candidate.key, at: new Date(this.now()).toISOString(), identifier: candidate.identifier, issueId: candidate.issueId, version: candidate.version ?? "", key: candidate.intentId ?? "", fingerprint: candidate.fingerprint, directive: TECHNICAL_CONTINUATION, continuation: candidate.continuation, citations: candidate.citations ?? [], ...(candidate.activation ? { activation: candidate.activation } : {}) });
+      } else {
+        await this.deps.log.append({ kind: "deputy-answer", id: candidate.key, at: new Date(this.now()).toISOString(), identifier: candidate.identifier, issueId: candidate.issueId, version: candidate.version ?? "", key: candidate.intentId ?? "", answers: candidate.selections ?? {}, citations: candidate.citations ?? [], ...(candidate.activation ? { activation: candidate.activation } : {}) });
+      }
+      const applied = await this.patch(candidate.key, { status: "applied", reason: candidate.continuation ? "checked technical instruction submitted; editor consumption and agent execution unobserved; not a substantive answer or owner approval" : undefined, notice: { comment: false, session: false, commentId: null } });
       if (applied) await this.notify(applied);
     } catch (error) {
       this.retrySettlement();
@@ -633,7 +666,9 @@ export class Deputy {
     const parts = questionsOf(candidate.request).map((item, index) => ({ key: questionKey(item, index), question: [item.header, item.question].filter(Boolean).join(": ") }));
     const answer = parts.filter((part) => candidate.selections?.[part.key]).map((part) => `- ${part.question}: **${candidate.selections?.[part.key]}**`).join("\n");
     const sources = (candidate.citations ?? []).map((citation) => `- ${citation.url ? `[${citation.title}](${citation.url})` : citation.title} (\`${citation.sourceId}\` @ \`${citation.revision}\`): “${citation.quote}”`).join("\n");
-    const head = `🤖 **Answered by the deputy** for **${candidate.agentTitle ?? "the Paseo agent"}** (${candidate.ref}):\n\n${answer}\n\n**Sources:**\n${sources}`;
+    const head = candidate.continuation
+      ? `🤖 **Checked technical instruction submitted** for **${candidate.agentTitle ?? "the Paseo agent"}** (${candidate.ref}). The checked receipt confirms only the first OMP response; later editor consumption and agent execution are unobserved. Not an owner approval or substantive decision answered.\n\n${answer}\n\n**Sources:**\n${sources}`
+      : `🤖 **Answered by the deputy** for **${candidate.agentTitle ?? "the Paseo agent"}** (${candidate.ref}):\n\n${answer}\n\n**Sources:**\n${sources}`;
     try {
       if (!notice.comment) {
         const commentId = await this.deps.linear.upsertComment(candidate.issueId, `${head}\n\n**Reply to override:** a reply to this comment goes to that agent as your correction. Request \`${candidate.key}\`.`, null);
@@ -661,7 +696,25 @@ export class Deputy {
     return candidate.status === "refused" && RETRYABLE_REFUSALS[candidate.refusalCategory ?? ""] === true;
   }
 
-  private async stillPending(candidate: Candidate): Promise<boolean> {
+  private legacyFingerprint(candidate: Candidate): string | null {
+    // Recognize only the pre-capability question hash, never an arbitrary
+    // mismatch or terminal history. The caller must verify the complete raw
+    // request freshly before persisting the returned current-format hash.
+    if (!["refused", "predicted", "waiting", "evaluating", "blocked"].includes(candidate.status) || candidate.request.kind !== "question") return null;
+    const current = fingerprint(candidate.request);
+    if (candidate.fingerprint === current) return null;
+    const legacy = createHash("sha256").update(JSON.stringify({ kind: candidate.request.kind, title: candidate.request.title ?? "", description: candidate.request.description ?? "", questions: questionsOf(candidate.request) })).digest("hex").slice(0, 24);
+    return candidate.fingerprint === legacy ? current : null;
+  }
+
+  private async resetEvaluation(candidate: Candidate, mode: Candidate["mode"], nextFingerprint: string | null): Promise<Candidate | null> {
+    this.unschedule(candidate.key);
+    const rechecked = nextFingerprint ? { ...candidate, fingerprint: nextFingerprint } : candidate;
+    if (!await this.stillPending(rechecked, nextFingerprint !== null)) return null;
+    return this.patch(candidate.key, { status: "evaluating", fingerprint: rechecked.fingerprint, mode, observedAt: new Date(this.now()).toISOString(), version: undefined, eligible: false, standing: undefined, continuation: undefined, activation: undefined, selections: undefined, citations: undefined, evidenceFingerprint: undefined, graceDeadline: undefined, refusalCategory: undefined, retryAt: undefined, reason: undefined, intentId: undefined });
+  }
+
+  private async stillPending(candidate: Candidate, requireRawMatch = false): Promise<boolean> {
     if (this.revoked.has(candidate.key)) return false;
     let entries: LogEntry[];
     try {
@@ -670,7 +723,7 @@ export class Deputy {
       await this.refuse(candidate, candidate.version ?? "no-evaluator", `recorded answers could not be checked (${message(error)})`, "source-unavailable");
       return false;
     }
-    if (entries.some((entry) => entry.id === candidate.key && (entry.kind === "answer" || entry.kind === "owner-answer" || entry.kind === "deputy-answer"))) {
+    if (entries.some((entry) => entry.id === candidate.key && (entry.kind === "answer" || entry.kind === "owner-answer" || entry.kind === "deputy-answer" || entry.kind === "deputy-continuation"))) {
       await this.outcome(candidate, "resolved", "the request already has a recorded answer");
       return false;
     }
@@ -686,7 +739,7 @@ export class Deputy {
       await this.outcome(candidate, "resolved", "the request is no longer pending on the linked agent");
       return false;
     }
-    if (fingerprint(pending) !== candidate.fingerprint) {
+    if (fingerprint(pending) !== candidate.fingerprint || (requireRawMatch && !isDeepStrictEqual(pending, candidate.request))) {
       await this.outcome(candidate, "canceled", "the request changed since it was observed");
       return false;
     }
@@ -768,14 +821,13 @@ export class Deputy {
           const revokedHere = current.status === "canceled" && restartKeys?.has(current.key)
             && ["the deputy settings changed", "the deputy settings changed during evaluation", "the deputy was switched off"].includes(current.reason ?? "");
           const newlyAuthorized = standingActivation && current.status === "blocked" && current.standing === true;
-          if (settings.deputy.mode !== "off" && (changedPolicy || revokedHere || newlyAuthorized)) {
+          const legacyFingerprint = this.legacyFingerprint(current);
+          if (settings.deputy.mode !== "off" && (changedPolicy || revokedHere || newlyAuthorized || legacyFingerprint)) {
             // Reevaluate exact still-pending requests after a policy/mode change
             // or this settings write's revocation/standing activation. Never
             // promote old selections, grace or intents; never revive arbitrary
             // canceled work, answered requests or interrupted dispatches.
-            this.unschedule(current.key);
-            if (!await this.stillPending(current)) return;
-            await this.patch(current.key, { status: "evaluating", mode: settings.deputy.mode, observedAt: new Date(this.now()).toISOString(), version: undefined, eligible: false, standing: undefined, activation: undefined, selections: undefined, citations: undefined, evidenceFingerprint: undefined, graceDeadline: undefined, refusalCategory: undefined, retryAt: undefined, reason: undefined, intentId: undefined });
+            if (!await this.resetEvaluation(current, settings.deputy.mode, legacyFingerprint)) return;
             this.background(this.lane(current.key, () => this.slot(() => this.evaluate(current.key))));
             return;
           }
@@ -879,7 +931,9 @@ export class Deputy {
       const question = questionsOf(candidate.request).map((item) => [item.header, item.question].filter(Boolean).join(": ")).join(" / ");
       const answered = Object.values(candidate.selections ?? {}).filter(Boolean).join(" / ");
       const note = [
-        `Correction from the owner (${candidate.ref}): the deputy answered your earlier question “${question}” (request ${candidate.requestId}) with “${answered}” on the owner's behalf. The owner overrides that answer:`,
+        candidate.continuation
+          ? `Correction from the owner (${candidate.ref}): the automated deputy submitted a bounded technical instruction for your earlier question “${question}” (request ${candidate.requestId}), not personal owner approval. The owner corrects that instruction:`
+          : `Correction from the owner (${candidate.ref}): the deputy answered your earlier question “${question}” (request ${candidate.requestId}) with “${answered}” on the owner's behalf. The owner overrides that answer:`,
         text.trim(),
         "Redo or adjust whatever you did based on the deputy's answer. This message is not an answer to any question you are asking now.",
       ].join("\n\n");

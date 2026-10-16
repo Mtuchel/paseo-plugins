@@ -7,7 +7,8 @@ import type { PaseoApi } from "@getpaseo/client";
 import type { AgentPermissionRequest, AgentPermissionResponse } from "@getpaseo/protocol/agent-types";
 import { fingerprint } from "./deputy";
 import { PermissionReplies, rejectedBeforeApplication, type DeliveryOrigin, type ReplyRecord } from "./permission-replies";
-import { questionAnswer } from "./relay";
+import { questionAnswer, questionsOf } from "./relay";
+import { TECHNICAL_CONTINUATION } from "./deputy-continuation";
 
 const q: AgentPermissionRequest = { id: "q1", provider: "omp", kind: "question", name: "ask", title: "Runner?", input: { questions: [{ header: "Runner", question: "Test runner?", options: [{ label: "Node" }, { label: "Vitest" }] }] } };
 const owner = (ref: string): DeliveryOrigin => ({ ref, responder: { kind: "owner", via: "linear-comment", activityId: ref, userId: "owner" }, issueId: "i1" });
@@ -224,15 +225,14 @@ test("lost acknowledgement, unknown and post-application errors remain unconfirm
   }
 });
 
-test("fingerprint prevents changed request content, but cannot prevent changes after last refresh", async (t) => {
+test("deputy refreshes again after asynchronous pre-submit work and rejects changed requests", async (t) => {
   const h = await harness(t);
   h.pending([{ ...q, title: "Changed" }]);
   assert.equal(await h.replies.respond(h.intent("changed")), "gone");
   assert.deepEqual(h.sent, []);
-  const after = await harness(t, { beforeSubmit: async () => { after.pending([{ ...q, title: "Changed after refresh" }]); } });
-  assert.equal(await after.replies.respond(after.intent("after")), "applied");
-  assert.equal(after.sent.length, 1);
-  assert.equal((await after.replies.records())["deputy:after"].fingerprint, fingerprint(q));
+  const after = await harness(t, { beforeSubmit: async () => { after.pending([{ ...q, title: "Changed during asynchronous check" }]); } });
+  assert.equal(await after.replies.respond(after.intent("after")), "gone");
+  assert.deepEqual(after.sent, []);
 });
 
 test("bound permission answers reject changed command input at the final submission refresh", async (t) => {
@@ -578,3 +578,24 @@ test("shutdown during checked submission records confirmation but leaves effects
   assert.deepEqual(h.needsYou, ["i1"]);
   assert.deepEqual(h.sent.map((entry) => entry.requestId), ["q1"]);
 });
+
+for (const change of ["ompAsk", "answerHeader", "optionLabels", "provider", "requestId", "questions"] as const) {
+  test(`checked custom instruction rejects ${change} changed at the last asynchronous submit boundary`, async t => {
+    const options = [{ label: "Ship unknown release" }, { label: "Owner reviews" }];
+    const request: AgentPermissionRequest = { id: "custom", provider: "omp", name: "OMP ask", kind: "question", title: "Release?",
+      input: { questions: [{ header: "Response", question: "Next?", options, allowOther: true, multiSelect: false }] },
+      metadata: { ompAsk: true, answerHeader: "Response", optionLabels: options.map(option => option.label) } };
+    const h = await harness(t, { beforeSubmit: async () => {
+      h.pending([change === "provider" ? { ...request, provider: "unknown" }
+        : change === "requestId" ? { ...request, id: "new-editor" }
+        : change === "questions" ? { ...request, input: { questions: [questionsOf(request)[0], null] } }
+        : { ...request, metadata: { ...request.metadata, [change]: change === "ompAsk" ? false : change === "answerHeader" ? "Different" : ["Changed"] } }]);
+    } });
+    h.pending([request]);
+    assert.equal(await h.replies.respond({ ...h.intent(`custom-${change}`), requestId: request.id, fingerprint: fingerprint(request),
+      response: { behavior: "allow", updatedInput: { answers: { Response: TECHNICAL_CONTINUATION } } } }), "gone");
+    assert.deepEqual(h.sent, []);
+    assert.deepEqual(h.evidence, []);
+    assert.deepEqual(h.needsYou, []);
+  });
+}
