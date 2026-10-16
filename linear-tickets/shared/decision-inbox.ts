@@ -42,12 +42,19 @@ export const stewardFlowSchema = z.object({
   oldest: z.array(z.object({ identifier: z.string(), situation: z.string(), since: z.string() })),
   error: z.string().nullable(),
   tickets: z.array(recoveryTicketSchema).optional(),
+  // Every recovery ticket the steward tracks, while `tickets` may carry only the referenced ones
+  // (the peer feed, server/decision-inbox.ts): the inbox page reads the rest from their host.
+  ticketCount: z.number().int().nonnegative().optional(),
   control: z.object({
     passStartedAt: z.string().nullable(), overduePassMs: z.number(),
     maxUnattendedMs: z.number(), recoveryOutcomes: z.record(z.string(), z.number()),
   }).optional(),
 });
 export type StewardFlow = z.infer<typeof stewardFlowSchema>;
+// One host's full recovery evidence (server/decision-inbox.ts): the on-demand counterpart of the
+// reference-only `flow.tickets` a peer feed ships.
+export const recoveryTicketPageSchema = z.object({ host: z.string().min(1), tickets: z.array(recoveryTicketSchema) }).strict();
+export type RecoveryTicketPage = z.infer<typeof recoveryTicketPageSchema>;
 export const decisionHostSchema = z.object({
   host: z.string(), asks: z.array(browserOwnerAskSchema), live: z.array(liveDecisionSchema),
   backendInstanceId: z.string().uuid().optional(),

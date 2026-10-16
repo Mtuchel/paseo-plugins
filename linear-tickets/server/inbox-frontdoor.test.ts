@@ -63,6 +63,9 @@ async function fakeBackend(options: { instance?: string; port?: number } = {}): 
         case "/api/decisions/reviews":
         case "/api/decisions/reviews/local":
           return json(200, { host: "laptop", updatedAt: "2026-01-01T09:00:00.000Z", total: 0, offset: 0, asks: [] });
+        case "/api/decisions/flow":
+        case "/api/decisions/flow/local":
+          return json(200, { host: "laptop", tickets: [] });
         case "/api/push/key":
           return json(200, { publicKey: "key" });
         case "/activation":
@@ -265,6 +268,20 @@ test("source review pages are forwarded with their paging query", async () => {
       const answer = await call(frontdoor.port, "GET", path);
       assert.equal(answer.status, 200, answer.text);
       assert.equal(jsonBody(answer.text).total, 0);
+      assert.equal(fake.calls.filter((item) => item.path === path).length, 1, path);
+    }
+  });
+});
+
+// Recovery evidence is read live from the backend with the host it names, never from the snapshot.
+test("recovery evidence is forwarded with the host it names", async () => {
+  const fake = await fakeBackend();
+  await withFrontdoor(fake, async (frontdoor) => {
+    await until(async () => (await readAvailability(frontdoor.port)).stale === false);
+    for (const path of ["/api/decisions/flow?host=server087", "/api/decisions/flow/local"]) {
+      const answer = await call(frontdoor.port, "GET", path);
+      assert.equal(answer.status, 200, answer.text);
+      assert.deepEqual(jsonBody(answer.text), { host: "laptop", tickets: [] });
       assert.equal(fake.calls.filter((item) => item.path === path).length, 1, path);
     }
   });

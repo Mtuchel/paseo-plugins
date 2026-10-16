@@ -6,7 +6,7 @@ import type { PaseoApi } from "@getpaseo/client";
 import type { AgentPermissionRequest, AgentPermissionResponse } from "@getpaseo/protocol/agent-types";
 import { z } from "zod";
 import { askQuestionSchema, decisionReceiptSchema, type DecisionReceipt } from "../shared/contracts";
-import { browserOwnerAskSchema, decisionHostSchema, isSourceReview, liveDecisionSchema, SOURCE_REVIEW_PAGE_LIMIT, SOURCE_REVIEW_PAGE_MAX, sourceReviewPageSchema, type BrowserDecisionAction, type DecisionHost, type DecisionView, type LiveDecision, type StewardFlow } from "../shared/decision-inbox";
+import { browserOwnerAskSchema, decisionHostSchema, isSourceReview, liveDecisionSchema, recoveryTicketPageSchema, recoveryTicketSchema, SOURCE_REVIEW_PAGE_LIMIT, SOURCE_REVIEW_PAGE_MAX, sourceReviewPageSchema, type BrowserDecisionAction, type DecisionHost, type DecisionView, type LiveDecision, type RecoveryTicketPage, type StewardFlow } from "../shared/decision-inbox";
 import type { ActivationRoute } from "./activation";
 import { decisionPage } from "./decision-page";
 import type { OwnerAsks, OwnerAskSnapshot } from "./owner-asks";
@@ -33,6 +33,10 @@ export type BrowserDecisionInboxDeps = {
 };
 const OWNER_CACHE_MS = CURATION_INTERVAL_MS;
 const READ_TIMEOUT_MS = 5_000;
+// How long this host's own snapshot answers reads from memory: a peer's five-second read must not
+// wait for a Linear scan, a Paseo listing or the steward, and the read after it must be instant.
+const LOCAL_FRESH_MS = 5_000;
+const LOCAL_STALE_MS = 120_000;
 const TRANSPORT_CACHE_MS = 30_000;
 const ACTION_TIMEOUT_MS = 65_000;
 const PREFIX = "decision-inbox:";
@@ -75,6 +79,9 @@ const peerSchema = decisionHostSchema.extend({
 // A paged source review read (shared/decision-inbox.ts): strict at the page boundary too, so an
 // extended or malformed page from the canonical host is refused rather than half-shown.
 const peerReviewPageSchema = sourceReviewPageSchema.extend({ asks: z.array(peerAskSchema) }).strict();
+// A recovery ticket page read from a peer: strict at the page boundary and at every ticket, so an
+// extended or malformed list is refused instead of half-shown.
+const peerFlowPageSchema = recoveryTicketPageSchema.extend({ tickets: z.array(recoveryTicketSchema.strict()) }).strict();
 const actionResultSchema = z.object({ delivered: z.string(), message: z.string() }).strict();
 const errorSchema = z.object({ error: z.string(), outcomeUnknown: z.boolean().optional() }).strict();
 const deferralSchema = z.object({ agentId: z.string(), requestId: z.string(), revision: z.string(), until: z.string().datetime() }).strict();
@@ -90,6 +97,18 @@ function stable(value: unknown): string {
 function hash(value: unknown): string { return createHash("sha256").update(stable(value)).digest("hex"); }
 // Unlike the deputy's question identity, the browser revision includes every original request field.
 function revision(request: AgentPermissionRequest): string { return hash(request); }
+// A peer feed carries only the recovery tickets its own decisions reference — exactly the
+// identifiers curation joins a task's blocked work and waiting agent on (decision-curation.ts) —
+// plus `ticketCount`, the steward's total, so a reader can see the shipped list is partial. The
+// whole list stays readable on demand (GET /api/decisions/flow), and this host's own page keeps it.
+function referencedTickets(host: DecisionHost): DecisionHost {
+  const flow = host.flow;
+  if (!flow?.tickets) return host;
+  const referenced = new Set<string>();
+  for (const ask of host.asks) if (ask.ticketIdentifier) referenced.add(ask.ticketIdentifier);
+  for (const live of host.live) if (live.identifier) referenced.add(live.identifier);
+  return { ...host, flow: { ...flow, tickets: flow.tickets.filter((ticket) => referenced.has(ticket.identifier)), ticketCount: flow.tickets.length } };
+}
 function peerOrigin(peer: string): string {
   const url = new URL(peer);
   if (!/^https?:$/.test(url.protocol) || url.username || url.password || url.search || url.hash || url.pathname !== "/") throw new Error("Decision peers must be HTTP(S) origins without credentials, paths or query strings.");
@@ -150,6 +169,9 @@ export class BrowserDecisionInbox {
   private ownerGeneration = 0;
   private storeQueue: Promise<unknown> = Promise.resolve();
   private readonly curation: DecisionCuration;
+  // This host's own snapshot, served from memory to the peer feed and the page (localSnapshot).
+  private localCache: { host: DecisionHost; at: number; generation: number; canonical: boolean; ownerCheckedAt: number | null } | null = null;
+  private localFlight: { canonical: boolean; ownerCheckedAt: number | null; promise: Promise<DecisionHost> } | null = null;
   private transportCache: { view: DecisionView; at: number; generation: number } | null = null;
   private transportFlight: Promise<DecisionView> | null = null;
   private readonly peerFlights = new Map<string, Promise<DecisionHost>>();
@@ -169,6 +191,7 @@ export class BrowserDecisionInbox {
   refresh(): Promise<void> {
     this.ownerGeneration++;
     this.peerFlights.clear();
+    this.localFlight = null;
     this.ownerCache = null;
     this.ownerFlight = null;
     this.transportFlight = null;
@@ -178,7 +201,7 @@ export class BrowserDecisionInbox {
 
   readonly route: ActivationRoute = async ({ method, path, search, headers, body }) => {
     if (path !== "/decisions" && path !== "/api/decisions" && path !== "/api/decisions/local" && path !== "/api/decisions/action"
-      && path !== "/api/decisions/reviews" && path !== "/api/decisions/reviews/local") return null;
+      && path !== "/api/decisions/reviews" && path !== "/api/decisions/reviews/local" && path !== "/api/decisions/flow" && path !== "/api/decisions/flow/local") return null;
     try {
       if (path === "/api/decisions/action") {
         if (method !== "POST") return json(405, { error: "Use POST for a decision action." });
@@ -199,15 +222,22 @@ export class BrowserDecisionInbox {
         finally {
           this.ownerGeneration++;
           this.peerFlights.clear();
+          this.localFlight = null;
           this.ownerCache = null;
           this.ownerFlight = null;
           this.transportFlight = null;
           this.curation.invalidate();
+          // The answered source may not be served again: collect the replacement snapshot right
+          // away, so the page's post-answer refresh and the next peer read join it instead of
+          // waiting for a cold collection. A background compute reports to nobody.
+          void this.localSnapshot().catch(() => undefined);
         }
       }
       if (method !== "GET") return json(405, { error: "Use GET for the decision inbox." });
-      if (path === "/api/decisions/local") return json(200, await this.local());
+      // The peer feed ships only the recovery tickets its decisions reference (referencedTickets).
+      if (path === "/api/decisions/local") return json(200, referencedTickets(await this.localSnapshot()));
       if (path === "/api/decisions/reviews" || path === "/api/decisions/reviews/local") return await this.reviewPage(path === "/api/decisions/reviews/local", search ?? "");
+      if (path === "/api/decisions/flow" || path === "/api/decisions/flow/local") return await this.flowPage(path === "/api/decisions/flow/local", search ?? "");
       const view = await this.view();
       if (path === "/api/decisions") return json(200, view);
       return { status: 200, headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" }, body: decisionPage(view) };
@@ -215,6 +245,63 @@ export class BrowserDecisionInbox {
       return json(error instanceof InboxError ? error.status : 503, { error: reasonOf(error), ...(error instanceof InboxError && error.outcomeUnknown ? { outcomeUnknown: true } : {}) });
     }
   };
+
+  // This host's own snapshot, served from memory: the peer feed and the page's transport reads
+  // must not wait for a fresh Linear scan, Paseo listing or steward on every request, and the read
+  // that follows a five-second deadline must find the collection already done. An entry answers
+  // the transport generation it was computed under: while that matches, an entry younger than
+  // LOCAL_FRESH_MS is returned as is, and one younger than LOCAL_STALE_MS — or one computed before
+  // the latest owner collection landed — is returned immediately while a recompute runs in the
+  // background. Anything else (no entry, superseded generation, older than stale) is awaited. An
+  // answer or refresh bumps the generation, so an answered source is never served again; a landed
+  // owner collection is carried by the next read's background recompute without a read waiting —
+  // except for the background pass (`awaitOwner`), which publishes the collection it awaited. A
+  // canonical flag that does not match the entry computes for that flag.
+  private async localSnapshot(canonical?: boolean, awaitOwner = false): Promise<DecisionHost> {
+    const errors: string[] = [];
+    if (canonical === undefined) {
+      try { canonical = await this.deps.canonicalPeer() === null; }
+      catch (error) { canonical = false; errors.push(`Canonical source unavailable: ${reasonOf(error)}`); }
+    }
+    const withErrors = (host: DecisionHost): DecisionHost => errors.length ? { ...host, error: [host.error, ...errors].filter(Boolean).join("\n") } : host;
+    const entry = this.localCache;
+    const ownerNow = this.ownerCache?.checkedAt ?? null;
+    if (entry && entry.generation === this.ownerGeneration && entry.canonical === canonical) {
+      const age = this.now() - entry.at;
+      const ownerCurrent = entry.ownerCheckedAt === ownerNow;
+      if (age < LOCAL_FRESH_MS && ownerCurrent) return withErrors(entry.host);
+      if (age < LOCAL_STALE_MS && (ownerCurrent || !awaitOwner)) {
+        void this.computeLocal(canonical).catch(() => undefined);
+        return withErrors(entry.host);
+      }
+    }
+    // A caller that waits for the latest owner collection does not join a compute begun before it
+    // landed: that compute finishes first, and the one started after it carries the collection.
+    const flight = this.localFlight;
+    if (awaitOwner && flight?.canonical === canonical && flight.ownerCheckedAt !== ownerNow) await flight.promise.catch(() => undefined);
+    return withErrors(await this.computeLocal(canonical));
+  }
+
+  // One collection in flight per canonical flag: every awaiting caller shares it, and a caller
+  // whose flag does not match collects its own. A collection begun under an older generation never
+  // writes the cache (the fence ownerSnapshot uses); a failed collection keeps the previous entry
+  // and rejects only its awaiters, while a background one is not awaited by anybody.
+  private computeLocal(canonical: boolean): Promise<DecisionHost> {
+    if (this.localFlight?.canonical === canonical) return this.localFlight.promise;
+    const generation = this.ownerGeneration;
+    // The owner collection this compute starts from: stamping the one current when it lands could
+    // mark a snapshot built from older asks as current.
+    const ownerCheckedAt = this.ownerCache?.checkedAt ?? null;
+    const flight = this.local(canonical).then((host) => {
+      if (generation === this.ownerGeneration) {
+        this.localCache = { host, at: this.now(), generation, canonical, ownerCheckedAt };
+      }
+      return host;
+    });
+    this.localFlight = { canonical, ownerCheckedAt, promise: flight };
+    void flight.finally(() => { if (this.localFlight?.promise === flight) this.localFlight = null; }).catch(() => undefined);
+    return flight;
+  }
 
   private async ownerSnapshot(): Promise<NonNullable<BrowserDecisionInbox["ownerCache"]>> {
     if (this.ownerCache && this.now() - this.ownerCache.checkedAt < OWNER_CACHE_MS) return this.ownerCache;
@@ -347,16 +434,59 @@ export class BrowserDecisionInbox {
     }, READ_TIMEOUT_MS));
   }
 
-  // The steward's flow for the page's Flow section; its failure is named there.
+  // The steward's flow for the page's Flow section; its failure is named there. A flow that ships
+  // its tickets carries their total as well, so the page reads the count of a full list exactly
+  // the way it reads a partial peer feed's `ticketCount` (shared/decision-inbox.ts).
   private async readFlow(errors: string[]): Promise<StewardFlow | null> {
     if (!this.deps.flow) return null;
     try {
-      return await this.deps.flow();
+      const flow = await this.deps.flow();
+      return flow.tickets === undefined ? flow : { ...flow, ticketCount: flow.tickets.length };
     } catch (error) {
       const reason = `Ticket flow unavailable: ${reasonOf(error)}`;
       errors.push(reason);
       return { at: null, counts: {}, oldest: [], error: reason };
     }
+  }
+
+  // The full recovery evidence of this host, for the page's on-demand list (README, "Decision
+  // inbox"): `flow.tickets` in a peer feed is reference-only, so reading the rest is always a
+  // request to the host that owns them. This host's own page reads them here, never through a URL
+  // from a payload.
+  private async localTickets(): Promise<RecoveryTicketPage> {
+    if (!this.deps.flow) throw new InboxError(503, "This host has no ticket flow configured, so it has no recovery evidence to read.");
+    try { return { host: this.host, tickets: (await this.deps.flow()).tickets ?? [] }; }
+    catch (error) { throw new InboxError(503, `Ticket flow unavailable: ${reasonOf(error)}`); }
+  }
+
+  // One host's full recovery evidence: this host's own list, or the same read proxied to the peer
+  // that owns the host name. The name resolves to a configured origin whose current local snapshot
+  // calls itself that host — the origin a URL comes from is never a payload's to choose — and the
+  // read is bounded like the review pages: a peer that does not answer inside the deadline is an
+  // unavailable source, not an inbox that hangs.
+  private async flowPage(locallyServed: boolean, search: string) {
+    const query = new URLSearchParams(search).get("host");
+    if (locallyServed) {
+      // `/flow/local` is this host's own read; a `host` that is not this host's is the client's error.
+      if (query !== null && query !== this.host) throw new InboxError(404, "The named host does not serve its recovery evidence here; read it through /api/decisions/flow.");
+      return json(200, await this.localTickets());
+    }
+    if (!query) throw new InboxError(400, "Name the decision host whose recovery evidence is read.");
+    if (query === this.host) return json(200, await this.localTickets());
+    // Only a host this page already collected is reachable, and only one peer may own the name.
+    const configured = [...new Set((await this.deps.peers()).map(peerOrigin))];
+    const sources = await Promise.all(configured.map(async (peer) => ({ peer, snapshot: await this.readPeer(peer).catch(() => null) })));
+    const matches = sources.filter((source) => source.snapshot?.host === query);
+    if (matches.length !== 1) throw new InboxError(404, "Unknown or unavailable decision host; no recovery evidence was read.");
+    const peer = matches[0].peer;
+    return json(200, await deadline(async () => {
+      const response = await fetch(`${peer}/api/decisions/flow/local`, { signal: AbortSignal.timeout(READ_TIMEOUT_MS), redirect: "error", headers: { accept: "application/json" } });
+      if (!response.ok) throw new Error(`Recovery tickets unavailable from ${peer}: HTTP ${response.status}`);
+      const parsed = peerFlowPageSchema.safeParse(await response.json());
+      if (!parsed.success) throw new Error(`The decision host ${peer} returned an invalid recovery ticket list.`);
+      if (parsed.data.host !== query) throw new Error(`The decision host ${peer} answered for ${parsed.data.host} instead of ${query}.`);
+      return parsed.data;
+    }, READ_TIMEOUT_MS));
   }
 
   private async readPeer(peer: string): Promise<DecisionHost> {
@@ -416,7 +546,9 @@ export class BrowserDecisionInbox {
     if (collectOwners && !this.ownerFlight) this.ownerCache = null;
     const [configuredPeers, canonicalPeer] = await Promise.all([this.deps.peers(), this.deps.canonicalPeer()]);
     if (collectOwners && canonicalPeer === null) await this.ownerSnapshot();
-    const localPromise = this.local(canonicalPeer === null);
+    // The background pass publishes the owner collection it just awaited, so it waits for the
+    // snapshot that carries it; interactive reads answer from memory (localSnapshot).
+    const localPromise = this.localSnapshot(canonicalPeer === null, collectOwners);
     const peers = [...new Set(configuredPeers)].map(configured => {
       try { return { configured, peer: peerOrigin(configured), error: null }; }
       catch (error) { return { configured, peer: null, error: reasonOf(error) }; }
@@ -429,22 +561,24 @@ export class BrowserDecisionInbox {
     });
     // Background collection can wait for coverage. Interactive reads never wait for another host.
     if (collectOwners) await Promise.all(reads);
-    const local = await localPromise;
+    // This host's snapshot is shared with the memory the peer feed reads (localSnapshot), so the
+    // page composes its own entry instead of writing a transport-only error into that snapshot.
+    let local = await localPromise;
     const sources = peers.map(({ configured, peer, error }) => {
       const cached = peer ? this.peerCache.get(peer) : undefined;
       const current = cached?.generation === this.ownerGeneration && this.now() - cached.at < TRANSPORT_CACHE_MS;
       return { configured, peer, snapshot: current ? cached.snapshot : null,
         error: error ?? (current ? cached.error : "Refreshing this host; no current snapshot is available.") };
     });
-    const hosts: DecisionHost[] = [local];
     const unreachable: string[] = [];
     let canonicalHost: string | null = canonicalPeer === null ? this.host : null;
     let canonicalOrigin: string | null = null;
     if (canonicalPeer !== null) {
       try { canonicalOrigin = peerOrigin(canonicalPeer); }
-      catch (error) { local.error = [local.error, `Canonical source ${canonicalPeer} unavailable: ${reasonOf(error)}`].filter(Boolean).join("\n"); }
+      catch (error) { local = { ...local, error: [local.error, `Canonical source ${canonicalPeer} unavailable: ${reasonOf(error)}`].filter(Boolean).join("\n") }; }
     }
     const identities = new Set([this.host]);
+    const hosts: DecisionHost[] = [];
     for (const source of sources) {
       if (!source.snapshot || identities.has(source.snapshot.host)) {
         unreachable.push(source.configured);
@@ -462,9 +596,9 @@ export class BrowserDecisionInbox {
     }
     if (canonicalPeer !== null && canonicalHost === null) {
       if (!unreachable.includes(canonicalPeer)) unreachable.push(canonicalPeer);
-      local.error = [local.error, `Canonical owner asks unavailable from ${canonicalPeer}; no local Linear fallback is used.`].filter(Boolean).join("\n");
+      local = { ...local, error: [local.error, `Canonical owner asks unavailable from ${canonicalPeer}; no local Linear fallback is used.`].filter(Boolean).join("\n") };
     }
-    return { hosts, canonicalHost, unreachable };
+    return { hosts: [local, ...hosts], canonicalHost, unreachable };
   }
 
   private async action(input: BrowserDecisionAction) {
