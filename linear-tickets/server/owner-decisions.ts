@@ -71,14 +71,15 @@ type LoggedQuestion = { key: string; question: string; options: string[] };
 // Where a deputy's knowledge came from (README, "Deputy for agent questions"): the source's stable
 // id and revision (a document's content hash, a commit, a log entry or memory id) and the verbatim
 // passage, so a citation still says what it relied on after the source changes.
-export type CitationKind = "plan" | "principles" | "rules" | "owner-answer" | "memory";
+export type CitationKind = "plan" | "principles" | "rules" | "owner-answer" | "resolution" | "owner-comment" | "memory";
 export type Citation = { sourceId: string; kind: CitationKind; title: string; revision: string; quote: string; url?: string };
 export type DeputyMode = "shadow" | "live";
 // `owner-answer`: an answer the plugin itself delivered for the authenticated owner (a Linear
 // comment written with the owner's key, or an agent-session reply whose author is the owner),
 // bound to the request it answered; the only answers the deputy treats as the owner's. `answer`
 // records resolutions as the daemon reports them: they name no responder, so they never count as
-// verified. `key` makes an entry unique beside (kind, id): an activity id, an intent or a status.
+// verified (the deputy keeps the ones on the ticket it is answering as blocking constraints).
+// `key` makes an entry unique beside (kind, id): an activity id, an intent or a status.
 export type LogEntry =
   | { kind: "plan-feedback"; id: string; at: string; identifier: string; issueId: string; approved: boolean; text: string }
   | { kind: "question"; id: string; at: string; identifier: string; issueId: string; questions: LoggedQuestion[] }
@@ -230,7 +231,9 @@ export function sentBackFeedback(body: string): string | null {
   return rest || null;
 }
 
-function answerText(question: Extract<LogEntry, { kind: "question" }>, answer: Extract<LogEntry, { kind: "answer" }>): string {
+// Exported for the deputy's sources (deputy-sources.ts): a recorded resolution is kept as a
+// constraint in the same wording the owner's inbox shows.
+export function answerText(question: Extract<LogEntry, { kind: "question" }>, answer: Extract<LogEntry, { kind: "answer" }>): string {
   if (answer.denyMessage !== undefined) {
     return [...question.questions.map((item) => `Question: ${item.question}`), `Declined${answer.denyMessage ? `: ${answer.denyMessage}` : ""}`].join("\n");
   }

@@ -627,9 +627,10 @@ export type GroupIssue = { id: string; identifier: string; status: string; statu
 export type GroupChild = GroupIssue & { assigneeId: string | null; labels: string[]; blockers: GroupIssue[] };
 export type IssueGroup = GroupIssue & { children: GroupChild[] };
 
-// Group reads authorize handout and verification: absent metadata is not an empty last page.
-// Track returned cursors per connection so a failed traversal never returns a partial group.
-function groupPage(value: unknown, context: string, seen: Set<string>): { nodes: unknown[]; after: string | null } {
+// A connection read that authorizes work or evidence: absent nodes or pagination metadata is not
+// an empty last page. Track returned cursors per connection so a failed traversal never returns a
+// partial result.
+function strictPage(value: unknown, context: string, seen: Set<string>): { nodes: unknown[]; after: string | null } {
   const raw = record(value);
   if (!Array.isArray(raw.nodes)) throw new Error(`Linear did not return ${context}.`);
   const page = connection(raw);
@@ -941,6 +942,10 @@ export type OwnerAskIssue = {
   status: string; statusType: string; parentId: string | null; parentIdentifier: string | null; labels: string[];
 };
 export type OwnerAskComment = { id: string; body: string; createdAt: string };
+// One comment of a ticket's complete history (deputy-sources.ts): `authorId` is Linear's own
+// author — null for a comment an app or bot actor wrote, which Linear returns as `user: null` —
+// and `updatedAt` marks an edit.
+export type TicketComment = { id: string; body: string; createdAt: string; updatedAt: string; url: string; authorId: string | null };
 export const OWNER_ASKS_PAGE = 100;
 const OWNER_ASK_FIELDS = `id identifier title url updatedAt description state { name type } parent { id identifier } labels(first: 50) { nodes { name } }`;
 export const OWNER_ASKS_QUERY = `query ownerAskIssues($first: Int!, $after: String, $filter: IssueFilter) {
@@ -976,6 +981,29 @@ export const OWNER_ASK_COMMENT_CHANGES_QUERY = `query ownerAskCommentChanges($fi
     pageInfo { hasNextPage endCursor }
   }
 }`;
+// One ticket's complete comment history, oldest first, for the deputy (deputy-sources.ts): every
+// comment with its author and both timestamps. An owner directive on the ticket must be seen whole
+// and current, so the deputy reads all pages of one issue (never a window or a keyword filter) and
+// the author/updatedAt of each comment decide whose words they are and whether they changed.
+export const ISSUE_COMMENT_HISTORY_QUERY = `query issueCommentHistory($id: String!, $after: String) {
+  issue(id: $id) {
+    id
+    comments(first: 100, after: $after) {
+      nodes { id body createdAt updatedAt url user { id } }
+      pageInfo { hasNextPage endCursor }
+    }
+  }
+}`;
+// A comment's author as Linear returned it: a user id, or null for a comment an app or bot actor
+// wrote (`user: null` — a valid, unattributed author, and never the owner's words). The user field
+// itself must have been returned and well-formed: missing (undefined), non-object or id-less is
+// undefined, which refuses the history rather than passing a comment off as having no author.
+function commentAuthorId(value: unknown): string | null | undefined {
+  if (value === null) return null;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const id = (value as Record<string, unknown>).id;
+  return typeof id === "string" && id ? id : undefined;
+}
 function ownerAskIssue(node: Record<string, unknown>): OwnerAskIssue {
   const parent = record(node.parent ?? {});
   return {
@@ -1726,7 +1754,7 @@ export class LinearService {
       const current = groupIssue(issue);
       if (!current.id || (parent && current.id !== parent.id)) throw new Error("Linear returned inconsistent group identity.");
       parent ??= current;
-      const page = groupPage(issue.children, `${parent.identifier}'s children`, cursors);
+      const page = strictPage(issue.children, `${parent.identifier}'s children`, cursors);
       for (const node of page.nodes) {
         const child = record(node);
         const fields = groupIssue(child);
@@ -1753,7 +1781,7 @@ export class LinearService {
     const cursors = new Set<string>();
     let value = first;
     for (;;) {
-      const page = groupPage(value, `${identifier}'s labels`, cursors);
+      const page = strictPage(value, `${identifier}'s labels`, cursors);
       for (const node of page.nodes) {
         const name = label(record(node).name);
         if (!name) throw new Error(`Linear returned an unnamed label on ${identifier}.`);
@@ -2315,6 +2343,44 @@ export class LinearService {
       } while (after);
     }
     return changes;
+  }
+
+  // One ticket's complete comment history, oldest first (deputy-sources.ts): the deputy must see
+  // the owner's own directives on the ticket it is answering on, whole and as they are now, so this
+  // reads every page and never returns a partial or filtered history. Every field the history is
+  // read for is required: a ticket Linear does not return, an unknown page state, an unfinished or
+  // repeated pagination and a comment without its id, body or timestamps all throw instead, since
+  // a short history would silently drop an owner constraint from the evidence. A comment's author
+  // may be absent in the answer itself (`user: null`: an app or bot actor wrote it, a valid
+  // unattributed author) — only a user field the read did not return refuses the history.
+  async issueCommentHistory(issueId: string): Promise<TicketComment[]> {
+    const comments: TicketComment[] = [];
+    const known = new Set<string>();
+    const cursors = new Set<string>();
+    let after: string | null = null;
+    for (let page = 0; page < WINDOW_PAGES; page++) {
+      const data = record(await this.read(ISSUE_COMMENT_HISTORY_QUERY, { id: issueId, after }, (found) => Boolean(found.issue && typeof found.issue === "object")));
+      const issue = record(data.issue ?? {});
+      if (typeof issue.id !== "string" || !issue.id) throw new Error("Linear did not return the ticket whose comment history was read.");
+      const found = strictPage(issue.comments ?? {}, `the comment history of ${issueId}`, cursors);
+      for (const node of found.nodes) {
+        const entry = record(node);
+        const id = entry.id;
+        // `user: null` is Linear's own answer for a comment an app or bot actor wrote: a valid,
+        // unattributed author. A user field the answer left out is not.
+        const authorId = commentAuthorId(entry.user);
+        if (typeof id !== "string" || !id || typeof entry.body !== "string" || typeof entry.createdAt !== "string" || !entry.createdAt
+          || typeof entry.updatedAt !== "string" || !entry.updatedAt || authorId === undefined) {
+          throw new Error("Linear did not return a ticket comment with its id, author and timestamps.");
+        }
+        if (known.has(id)) continue;
+        known.add(id);
+        comments.push({ id, body: entry.body, createdAt: entry.createdAt, updatedAt: entry.updatedAt, url: label(entry.url), authorId });
+      }
+      if (!found.after) return comments;
+      after = found.after;
+    }
+    throw new Error(`Linear returned more than ${WINDOW_PAGES} pages of comments for one ticket.`);
   }
 
   // Every page of a connection read with the key (at most WINDOW_PAGES), for the windowed reads below.

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { AgentApi } from "./agent-app";
 import { Credentials } from "./credentials";
-import { AuthenticationError, CREATE_ISSUE_QUERY, ISSUE_ATTACHMENT_URLS_QUERY, ISSUE_CORE_QUERY, ISSUE_GROUP_QUERY, ISSUE_GROUP_LABELS_QUERY, ISSUE_WATCH_STATE_QUERY, ISSUE_METADATA_QUERY, ISSUE_STATUS_QUERY, ISSUE_STATE_QUERY, ISSUE_STATUSES_QUERY, LABELED_ISSUES_QUERY, LinearApiError, LinearService, MARKED_COMMENT_QUERY, MENTIONING_ISSUES_QUERY, OWNER_ASKS_QUERY, TEAM_STATES_QUERY, type App, type IssueCore, type Post } from "./linear";
+import { AuthenticationError, CREATE_ISSUE_QUERY, ISSUE_ATTACHMENT_URLS_QUERY, ISSUE_COMMENT_HISTORY_QUERY, ISSUE_CORE_QUERY, ISSUE_GROUP_QUERY, ISSUE_GROUP_LABELS_QUERY, ISSUE_WATCH_STATE_QUERY, ISSUE_METADATA_QUERY, ISSUE_STATUS_QUERY, ISSUE_STATE_QUERY, ISSUE_STATUSES_QUERY, LABELED_ISSUES_QUERY, LinearApiError, LinearService, MARKED_COMMENT_QUERY, MENTIONING_ISSUES_QUERY, OWNER_ASKS_QUERY, TEAM_STATES_QUERY, type App, type IssueCore, type Post } from "./linear";
 import { RateLimitedError } from "./rate-budget";
 
 const issue = { id: "i1", identifier: "TUC-1", state: { id: "s1", name: "Todo", type: "unstarted" }, team: { id: "t1" }, labels: { nodes: [] }, attachments: { nodes: [] }, inverseRelations: { nodes: [] } };
@@ -571,4 +571,91 @@ test("issueCore keeps exactly the fields it reads from one answer, on a cold ser
   });
   assert.deepEqual(await linear.moveToReview("i1"), { changed: true });
   assert.deepEqual(sent, ["issueCore", "issueCore", "teamStates", "issueUpdateState review"]);
+});
+
+const commentNode = (id: string, at: string, author = "u-owner") => ({ id, body: `Comment ${id}`, createdAt: at, updatedAt: at, url: `https://linear.app/tuc/comment/${id}`, user: { id: author } });
+const commentPage = (nodes: unknown[], after: string | null) => ({ nodes, pageInfo: { hasNextPage: after !== null, endCursor: after } });
+
+test("issueCommentHistory reads every page of one ticket's comments, oldest first", async () => {
+  const { keyCalls, linear } = service(undefined, (query, variables) => {
+    assert.equal(query, ISSUE_COMMENT_HISTORY_QUERY);
+    assert.equal(variables.id, "i1");
+    if (variables.after === null) return { issue: { id: "i1", comments: commentPage([commentNode("k1", "2026-10-01T07:00:00Z"), commentNode("k2", "2026-10-01T08:00:00Z", "app-1")], "cursor-2") } };
+    assert.equal(variables.after, "cursor-2", "the next page is read with the cursor Linear returned");
+    return { issue: { id: "i1", comments: commentPage([commentNode("k3", "2026-10-02T07:00:00Z")], null) } };
+  });
+  assert.deepEqual(await linear.issueCommentHistory("i1"), [
+    { id: "k1", body: "Comment k1", createdAt: "2026-10-01T07:00:00Z", updatedAt: "2026-10-01T07:00:00Z", url: "https://linear.app/tuc/comment/k1", authorId: "u-owner" },
+    { id: "k2", body: "Comment k2", createdAt: "2026-10-01T08:00:00Z", updatedAt: "2026-10-01T08:00:00Z", url: "https://linear.app/tuc/comment/k2", authorId: "app-1" },
+    { id: "k3", body: "Comment k3", createdAt: "2026-10-02T07:00:00Z", updatedAt: "2026-10-02T07:00:00Z", url: "https://linear.app/tuc/comment/k3", authorId: "u-owner" },
+  ]);
+  assert.equal(keyCalls.length, 2, "one read per page and nothing else");
+});
+
+
+test("a comment Linear returns without its id, body or timestamps, or without the user field it was asked for, refuses the whole history", async () => {
+  const whole = commentNode("k1", "2026-10-01T07:00:00Z");
+  for (const broken of [
+    { ...whole, id: undefined },
+    { ...whole, body: null },
+    { ...whole, createdAt: "" },
+    { ...whole, updatedAt: 7 },
+    // `user: null` is Linear's own answer for a comment an app or bot actor wrote (read as valid
+    // below), so only a user field the answer did not return, or returned malformed, refuses.
+    { ...whole, user: undefined },
+    { ...whole, user: "someone" },
+    { ...whole, user: {} },
+    { ...whole, user: { id: "" } },
+    { ...whole, user: { id: 7 } },
+    "not-a-comment",
+  ]) {
+    const { linear } = service(undefined, () => ({ issue: { id: "i1", comments: commentPage([broken], null) } }));
+    await assert.rejects(linear.issueCommentHistory("i1"), /ticket comment|unexpected response/, JSON.stringify(broken));
+  }
+});
+
+test("a comment Linear attributes to no user is read as valid, beside the owner's own comments", async () => {
+  // Linear's real answer for a comment an app or bot actor wrote: `user: null` is part of the
+  // answer, not a read that went missing, so it does not refuse the history the owner's own
+  // comment is read from.
+  const { linear } = service(undefined, () => ({ issue: { id: "i1", comments: commentPage([commentNode("k1", "2026-10-01T07:00:00Z"), { ...commentNode("k2", "2026-10-01T08:00:00Z"), user: null }], null) } }));
+  assert.deepEqual(await linear.issueCommentHistory("i1"), [
+    { id: "k1", body: "Comment k1", createdAt: "2026-10-01T07:00:00Z", updatedAt: "2026-10-01T07:00:00Z", url: "https://linear.app/tuc/comment/k1", authorId: "u-owner" },
+    { id: "k2", body: "Comment k2", createdAt: "2026-10-01T08:00:00Z", updatedAt: "2026-10-01T08:00:00Z", url: "https://linear.app/tuc/comment/k2", authorId: null },
+  ]);
+});
+
+test("an unknown or unfinished comment page state refuses the history instead of passing as its end", async () => {
+  for (const [comments, expected] of [
+    [{ nodes: [], pageInfo: {} }, /pagination metadata/],
+    [{ nodes: [] }, /pagination metadata/],
+    [{ nodes: [], pageInfo: { hasNextPage: null } }, /pagination metadata/],
+    [{ nodes: [], pageInfo: { hasNextPage: true } }, /missing or repeated cursor/],
+    [{ nodes: "later" }, /did not return the comment history/],
+    [null, /did not return the comment history/],
+  ] as const) {
+    const { linear } = service(undefined, () => ({ issue: { id: "i1", comments } }));
+    await assert.rejects(linear.issueCommentHistory("i1"), expected, JSON.stringify(comments));
+  }
+  const { linear } = service(undefined, () => ({ issue: { id: "i1", comments: commentPage([], null) } }));
+  assert.deepEqual(await linear.issueCommentHistory("i1"), [], "a ticket with no comments has a complete history");
+});
+
+test("a repeated cursor and a history longer than one read allows both fail closed", async () => {
+  const repeated = service(undefined, () => ({ issue: { id: "i1", comments: commentPage([], "same-cursor") } }));
+  await assert.rejects(repeated.linear.issueCommentHistory("i1"), /missing or repeated cursor/);
+  let page = 0;
+  const endless = service(undefined, () => ({ issue: { id: "i1", comments: commentPage([], `cursor-${++page}`) } }));
+  await assert.rejects(endless.linear.issueCommentHistory("i1"));
+  assert.equal(page, 50, "an unfinished history must stop at the bounded page limit");
+});
+
+test("a ticket Linear does not return, and a failed comment read, refuse the history", async () => {
+  const missing = service(undefined, () => ({ issue: null }));
+  await assert.rejects(missing.linear.issueCommentHistory("i1"), /did not return the ticket whose comment history/);
+  const limited = new RateLimitedError("key", Date.now() + 60_000);
+  const paused = service(undefined, () => { throw limited; });
+  await assert.rejects(paused.linear.issueCommentHistory("i1"), (error: unknown) => error === limited);
+  const failed = service(undefined, () => { throw new LinearApiError("Linear answered HTTP 500", 500); });
+  await assert.rejects(failed.linear.issueCommentHistory("i1"), /HTTP 500/);
 });

@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readdir, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { AgentApi } from "./agent-app";
-import { oldestRecord, pluginComments, recordedComments, recordPluginComment } from "./agent-records";
+import { oldestRecord, pluginComments, recordedComments, recordPluginComment, strictRecordProvenance } from "./agent-records";
 import { AuthenticationError, type MentioningIssue, type PlanDocument, type WindowComment } from "./linear";
 import {
   AppOnlyToken, AppWriter, candidateKey, collectOwnerDecisions, collectWindow, DecisionLog, documentFeedback, InvalidInput, isoWeek, runCollect, runFile,
@@ -167,6 +167,69 @@ test("owner comments count only from the oldest comment record; plan feedback be
     assert.equal((await state(home)).commentsFrom, ago(3));
     await rm(join(home, "agent-comments"), { recursive: true, force: true });
     assert.equal((await collect(home, world, NOW, undefined, () => oldestRecord(home))).batch.commentsFrom, ago(3));
+  } finally { await rm(home, { recursive: true, force: true }); }
+});
+
+test("a comment record that cannot be read refuses the deputy's evidence instead of vanishing from it", async () => {
+  const home = await temporary();
+  try {
+    await recordPluginComment(home, "key-written", "issue-1", new Date(NOW - 3 * DAY));
+    await mkdir(join(home, "agent-comments", "11111111-1111-4111-8111-111111111111"), { recursive: true });
+    await writeFile(join(home, "agent-comments", "11111111-1111-4111-8111-111111111111", "a.json"), JSON.stringify({ id: "by-agent", issueId: "issue-1", createdAt: ago(1) }));
+    assert.deepEqual(await strictRecordProvenance(home), { recorded: ["by-agent", "key-written"], recordsFrom: ago(3) });
+    // A directory where a record file is expected (EISDIR): the strict read refuses it, the weekly
+    // review display still tolerates it, and the records read again once the damage is repaired.
+    const directory = join(home, "agent-comments", "plugin", "folder.json");
+    await mkdir(directory, { recursive: true });
+    await assert.rejects(() => strictRecordProvenance(home), (error: unknown) => (error as NodeJS.ErrnoException).code === "EISDIR");
+    assert.deepEqual([...(await recordedComments(home))].sort(), ["by-agent", "key-written"], "the display path must not start failing on a damaged record");
+    await rm(directory, { recursive: true, force: true });
+    assert.deepEqual(await strictRecordProvenance(home), { recorded: ["by-agent", "key-written"], recordsFrom: ago(3) });
+    // Invalid JSON, and a record without the timestamp the format always carries, refuse the same way.
+    const broken = join(home, "agent-comments", "plugin", "broken.json");
+    await writeFile(broken, "{not json");
+    await assert.rejects(() => strictRecordProvenance(home), /not valid JSON/);
+    await rm(broken, { force: true });
+    const half = join(home, "agent-comments", "plugin", "half.json");
+    await writeFile(half, JSON.stringify({ id: "half" }));
+    await assert.rejects(() => strictRecordProvenance(home), /no comment id or no readable timestamp/);
+    await rm(half, { force: true });
+    // A ticket agent's record is read the same way: never skipped, so a comment it wrote is never
+    // left to look like the owner's own.
+    const agentFolder = join(home, "agent-comments", "11111111-1111-4111-8111-111111111111");
+    const agentRecord = join(agentFolder, "b.json");
+    await writeFile(agentRecord, "");
+    await assert.rejects(() => strictRecordProvenance(home), /not valid JSON/);
+    await rm(agentRecord, { force: true });
+    assert.deepEqual(await strictRecordProvenance(home), { recorded: ["by-agent", "key-written"], recordsFrom: ago(3) });
+    // A known record folder that is no longer a folder (a file, then a symlink) has lost the records
+    // under it: the snapshot refuses rather than reading the folder as absent, and reads again once
+    // the folder is restored (the display path above stays tolerant of the same damage instead).
+    const pluginFolder = join(home, "agent-comments", "plugin");
+    const keyWritten = join(pluginFolder, "key-written.json");
+    const kept = await readFile(keyWritten, "utf8");
+    await rm(pluginFolder, { recursive: true, force: true });
+    await writeFile(pluginFolder, "not a folder");
+    await assert.rejects(() => strictRecordProvenance(home), /plugin is not a folder/);
+    await rm(pluginFolder, { force: true });
+    await mkdir(pluginFolder, { recursive: true });
+    await writeFile(keyWritten, kept);
+    await rm(pluginFolder, { recursive: true, force: true });
+    await symlink(agentFolder, pluginFolder, "dir");
+    await assert.rejects(() => strictRecordProvenance(home), /plugin is not a folder/);
+    await rm(pluginFolder, { force: true });
+    await mkdir(pluginFolder, { recursive: true });
+    await writeFile(keyWritten, kept);
+    assert.deepEqual(await strictRecordProvenance(home), { recorded: ["by-agent", "key-written"], recordsFrom: ago(3) });
+    // A ticket agent's folder the same way: a file in its place leaves its records unreachable.
+    const agentKept = await readFile(join(agentFolder, "a.json"), "utf8");
+    await rm(agentFolder, { recursive: true, force: true });
+    await writeFile(agentFolder, "not a folder");
+    await assert.rejects(() => strictRecordProvenance(home), /11111111-1111-4111-8111-111111111111 is not a folder/);
+    await rm(agentFolder, { force: true });
+    await mkdir(agentFolder, { recursive: true });
+    await writeFile(join(agentFolder, "a.json"), agentKept);
+    assert.deepEqual(await strictRecordProvenance(home), { recorded: ["by-agent", "key-written"], recordsFrom: ago(3) });
   } finally { await rm(home, { recursive: true, force: true }); }
 });
 
