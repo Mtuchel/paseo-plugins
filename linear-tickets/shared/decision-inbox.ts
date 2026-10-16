@@ -103,6 +103,10 @@ export type DecisionView = {
   hosts: DecisionHost[];
   canonicalHost: string | null;
   unreachable: string[];
+  // Configured hosts in `unreachable` whose first read is still under way (no current snapshot
+  // yet, no failure either); `canonicalReading` when the canonical owner-ask host is one of them.
+  reading?: string[];
+  canonicalReading?: boolean;
   tasks?: CuratedDecision[];
   curation?: CurationStatus;
 };

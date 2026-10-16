@@ -21,7 +21,7 @@ const CLIENT = String.raw`
   let availability = view.availability || null;
   let availabilityError = '', recoveryPending = false;
   let selected = null, selectedSnapshot = null, stale = false, busy = false, refreshing = false;
-  let refreshError = '', lastUpdated = Date.now();
+  let refreshError = '', lastUpdated = Date.now(), readingTimer = 0;
   const drafts = new Map(), results = new Map(), completed = new Set(), uncertain = new Set();
   // Withheld nonurgent source reviews never ship in the feed: they arrive here in server pages,
   // browsed, searched and answered like any owner ask. reviewQuery is the query the loaded
@@ -275,12 +275,16 @@ const CLIENT = String.raw`
   }
   function coverage() {
     const warnings = [];
+    // A host whose first read is still under way is shown as being read, not as failed, and the
+    // page asks again shortly instead of on the 30-second cycle; a failed read is a warning.
+    const reading = view.reading || [];
     if (unavailable()) warnings.push(availabilityReason());
-    if (!view.canonicalHost) warnings.push('Canonical Linear owner-ask host unavailable. Owner asks are not shown.');
+    if (!view.canonicalHost) { if (!view.canonicalReading) warnings.push('Canonical Linear owner-ask host unavailable. Owner asks are not shown.'); }
     else if (!view.hosts.some(host => host.host === view.canonicalHost)) warnings.push('Canonical Linear owner-ask host ' + view.canonicalHost + ' is missing.');
-    for (const host of view.unreachable) warnings.push(host + ' unavailable; its decisions may be missing.');
+    for (const host of view.unreachable) if (!reading.includes(host)) warnings.push(host + ' unavailable; its decisions may be missing.');
     const interval = view.curation?.intervalMs || 900000;
     for (const host of view.hosts) {
+      if (reading.includes(host.host)) continue;
       if (host.error) warnings.push(host.host + ' partial or unavailable: ' + host.error);
       const checked = Date.parse(host.updatedAt);
       if (!Number.isFinite(checked)) warnings.push(host.host + ' source snapshot time is unavailable.');
@@ -293,12 +297,14 @@ const CLIENT = String.raw`
     if (view.curation?.running && view.curation.nextRefreshAt && Date.now() - Date.parse(view.curation.nextRefreshAt) > 30000) warnings.push('Scheduled collection is overdue. The received task list may be stale.');
     const element = document.getElementById('coverage');
     element.classList.toggle('warning', warnings.length > 0);
+    if (reading.length && !refreshError && !readingTimer) readingTimer = setTimeout(() => { readingTimer = 0; if (!document.hidden) void refresh(); }, 2000);
+    const status = reading.length ? '<p role="status">Reading decisions' + (view.canonicalReading ? ' and owner asks' : '') + ' from ' + escape(reading.join(', ')) + '…</p>' : '';
     const withheld = view.hosts.reduce((sum, host) => sum + (host.sourceReviews || 0), 0);
     const sources = view.hosts.map(host => '<p><b>' + escape(host.host) + '</b> · ' + host.asks.length + ' owner sources · ' + host.live.length + ' live requests' + (host.sourceReviews ? ' · ' + host.sourceReviews + ' sources to review' : '') + '<br>Source snapshot: ' + escape(date(host.updatedAt)) + '</p>').join('');
     const retained = rows();
     const unresolved = retained.filter(row => row.target === 'owner' && !row.data.extracted).length;
     const expanded = element.querySelector('#source-coverage')?.open;
-    element.innerHTML = (warnings.length ? '<b>Incomplete or stale coverage</b>' + warnings.map(text => '<p>' + escape(text) + '</p>').join('') : '') +
+    element.innerHTML = (warnings.length ? '<b>Incomplete or stale coverage</b>' + warnings.map(text => '<p>' + escape(text) + '</p>').join('') : '') + status +
       '<details id="source-coverage"' + (expanded ? ' open' : '') + '><summary>' + retained.length + ' source tasks · ' + unresolved + ' unresolved' + (withheld ? ' · ' + withheld + ' sources to review' : '') + ' · coverage</summary>' + sources +
       '<p>Collected every 15 minutes, even with this page closed. Retained after exact-source deduplication and confirmed answers; includes waits and unresolved extraction, not just immediately actionable decisions.</p>' +
       (view.canonicalHost ? '<p>Canonical Linear source: ' + escape(view.canonicalHost) + '</p>' : '') +
