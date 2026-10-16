@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { z } from "zod";
 import type { PaseoApi } from "@getpaseo/client";
 import type { DecisionReceipt, OwnerAsk } from "../shared/contracts";
-import type { BrowserOwnerAsk } from "../shared/decision-inbox";
+import { isSourceReview, type BrowserOwnerAsk } from "../shared/decision-inbox";
 import type { Handover, HandoverRecord } from "./handover";
 import type { LinearService, OwnerAskComment, OwnerAskIssue } from "./linear";
 import type { NeedsYouIssue, NeedsYouIssues } from "./needs-you";
@@ -92,6 +92,15 @@ export type OwnerAsksDeps = {
 };
 
 export type OwnerAskSnapshot = { asks: BrowserOwnerAsk[]; updatedAt: string; history: DecisionReceipt[]; coverage?: string[] };
+
+// The `linear.owner-asks` page (the Paseo Agents menu bar). As in the browser feed
+// (decision-inbox.ts), nonurgent source reviews are counted, not shipped: listing them made the page
+// 28 MB on server087 (14,073 of 14,213 sources, 2026-10-16) and pushed the read past the menu bar's
+// 30-second deadline. The browser's paged review list still reads every source from the snapshot.
+export function ownerAsksPage(snapshot: OwnerAskSnapshot): { asks: BrowserOwnerAsk[]; updatedAt: string; history: DecisionReceipt[]; sourceReviews: number } {
+  const asks = snapshot.asks.filter((ask) => !isSourceReview(ask));
+  return { asks, updatedAt: snapshot.updatedAt, history: snapshot.history, sourceReviews: snapshot.asks.length - asks.length };
+}
 export type AnswerAskInput = { issueId: string; sourceId?: string; revision: string; answers: Record<string, string>; note?: string; done?: boolean };
 export type TriageAskInput = { issueId: string; sourceId?: string; revision: string; action: "research" | "delegate" | "defer" | "reopen"; note?: string; until?: string };
 export type AnswerAskResult = { delivered: "agent" | "continued" | "queued" | "comment" | "closed"; message: string };
