@@ -890,8 +890,8 @@ When the approved plan is implemented, the agent starts on the strongest of: the
 plugin on approval; change it to override), the ticket's latest decided tier (an approved plan or
 an escalation; an escalation stays), and the plan's tier, which its risk rating raises to `strong`
 when a rule above requires it. The cheap tier runs the provider's model in `cheapModels` (default
-for omp: `deepseek/deepseek-flash`, thinking `max`, through the official DeepSeek API, with
-`lithos/deepseek-ai/DeepSeek-V4.1-Flash` through the Lithos account behind it in omp's
+for omp: `lithos/deepseek-ai/DeepSeek-V4.1-Flash`, thinking `max`, through the Lithos
+account, with the official `deepseek/deepseek-flash` API behind it in omp's
 `retry.fallbackChains`); a provider without one implements on the launch model. After
 **Approve & split**, each sub-issue plans again and picks its own tier; a sub-issue of a strong
 plan, or of a step the plan lists under `Strong steps`, gets `model:strong` first, so its own plan
