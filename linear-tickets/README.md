@@ -4354,7 +4354,7 @@ Candidates live in `$PASEO_HOME/linear-tickets/deputy/candidates.json` (director
    Such choices require a technical reframe, not a fabricated answer.
    **Bounded technical continuation:** when no safe exact choice can accomplish useful delegated
    work, the evaluator may instead return `technical-continuation` with the closed
-   `read-only-investigation-v1` template, a concrete relevant read-only step using existing material
+   `read-only-investigation-v2` template, a concrete relevant read-only step using existing material
    and access, and why no safe offered choice suffices. Those explanations are audit data, never
    executable model prose. Delivery is one fixed directive identifying the automated deputy,
    expressly not personal owner approval or selection of any bundled release. It permits only
@@ -4364,6 +4364,10 @@ Candidates live in `$PASEO_HOME/linear-tickets/deputy/candidates.json` (director
    access changes and external commitments. Findings must distinguish scoped technical work from
    retained business/owner decisions. A current no-further-review stop still forbids review; a
    missing business fact or no useful permitted technical step still requires abstention.
+   Its restrictions scope that investigation; they do not create a permanent ticket-wide owner
+   hold. Later actions require their own evidenced authority and current gates. Known technical
+   work can use existing standing delegation without a new personal owner click; this never
+   releases unrelated staging exclusions, real owner holds or acceptance requirements.
    Safe exact offered choices remain preferred. Every actor, consequence, integrity and citation
    fence applies to the complete directive; continuation additionally requires `standing`
    authority and `technical` outcome scope. No quota can fabricate a selection or business fact.
@@ -4444,7 +4448,7 @@ block, without Paseo, Linear or GitHub credentials in its environment. A tool ev
 unreadable/oversized answer, abstention or failed check refuses the whole request. Citations
 retain source ID, revision and quote.
 
-Evidence is versioned as `deputy-18-bounded-technical-continuation/owner-autonomy-2026-10-15-v3/<model>/high`.
+Evidence is versioned as `deputy-19-scoped-authority-reconciliation/owner-autonomy-2026-10-15-v3/<model>/high`.
 Old-policy predictions never satisfy current empirical readiness. On restart, an old-version
 refusal/prediction is reevaluated only after the exact unanswered request is freshly verified;
 old selections, citations, intent and grace are discarded. An equivalent new request ID retires
@@ -4463,6 +4467,31 @@ migrating, discarding old evidence/intent/grace and starting a full new grace pe
 Terminal/applied/canceled history is not revived; interrupted dispatches retain their existing
 receipt-only settlement path. Persisted owner holds must be restored before recovery and still
 veto the checked submission.
+
+Applied continuations remain terminal permission receipts, but are revisited for **authority
+reconciliation**, not redispatch. An authenticated owner answer recorded since the original ask,
+a delivered owner correction to another decision, or a checked substantive deputy answer on the same ticket triggers a scoped
+reminder to the original live, still-linked agent in the same worktree. Owner-answer and deputy
+authority remain distinctly attributed. The reminder carries the complete request/answer and
+current ticket labels, asks the agent to check each action's authority and remaining prerequisite,
+and never answers a new permission, clears a hold, waives acceptance, or orders a repeated write.
+Owner-answer, delivered-correction and deputy-answer callbacks wake reconciliation; startup,
+explicit reconciliation and policy reactivation recover missed callbacks. This uses the local
+journal, not additional model calls or polling Linear comment histories. New answer receipts
+persist the complete raw request, including option descriptions and request-level constraints.
+Legacy entries require a retained complete candidate request; abbreviated question projections
+alone cannot trigger reconciliation. Recovery uses original ask chronology, not a delayed
+settlement timestamp, so authority recorded during a journal outage is not lost.
+
+Each evidence batch is reserved durably before sending. `Candidate.reconciliation` records
+`submitted`, `sent`, or `unknown`; none means the agent executed or completed the work.
+Polling/restart never resends a reserved batch, including ambiguous delivery. Off/shadow mode,
+completed/canceled tickets, archived/closed/relinked agents and changed worktrees send nothing.
+Unreadable evidence defers reconciliation; oversized authority context is not truncated.
+Unattributed daemon resolutions, arbitrary agent claims and parent-relayed prose cannot supply
+human provenance. A parent human-choice receipt outside the plugin's authenticated channels
+still requires verifiable provenance; this change does not manufacture it.
+
 Dispatch fingerprints the complete evaluator input, including blocking-only sources. Changed
 input invalidates the prediction even if an old quotation remains. The pending-request fingerprint
 includes raw input, provider/name and metadata, so custom-answer capability changes also invalidate
