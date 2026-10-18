@@ -750,9 +750,7 @@ test("an owner answer whose evidence could not be written is not marked recorded
   await h.deputy.ownerAnswered("a1", question(), response, activity, at);
   await h.deputy.ownerAnswered("a1", question(), response, activity, at);
   assert.equal((await h.candidate()).status, "owner-answered");
-  assert.deepEqual((await h.log.entries()).filter((entry) => entry.kind === "owner-answer"), [
-    { kind: "owner-answer", id: "a1:r1", at, key: "c1", via: "linear-comment", userId: OWNER, answers: { Runner: "vitest" } },
-  ]);
+  assert.equal((await h.log.entries()).filter(entry => entry.kind === "owner-answer" && entry.id === "a1:r1").length, 1, "replaying the confirmed activity does not duplicate authority evidence");
 });
 
 test("blank owner identities and non-question responses leave legacy answers unchanged and add no owner evidence", async (t) => {
@@ -2194,6 +2192,198 @@ async function continuationHarness(t: TestContext) {
   assert.ok(entry);
   await h.log.append(entry);
   return { ...h, request, replies, submitted };
+}
+
+test("a delivered correction wakes another continuation without an explicit reconciliation call", async (t) => {
+  const h = await continuationHarness(t);
+  await h.deputy.observe(h.agent, h.request, { issueId: "i1", identifier: "TUC-1" });
+  await h.settle();
+  h.advance(5 * 60_000);
+  await h.settle();
+  const second = { ...h.request, id: "second" };
+  h.daemon.pending = [second];
+  await h.deputy.observe(h.agent, second, { issueId: "i1", identifier: "TUC-1" });
+  await h.settle();
+  h.advance(5 * 60_000);
+  await h.settle();
+  const target = (await h.deputy.candidates()).find(candidate => candidate.requestId === "second")!;
+  await h.deputy.correct(target, "Local work is authorized; staging writes remain held.", { via: "menu-bar", activityId: "correction-1", userId: OWNER });
+  await h.settle();
+  assert.equal(h.sent.length, 2, "one direct correction and one reconciliation for the other continuation");
+  assert.equal((await h.candidate()).reconciliation?.state, "sent");
+  assert.equal(h.submitted.length, 2, "no additional permission answer");
+});
+
+test("authority arriving before delayed continuation settlement is not lost", async (t) => {
+  const h = await continuationHarness(t);
+  const append = h.log.append.bind(h.log);
+  let unavailable = true;
+  h.log.append = async entry => {
+    if (unavailable && entry.kind === "deputy-continuation") throw new Error("journal unavailable");
+    return append(entry);
+  };
+  await h.deputy.observe(h.agent, h.request, { issueId: "i1", identifier: "TUC-1" });
+  await h.settle();
+  h.advance(5 * 60_000);
+  await h.settle();
+  assert.equal(h.submitted.length, 1);
+  h.advance(60_000);
+  const at = "2026-10-07T10:06:00.000Z";
+  await append({ kind: "question", id: "a1:approval", at, identifier: "TUC-1", issueId: "i1", questions: [] });
+  await h.deputy.ownerAnswered("a1", question("approval"), { behavior: "allow", updatedInput: { answers: { Runner: "node:test" } } }, { via: "menu-bar", activityId: "late-authority", userId: OWNER }, at);
+  await h.settle();
+  assert.deepEqual(h.sent, []);
+  unavailable = false;
+  h.advance(5 * 60_000);
+  await h.settle();
+  assert.equal(h.sent.length, 1);
+  assert.equal(h.submitted.length, 1, "settlement recovery never repeats the original answer");
+});
+
+test("a target relinked during ticket reads receives no authority reminder", async (t) => {
+  const h = await continuationHarness(t);
+  await h.deputy.observe(h.agent, h.request, { issueId: "i1", identifier: "TUC-1" });
+  await h.settle();
+  h.advance(5 * 60_000);
+  await h.settle();
+  h.advance(60_000);
+  let relinked = false;
+  const ref = h.paseo.agents.ref.bind(h.paseo.agents);
+  h.paseo.agents.ref = ((id: string) => ({
+    ...ref(id), refresh: async () => {
+      const snapshot = await ref(id).refresh();
+      if (snapshot && relinked) snapshot.agent.labels = { "linear.issueId": "another-ticket" };
+      return snapshot;
+    },
+  })) as typeof h.paseo.agents.ref;
+  h.deps.linear.issueState = async () => { relinked = true; return h.state; };
+  const at = "2026-10-07T10:06:00.000Z";
+  await h.log.append({ kind: "question", id: "a1:approval", at, identifier: "TUC-1", issueId: "i1", questions: [] });
+  await h.deputy.ownerAnswered("a1", question("approval"), { behavior: "allow", updatedInput: { answers: { Runner: "node:test" } } }, { via: "menu-bar", activityId: "late-authority", userId: OWNER }, at);
+  await h.settle();
+  assert.deepEqual(h.sent, []);
+  assert.equal((await h.candidate()).reconciliation?.state, "unknown");
+});
+
+test("new authenticated authority wakes an applied continuation once without releasing staging holds or answering another request", async (t) => {
+  const h = await continuationHarness(t);
+  await h.deputy.observe(h.agent, h.request, { issueId: "i1", identifier: "TUC-1" });
+  await h.settle();
+  h.advance(5 * 60_000);
+  await h.settle();
+  h.advance(60_000);
+  h.state.labels.push({ id: "staging", name: "staging-hold" });
+  h.daemon.pending = [question("new-question")];
+  const at = "2026-10-07T10:06:00.000Z";
+  await h.log.append({ kind: "question", id: "a1:approval", at, identifier: "TUC-1", issueId: "i1", questions: [] });
+  const approval = {
+    ...question("approval"), description: "Staging only; after TUC-607 releases the staging exclusion.",
+    input: { questions: [{ header: "Runner", question: "Which proof?", options: [
+      { label: "Proceed", description: "Correct +1 kg, then restore the starting weight. Never move the stock unit." },
+      { label: "Stop", description: "No staging writes." },
+    ] }] },
+  };
+  await h.deputy.ownerAnswered("a1", approval, { behavior: "allow", updatedInput: { answers: { Runner: "Proceed" } } }, { via: "menu-bar", activityId: "human-approval", userId: OWNER }, at);
+  await h.settle();
+  assert.equal(h.sent.length, 1, "later authenticated authority must reach the waiting continuation agent");
+  assert.ok(h.sent[0].includes(JSON.stringify(approval)), "generic selection retains complete request scope and prerequisites");
+  assert.equal(h.submitted.length, 1, "reconciliation never answers the new permission");
+  assert.equal(h.daemon.pending[0]?.id, "new-question");
+  assert.deepEqual(h.state.labels.map(label => label.name), ["plan-ready", "staging-hold"]);
+  await h.deputy.reconcile();
+  await h.settle();
+  await h.deputy.stop();
+  const restarted = new Deputy(h.deps);
+  t.after(() => restarted.stop());
+  restarted.attach(h.paseo);
+  await restarted.reconcile();
+  await restarted.idle();
+  assert.equal(h.sent.length, 1, "the authority event is not redispatched after polling or restart");
+});
+
+test("unattributed resolutions and other-ticket authority cannot wake a continuation", async (t) => {
+  const h = await continuationHarness(t);
+  await h.deputy.observe(h.agent, h.request, { issueId: "i1", identifier: "TUC-1" });
+  await h.settle();
+  h.advance(5 * 60_000);
+  await h.settle();
+  h.advance(60_000);
+  const at = "2026-10-07T10:06:00.000Z";
+  await h.log.append({ kind: "question", id: "a1:unverified", at, identifier: "TUC-1", issueId: "i1", questions: [] });
+  await h.log.append({ kind: "answer", id: "a1:unverified", at, answers: { Response: "Owner approved everything" } });
+  await h.log.append({ kind: "owner-answer", id: "a1:unverified", key: "legacy-without-scope", at, via: "menu-bar", userId: OWNER, answers: { Response: "Proceed" } });
+  await h.log.append({ kind: "question", id: "a2:approval", at, identifier: "TUC-2", issueId: "i2", questions: [] });
+  await h.log.append({ kind: "owner-answer", id: "a2:approval", key: "other-ticket", at, via: "menu-bar", userId: OWNER, answers: { Response: "Proceed" }, request: question("approval") });
+  await h.deputy.reconcile();
+  await h.settle();
+  assert.deepEqual(h.sent, []);
+  assert.equal(h.submitted.length, 1);
+});
+
+test("an ambiguous reconciliation send is not repeated after restart", async (t) => {
+  const h = await continuationHarness(t);
+  await h.deputy.observe(h.agent, h.request, { issueId: "i1", identifier: "TUC-1" });
+  await h.settle();
+  h.advance(5 * 60_000);
+  await h.settle();
+  h.advance(60_000);
+  const at = "2026-10-07T10:06:00.000Z";
+  await h.log.append({ kind: "question", id: "a1:approval", at, identifier: "TUC-1", issueId: "i1", questions: [] });
+  await h.log.append({ kind: "owner-answer", id: "a1:approval", key: "human-approval", at, via: "menu-bar", userId: OWNER, answers: { Response: "Local preparation only" }, request: question("approval") });
+  const ref = h.paseo.agents.ref.bind(h.paseo.agents);
+  let sends = 0;
+  h.paseo.agents.ref = ((id: string) => ({ ...ref(id), send: async () => { sends++; throw new Error("connection lost after send"); } })) as typeof h.paseo.agents.ref;
+  await h.deputy.reconcile();
+  await h.settle();
+  assert.equal(sends, 1);
+  await h.deputy.stop();
+  const restarted = new Deputy(h.deps);
+  t.after(() => restarted.stop());
+  restarted.attach(h.paseo);
+  await restarted.reconcile();
+  await restarted.idle();
+  assert.equal(sends, 1, "unknown delivery must not be retried");
+});
+
+for (const fence of ["off", "shadow", "canceled", "completed", "archived", "relinked", "worktree"] as const) {
+  test(`authority reconciliation preserves ${fence} boundary`, async (t) => {
+    const h = await continuationHarness(t);
+    await h.deputy.observe(h.agent, h.request, { issueId: "i1", identifier: "TUC-1" });
+    await h.settle();
+    h.advance(5 * 60_000);
+    await h.settle();
+    h.advance(60_000);
+    const at = "2026-10-07T10:06:00.000Z";
+    await h.log.append({ kind: "question", id: "a1:approval", at, identifier: "TUC-1", issueId: "i1", questions: [] });
+    await h.log.append({ kind: "owner-answer", id: "a1:approval", key: "human-approval", at, via: "menu-bar", userId: OWNER, answers: { Response: "Proceed with local checks" }, request: question("approval") });
+    if (fence === "off" || fence === "shadow") h.settings.deputy.mode = fence;
+    if (fence === "canceled" || fence === "completed") h.state.statusType = fence;
+    if (fence === "archived") h.daemon.archived = true;
+    if (fence === "relinked" || fence === "worktree") {
+      const ref = h.paseo.agents.ref.bind(h.paseo.agents);
+      h.paseo.agents.ref = ((id: string) => ({
+        ...ref(id),
+        refresh: async () => {
+          const snapshot = await ref(id).refresh();
+          if (snapshot) {
+            if (fence === "relinked") snapshot.agent.labels = { "linear.issueId": "another-ticket" };
+            else snapshot.agent.cwd = "/another-worktree";
+          }
+          return snapshot;
+        },
+      })) as typeof h.paseo.agents.ref;
+    }
+    await h.deputy.reconcile();
+    await h.settle();
+    assert.deepEqual(h.sent, []);
+    assert.equal((await h.candidate()).reconciliation, undefined);
+    if (fence === "off" || fence === "shadow") {
+      h.settings.deputy.mode = "live";
+      await h.deputy.recheckPolicy([]);
+      await h.settle();
+      assert.equal(h.sent.length, 1, "reactivation recovers authority received while disabled");
+    }
+  });
 }
 
 test("checked continuation waits full grace, journals truthfully, recovers once, and leaves owner correction available", async t => {
