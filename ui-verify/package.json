@@ -1,0 +1,30 @@
+{
+  "name": "paseo-ui-verify",
+  "version": "0.1.0",
+  "description": "Prompts an agent to check changed core-web UI in a browser before its turn ends.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Mtuchel/paseo-plugins.git",
+    "directory": "ui-verify"
+  },
+  "type": "module",
+  "files": [
+    "npm-shrinkwrap.json",
+    "paseo-plugin.json",
+    "index.server.ts",
+    "server/",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test test/*.test.ts"
+  },
+  "devDependencies": {
+    "@getpaseo/plugin": "0.10.3",
+    "@types/node": "^22.0.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.3"
+  }
+}
