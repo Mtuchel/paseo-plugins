@@ -9,6 +9,10 @@ import { checkAssessment, type AskAssessment, type AskContext } from "./owner-as
 
 // Changing the prompt, the checks or the JSON shape makes earlier extractions stale.
 export const EXTRACTION_VERSION = "owner-ask-4-source-currentness";
+// Stored results carry the policy that produced them. A missing marker alone is not stale: only
+// a pre-policy owner/owner-hold result is re-extracted once (owner-asks.ts, "Owner asks" in the
+// README). Bumping EXTRACTION_VERSION would discard every stored extraction instead.
+export const EXTRACTION_POLICY = "owner-hold-deferral-1";
 export const EXTRACTION_THINKING = "low";
 export const MAX_SOURCE_CHARS = 4_000;
 export const MAX_QUESTIONS = 6;
@@ -35,7 +39,7 @@ export const SYSTEM_PROMPT = [
   "- \"info\": nothing the owner can decide or do that answers the ask (a status update, a report to read). `questions` is empty.",
   "Pending advisor reviews and future plan approvals are not current owner decisions. An explicit 'nothing needed from you yet' status is info, unless a separate concrete request/question needs the owner now. Preserve every real current owner question even when advisor/dependency waiting status is present.",
   "Admission is source-specific. Inspect the supplied timeline, not just the ask. A '?' (including a URL), historical relay, plan-ready notice, progress report, recommended option, extraction failure, manual label or ticket status is NOT evidence that the owner currently needs to act.",
-  "Return assessment.state owner only for a positively evidenced CURRENT unresolved human business decision, personal identity step, or explicit owner hold. Cite the exact request plus its human-only boundary/currentness. Do not infer owner work merely from missing technical context or absence of technical keywords. Routine safe technical work belongs the agent; never invent an answer or dispatch it.",
+  "Return assessment.state owner only for a positively evidenced CURRENT unresolved human business decision, personal identity step, or CURRENT owner-only request (for example apply an owner-only label, revoke a credential, or choose whether to lift a hold). An owner deferral or hold the owner already decided, where the source asks nothing of the owner now and waits on a named condition, date, ticket or the owner's own later call, is assessment.state dependency with evidence quoting the hold; it is not owner urgency. Cite the exact request plus its human-only boundary/currentness. Do not infer owner work merely from missing technical context or absence of technical keywords. Routine safe technical work belongs the agent; never invent an answer or dispatch it.",
   "An independently unanswered business question survives unrelated newer progress and needs no live agent or Needs input status. Age alone is never an answer. Reconcile only the exact source: resolved means a cited later source actually answers that question; superseded means a cited later source explicitly replaces/withdraws that request. A newer question does not supersede all older questions. Cite both sides by sourceId and exact quotes and explain the relationship; if uncertain, use review.",
   "Preserve every independent question within the source. If even one human decision remains unanswered, do NOT classify the whole source resolved/superseded. Exact echoes are grouped separately without deleting originals. Do not create blanket business decisions from technical relays.",
   "assessment.state agent means evidenced delegated technical work (not permission to do it); info means an evidenced report/no current ask; advisor/dependency names evidenced non-owner waiting. review means unresolved historical currentness/ownership, NOT completed, approved, delegated or deferred. If timeline.complete is false, do not claim a historical owner request is currently unresolved; use review unless independently current wait evidence is supplied.",

@@ -4963,6 +4963,17 @@ Two calls run at a time. Private `owner-asks/extract/` cache files (`0700` direc
 files) bind source text, current timeline/wait context and `owner-ask-4-source-currentness`;
 old extraction labels cannot silently restore urgency after this policy change.
 
+An owner deferral or hold the owner already decided — waiting on a named condition, date, ticket
+or the owner's own later call — extracts as `assessment.state dependency`, with the hold quoted as
+evidence, and curates with priority `waiting`. `owner` with `ownerBoundary owner-hold` is reserved
+for a current request only the owner can perform or lift now, such as applying an owner-only
+label, revoking a credential or choosing whether to lift the hold. Stored extraction records carry
+the policy marker `owner-hold-deferral-1`. Only a record without that marker whose stored result
+is still `owner`/`owner-hold` is stale: it keeps displaying its old card while one background
+re-extraction replaces it, and the replacement is stored with the marker so it is never re-run.
+Every other stored result, with or without the marker, remains valid; `EXTRACTION_VERSION` and the
+ask hash are unchanged.
+
 Each collection derives revisions and attention from the current source and exact matching
 extraction; there is no separate persistent derived-result cache. Timeline entries are serialized
 once per entry object within that collection, preserving the original JSON bytes and revision

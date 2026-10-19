@@ -8,7 +8,7 @@ import { isSourceReview, type BrowserOwnerAsk } from "../shared/decision-inbox";
 import type { Handover, HandoverRecord } from "./handover";
 import type { LinearService, OwnerAskComment, OwnerAskIssue } from "./linear";
 import type { NeedsYouIssue, NeedsYouIssues } from "./needs-you";
-import { askHash, askHashParts, EXTRACTION_VERSION, MAX_SOURCE_CHARS, type AskQuestion, type ExtractInput, type Extraction, type ExtractedAsk } from "./owner-ask-extract";
+import { askHash, askHashParts, EXTRACTION_POLICY, EXTRACTION_VERSION, MAX_SOURCE_CHARS, type AskQuestion, type ExtractInput, type Extraction, type ExtractedAsk } from "./owner-ask-extract";
 import type { DeliveryOrigin, DeliveryResult } from "./permission-replies";
 import { LIVE_AGENT } from "./process-liveness";
 import { withPriority, type Priority } from "./rate-budget";
@@ -115,9 +115,13 @@ type TriageAskResult = NonNullable<DecisionRecord["result"]>;
 // answered. Independently cited current owner evidence can retain attention, never old dispatch.
 type Draft = { issue: OwnerAskIssue; manual: boolean; text: string; sourceId: string; context: AskContext; needsYou: string | null; tracking: NeedsYouIssue | null; route: OwnerAsk["route"]; agentId: string | null; ticketAgentId: string | null; ticketId: string; ticketIdentifier: string; request: "pending" | "retired" | null;
   textHash: string };
-type ExtractionState = { hash: string; value: ExtractedAsk | null; attempts: number; nextAt: number; running: boolean };
+// `stale`: a stored pre-policy owner/owner-hold result. Its value stays displayed (fail-open)
+// until one re-extraction replaces it; it never suppresses the queued replacement.
+type ExtractionState = { hash: string; value: ExtractedAsk | null; attempts: number; nextAt: number; running: boolean; stale: boolean };
 type ExtractionJob = { issueId: string; hash: string; input: ExtractInput };
-type StoredExtraction = { hash: string; version: string; model: string; result: ExtractedAsk | null; attempts: number; nextAt: string | null; at: string };
+// `policyAttempts`: failed re-extraction attempts of a stale pre-policy result. The original
+// `attempts` count belongs to the extraction that produced the stale result.
+type StoredExtraction = { hash: string; version: string; policy?: string; model: string; result: ExtractedAsk | null; attempts: number; policyAttempts?: number; nextAt: string | null; at: string };
 
 // Discover sources across every status without interpreting punctuation, labels or old wait
 // envelopes as current owner attention. Delivery receipts are timeline evidence, not new asks.
@@ -388,10 +392,10 @@ export class OwnerAsks {
           state = await this.extractionFor(key, hash, stored);
         }
         if (!state) {
-          state = { hash, value: null, attempts: 0, nextAt: 0, running: false };
+          state = { hash, value: null, attempts: 0, nextAt: 0, running: false, stale: false };
           this.extractions.set(key, state);
         }
-        if (!state.value && !state.running && state.attempts < MAX_ATTEMPTS && state.nextAt <= this.now()) {
+        if ((!state.value || state.stale) && !state.running && state.attempts < MAX_ATTEMPTS && state.nextAt <= this.now()) {
           this.enqueue({ issueId: key, hash, input });
         }
         const value = state.value;
@@ -839,7 +843,14 @@ export class OwnerAsks {
     // per source was another 14k filesystem reads on a cold collection (2026-10-16).
     const stored = known === undefined ? await this.readExtraction(issueId) : known;
     if (!stored || stored.hash !== hash || stored.version !== EXTRACTION_VERSION) return undefined;
-    const state: ExtractionState = { hash, value: stored.result, attempts: stored.attempts, nextAt: stored.nextAt ? Date.parse(stored.nextAt) || 0 : 0, running: false };
+    // A marker-only difference is not stale: only a pre-policy owner/owner-hold result is
+    // re-extracted once. Every other stored result stays valid, so EXTRACTION_VERSION and the ask
+    // hash are unchanged and unrelated extractions keep their cache.
+    const stale = stored.policy !== EXTRACTION_POLICY
+      && stored.result?.assessment?.state === "owner" && stored.result.assessment.ownerBoundary === "owner-hold";
+    // A stale result starts its own re-extraction budget: the original extraction may have
+    // succeeded on its last allowed attempt.
+    const state: ExtractionState = { hash, value: stored.result, attempts: stale ? stored.policyAttempts ?? 0 : stored.attempts, nextAt: stored.nextAt ? Date.parse(stored.nextAt) || 0 : 0, running: false, stale };
     this.extractions.set(issueId, state);
     return state;
   }
@@ -866,7 +877,8 @@ export class OwnerAsks {
 
   private async extract(job: ExtractionJob): Promise<void> {
     const state = this.extractions.get(job.issueId);
-    if (!state || state.hash !== job.hash || state.value || state.running) return;
+    // A stale value is displayed but not final: it must not suppress its one replacement.
+    if (!state || state.hash !== job.hash || (state.value && !state.stale) || state.running) return;
     state.running = true;
     const model = await this.deps.resolveModel().catch(() => "");
     const outcome: Extraction = model ? await this.deps.extract(job.input, model).catch((error: unknown) => ({ ok: false as const, reason: error instanceof Error ? error.message : String(error) })) : { ok: false, reason: "no model is configured for the owner asks" };
@@ -880,10 +892,13 @@ export class OwnerAsks {
       console.error(`[linear-tickets] extracting the ask on ${job.input.identifier} failed (attempt ${attempts} of ${MAX_ATTEMPTS}): ${outcome.reason}`);
       if (attempts < MAX_ATTEMPTS) this.retryAfter(RETRY_DELAYS_MS[attempts - 1]);
     }
-    const stored: StoredExtraction = { hash: job.hash, version: EXTRACTION_VERSION, model, result: outcome.ok ? outcome.value : null, attempts, nextAt: state.nextAt ? new Date(state.nextAt).toISOString() : null, at: new Date(this.now()).toISOString() };
+    // A failed attempt keeps the stale card visible. It writes no policy marker, so the record
+    // stays stale across a restart; `policyAttempts` keeps the attempt/backoff cap across restarts.
+    const stored: StoredExtraction = { hash: job.hash, version: EXTRACTION_VERSION, ...(outcome.ok ? { policy: EXTRACTION_POLICY } : {}), model, result: outcome.ok ? outcome.value : state.value, attempts, ...(!outcome.ok && state.stale ? { policyAttempts: attempts } : {}), nextAt: state.nextAt ? new Date(state.nextAt).toISOString() : null, at: new Date(this.now()).toISOString() };
     await this.write(this.extractionPath(job.issueId), JSON.stringify(stored));
     // Publish only durable extraction payloads; the revision seen by the owner survives restart.
     state.value = stored.result;
+    if (outcome.ok) state.stale = false;
   }
 
   private retryAfter(ms: number): void {
