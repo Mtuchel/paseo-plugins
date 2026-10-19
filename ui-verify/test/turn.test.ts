@@ -1,8 +1,17 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  watch,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { test, type TestContext } from "node:test";
 import type { PluginLifecycleEvents } from "@getpaseo/plugin/server";
 import type { TimelineItem } from "../server/decision";
@@ -43,7 +52,11 @@ function agent(root: string): Started["agent"] {
   };
 }
 
-const user = (text: string): TimelineItem => ({ type: "user_message", text });
+const user = (text: string, messageId?: string): TimelineItem => ({
+  type: "user_message",
+  text,
+  ...(messageId ? { messageId } : {}),
+});
 const assistant = (text: string): TimelineItem => ({ type: "assistant_message", text });
 const tool = (name: string): TimelineItem => ({
   type: "tool_call",
@@ -66,6 +79,46 @@ async function deliver(
   await monitor.turnEnded(event, async (agentId, text) => {
     sent.push({ agentId, text });
   });
+}
+
+/** A git shim that delegates everything except `add`, which hangs until the monitor aborts it. */
+function slowGit(t: TestContext): { binary: string; log: string } {
+  const directory = mkdtempSync(join(tmpdir(), "ui-verify-slow-git-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const log = join(directory, "indexes.log");
+  const binary = join(directory, "git");
+  const realGit = execFileSync("which", ["git"], { encoding: "utf8" }).trim();
+  writeFileSync(
+    binary,
+    `#!/bin/sh
+if [ "$1" = "add" ]; then
+  printf '%s\\n' "$GIT_INDEX_FILE" >> "${log}"
+  exec sleep 30
+fi
+exec "${realGit}" "$@"
+`,
+  );
+  chmodSync(binary, 0o755);
+  return { binary, log };
+}
+
+async function waitForFile(path: string): Promise<void> {
+  const { promise, resolve, reject } = Promise.withResolvers<void>();
+  const watcher = watch(dirname(path), (_event, filename) => {
+    if (filename === basename(path) && existsSync(path)) {
+      watcher.close();
+      resolve();
+    }
+  });
+  watcher.on("error", (error) => {
+    watcher.close();
+    reject(error);
+  });
+  if (existsSync(path)) {
+    watcher.close();
+    resolve();
+  }
+  await promise;
 }
 
 test("a UI change without a browser check sends exactly one follow-up", async (t) => {
@@ -203,6 +256,78 @@ test("only the files changed in this turn are named", async (t) => {
   assert.doesNotMatch(sent[1].text, /First\.tsx/);
 });
 
+test("a newer turn drops the previous turn's follow-up", async (t) => {
+  const root = repository(t);
+  const monitor = createTurnMonitor({ log: () => {} });
+  const sent: Array<{ agentId: string; text: string }> = [];
+
+  await monitor.turnStarted({ agent: agent(root), turnId: "turn-1" });
+  writeFileSync(join(root, "apps", "core-web", "src", "Page.tsx"), "export const Page = () => 6;\n");
+
+  const ending = monitor.turnEnded(
+    completedTurn(root, [user("Change the page"), assistant("Done")], "turn-1"),
+    async (agentId, text) => {
+      sent.push({ agentId, text });
+    },
+  );
+  await monitor.turnStarted({ agent: agent(root), turnId: "turn-2" });
+  await ending;
+
+  assert.deepEqual(sent, []);
+});
+
+test("one follow-up covers autonomous continuation turns for the same request", async (t) => {
+  const root = repository(t);
+  const monitor = createTurnMonitor({ log: () => {} });
+  const sent: Array<{ agentId: string; text: string }> = [];
+
+  await monitor.turnStarted({ agent: agent(root), turnId: "turn-1" });
+  writeFileSync(join(root, "apps", "core-web", "src", "Page.tsx"), "export const Page = () => 7;\n");
+  const firstTimeline = [user("Change the page", "message-1"), assistant("Done")];
+  await deliver(monitor, completedTurn(root, firstTimeline, "turn-1"), sent);
+  assert.equal(sent.length, 1);
+
+  await monitor.turnStarted({ agent: agent(root), turnId: "turn-2" });
+  writeFileSync(join(root, "apps", "core-web", "src", "Page.tsx"), "export const Page = () => 8;\n");
+  await deliver(
+    monitor,
+    completedTurn(
+      root,
+      [user("Change the page", "message-1"), assistant("Done"), assistant("Continuing")],
+      "turn-2",
+    ),
+    sent,
+  );
+  assert.equal(sent.length, 1);
+
+  await monitor.turnStarted({ agent: agent(root), turnId: "turn-3" });
+  writeFileSync(join(root, "apps", "core-web", "src", "Page.tsx"), "export const Page = () => 9;\n");
+  await deliver(
+    monitor,
+    completedTurn(root, [user("Change it again", "message-2"), assistant("Done")], "turn-3"),
+    sent,
+  );
+  assert.equal(sent.length, 2);
+});
+
+test("concurrent turn ends for one request deliver one follow-up", async (t) => {
+  const root = repository(t);
+  const monitor = createTurnMonitor({ log: () => {} });
+  const sent: Array<{ agentId: string; text: string }> = [];
+
+  await monitor.turnStarted({ agent: agent(root), turnId: "turn-1" });
+  await monitor.turnStarted({ agent: agent(root), turnId: "turn-2" });
+  writeFileSync(join(root, "apps", "core-web", "src", "Page.tsx"), "export const Page = () => 10;\n");
+  const timeline = [user("Change the page", "message-1"), assistant("Done")];
+
+  await Promise.all([
+    deliver(monitor, completedTurn(root, timeline, "turn-1"), sent),
+    deliver(monitor, completedTurn(root, timeline, "turn-2"), sent),
+  ]);
+
+  assert.equal(sent.length, 1);
+});
+
 test("a failed send is logged and never rejects", async (t) => {
   const root = repository(t);
   const logs: string[] = [];
@@ -241,3 +366,22 @@ test("a turn end without a start does nothing", async (t) => {
 
   assert.deepEqual(sent, []);
 });
+
+test(
+  "close aborts an in-flight snapshot and removes its temp directory",
+  { timeout: 10_000 },
+  async (t) => {
+    const root = repository(t);
+    const slow = slowGit(t);
+    const monitor = createTurnMonitor({ gitBinary: slow.binary, log: () => {} });
+
+    const started = monitor.turnStarted({ agent: agent(root), turnId: "turn-1" });
+    await waitForFile(slow.log);
+    await monitor.close();
+    await started;
+
+    const index = readFileSync(slow.log, "utf8").trim();
+    assert.notEqual(index, "");
+    assert.equal(existsSync(dirname(index)), false);
+  },
+);

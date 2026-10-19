@@ -26,9 +26,14 @@ An agent turn triggers the check only when all of these hold:
 - The turn changed at least one UI source file under `apps/core-web/src/`: `*.tsx` or `*.css`.
 - The change is new in this turn. The plugin snapshots the working tree into a temporary git tree
   object at turn start and again at turn end, so committed changes made during the turn count too.
-- No tool call in the turn used a browser or Playwright: the serialized tool calls must not match
-  `browser_screenshot`, `browser_snapshot`, `browser_navigate`, `browser_take_screenshot`,
-  `playwright test`, `playwright-test`, or `playwright screenshot`.
+- No tool call in the turn used a browser or Playwright. The check looks only at the tool's name
+  and, for shell tools, the executed command. A browser tool name such as `browser_screenshot`,
+  `browser_snapshot`, `browser_navigate`, `browser_take_screenshot` (including provider prefixes
+  such as `mcp__paseo__browser_screenshot` and `paseo.browser_screenshot`) counts. A command that
+  runs `playwright test`, `playwright-test`, or `playwright screenshot` counts, including through
+  `npx`, `pnpm exec`, and similar runners. Tool outputs and file contents are ignored: reading
+  `ui-check.md`, grepping for a command, or writing a file that mentions Playwright is not a
+  browser check.
 
 Test and fixture files do not count: `*.test.tsx`, `*.spec.tsx`, `*.test.css`, `*.spec.css`, files
 under `__tests__/`, and files under `e2e/` are ignored.
@@ -39,14 +44,32 @@ index, so the agent's staged and unstaged changes stay exactly as they were.
 ## Loop guard
 
 Every follow-up starts with `[ui-verify]`. A turn whose triggering user message starts with that
-marker is never nudged again, and only completed turns produce a nudge. So one human request can
-produce at most one ui-verify follow-up, even if the agent edits more UI files while answering it.
+marker is never nudged again, and only completed turns produce a nudge.
+
+The plugin also remembers the identity of the human user message that triggered a follow-up (its
+`messageId` when present, otherwise its position and text) and reserves one follow-up per message
+before sending. Autonomous continuation turns that add no new user message therefore cannot send
+the same reminder again, and two concurrent turn ends for one request send at most one.
+
+## A newer turn
+
+Paseo's send API has no queue or skip-when-busy mode: a prompt sent while a turn is active
+interrupts that turn by default. The only other mode, `steer`, can fall back to replacing the turn
+on providers that do not support steering. The plugin therefore increments a per-agent turn
+generation on every `agent.turn_started` and drops the follow-up if a newer turn has started by the
+time the end-of-turn snapshot and decision finish. The check is best effort for the small window
+between that check and the daemon accepting the send; the plugin never deliberately interrupts a
+newer turn.
 
 ## Failures
 
 Not being in a git repository, a git error, or a failed send is logged with a `[ui-verify]` prefix
 in the plugin logs and skipped. The plugin never throws into the agent lifecycle. If the turn-start
 snapshot fails, that turn gets no follow-up.
+
+On plugin shutdown the monitor aborts any in-flight git command and waits for its temporary index
+directory to be removed before the cleanup resolves. Paseo gives cleanup 2 seconds before it sends
+`SIGTERM`, which is enough for the aborted git process and the directory removal.
 
 ## Install
 
@@ -91,8 +114,9 @@ node ../tools/paseo-build.mjs .
 ```
 
 `server/decision.ts` is the pure decision logic (path filter, browser-check matcher, loop guard,
-message text); `server/git-snapshot.ts` owns the temporary-index git snapshots and is tested against
-real temporary repositories; `server/turn.ts` holds the per-agent baselines and sends the
-follow-up through `paseo.agents.ref(agentId).send(text)`.
+message text); `server/git-snapshot.ts` owns the temporary-index git snapshots, abort signals, and
+is tested against real temporary repositories; `server/turn.ts` holds the per-agent turn
+generations, baselines, per-request reservations, cleanup, and sends the follow-up through
+`paseo.agents.ref(agentId).send(text)`.
 
 Roll out with `node ~/dev/paseo-plugins/tools/plugin-rollout.mjs ~/dev/paseo-plugins/ui-verify`.

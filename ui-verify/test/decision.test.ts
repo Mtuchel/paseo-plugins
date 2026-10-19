@@ -7,30 +7,37 @@ import {
   isUiSourceFile,
   nudgeText,
   triggeringUserMessage,
+  triggeringUserMessageInfo,
   turnItems,
   type TimelineItem,
   type TurnFacts,
   type TurnOutcome,
 } from "../server/decision";
 
+type ToolDetail = Extract<TimelineItem, { type: "tool_call" }>["detail"];
+
 const completed: TurnOutcome = { kind: "completed" };
-const user = (text: string): TimelineItem => ({ type: "user_message", text });
+const user = (text: string, messageId?: string): TimelineItem => ({
+  type: "user_message",
+  text,
+  ...(messageId ? { messageId } : {}),
+});
 const assistant = (text: string): TimelineItem => ({ type: "assistant_message", text });
-const shell = (command: string): TimelineItem => ({
+const shell = (command: string, output = "", name = "shell"): TimelineItem => ({
   type: "tool_call",
   callId: "call-shell",
-  name: "shell",
+  name,
   status: "completed",
   error: null,
-  detail: { type: "shell", command, output: "" },
+  detail: { type: "shell", command, output },
 });
-const tool = (name: string): TimelineItem => ({
+const tool = (name: string, detail?: ToolDetail): TimelineItem => ({
   type: "tool_call",
   callId: "call-tool",
   name,
   status: "completed",
   error: null,
-  detail: { type: "plain_text", text: name },
+  detail: detail ?? { type: "unknown", input: null, output: null },
 });
 
 function turnaround(overrides: Partial<TurnFacts> = {}) {
@@ -69,6 +76,87 @@ test("a playwright run suppresses the follow-up", () => {
     timeline: [user("Build it"), shell("npx playwright test e2e/settings.spec.ts"), assistant("Done")],
   });
   assert.equal(decision.kind, "skip");
+});
+
+test("reading ui-check.md does not count as running its Playwright command", () => {
+  const read = tool("Read", {
+    type: "read",
+    filePath: "apps/core-web/docs/ui-check.md",
+    content: "pnpm exec playwright screenshot --full-page http://localhost:3000/settings /tmp/shot.png",
+  });
+  const decision = turnaround({
+    timeline: [user("Build it"), read, assistant("I read the guide")],
+  });
+  assert.equal(decision.kind, "nudge");
+});
+
+test("a shell output that mentions Playwright does not count as a check", () => {
+  const decision = turnaround({
+    timeline: [
+      user("Build it"),
+      shell("cat apps/core-web/docs/ui-check.md", "pnpm exec playwright screenshot --full-page http://localhost:3000 /tmp/shot.png"),
+      assistant("Done"),
+    ],
+  });
+  assert.equal(decision.kind, "nudge");
+});
+
+test("a grep for the Playwright command does not count as a check", () => {
+  assert.equal(
+    hasBrowserVerification([
+      shell('grep -R "playwright screenshot" apps/core-web/docs'),
+    ]),
+    false,
+  );
+});
+
+test("file edits that contain browser tool names do not count as checks", () => {
+  const write = tool("Write", {
+    type: "write",
+    filePath: "apps/core-web/docs/ui-check.md",
+    content: "Call browser_screenshot after browser_navigate.",
+  });
+  assert.equal(hasBrowserVerification([write]), false);
+});
+
+test("real provider tool-call shapes for browser checks are recognized", () => {
+  const details: ToolDetail = { type: "unknown", input: { browserId: "browser-1" }, output: null };
+  assert.equal(hasBrowserVerification([tool("mcp__paseo__browser_screenshot", details)]), true);
+  assert.equal(hasBrowserVerification([tool("paseo.browser_snapshot", details)]), true);
+  assert.equal(hasBrowserVerification([tool("browser_screenshot", details)]), true);
+  assert.equal(
+    hasBrowserVerification([
+      shell(
+        "pnpm exec playwright screenshot --full-page http://localhost:3000/settings /tmp/settings.png",
+        "",
+        "Bash",
+      ),
+    ]),
+    true,
+  );
+  assert.equal(
+    hasBrowserVerification([shell("pnpm exec playwright test e2e/settings.spec.ts", "", "bash")]),
+    true,
+  );
+});
+
+test("a Playwright run on a later line of a multi-line shell command counts", () => {
+  assert.equal(
+    hasBrowserVerification([shell("cd apps/core-web\npnpm exec playwright test e2e/settings.spec.ts", "", "bash")]),
+    true,
+  );
+});
+
+test("the triggering user message exposes a stable identity", () => {
+  const withId = triggeringUserMessageInfo([
+    user("first"),
+    assistant("earlier"),
+    user("second", "message-2"),
+  ]);
+  assert.deepEqual(withId, { text: "second", key: "id:message-2" });
+
+  const fallback = triggeringUserMessageInfo([user("only"), assistant("done")]);
+  assert.deepEqual(fallback, { text: "only", key: "at:0:only" });
 });
 
 test("a browser check from an earlier turn does not suppress this turn", () => {

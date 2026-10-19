@@ -77,5 +77,5 @@ test("the server entry registers both turn hooks and sends through paseo.agents.
   assert.equal(sent.length, 1);
   assert.equal(sent[0].agentId, "agent-1");
   assert.ok(sent[0].text.startsWith("[ui-verify]"));
-  cleanup();
+  await cleanup();
 });

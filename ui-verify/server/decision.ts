@@ -10,9 +10,15 @@ export const NUDGE_PREFIX = "[ui-verify]";
 /** UI source files this plugin watches, relative to the repository root. */
 const UI_SOURCE = /^apps\/core-web\/src\/.+\.(?:tsx|css)$/;
 
-/** A browser check or a Playwright run, matched against the turn's serialized tool calls. */
-const BROWSER_VERIFICATION =
-  /browser_(screenshot|snapshot|navigate|take_screenshot)|playwright test|playwright-test|playwright screenshot/;
+/** A browser tool, matched against the tool call's name only. */
+const BROWSER_TOOL = /browser_(?:screenshot|snapshot|navigate|take_screenshot)\b/;
+
+/**
+ * A Playwright run, matched only where it is executed in a shell command. The command position
+ * check keeps a `grep` or a `Read` that merely mentions Playwright from counting as a check.
+ */
+const PLAYWRIGHT_RUN =
+  /(?:^|[;&|]\s*|\bthen\s+)\s*(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*(?:(?:pnpm|npm|yarn|bun|npx|pnpx)\s+(?:exec\s+|dlx\s+)?|exec\s+)?(?:\S*\/)?(?:playwright-test\b|playwright\s+(?:test|screenshot)\b)/m;
 
 /** How many changed files the follow-up names before it summarizes the rest. */
 export const FILE_LIMIT = 10;
@@ -45,13 +51,31 @@ export function changedUiFiles(paths: readonly string[]): string[] {
   return [...files];
 }
 
+export interface TriggeringUserMessage {
+  text: string;
+  /**
+   * Identity of the human request, stable across autonomous continuation turns that add no new
+   * user message. Null when the timeline has no user message at all.
+   */
+  key: string | null;
+}
+
 /** The last user message in the timeline is the one that started this turn. */
-export function triggeringUserMessage(timeline: Timeline): string {
+export function triggeringUserMessageInfo(timeline: Timeline): TriggeringUserMessage {
   for (let index = timeline.length - 1; index >= 0; index -= 1) {
     const item = timeline[index];
-    if (item.type === "user_message") return item.text;
+    if (item.type !== "user_message") continue;
+    const id = item.messageId ?? item.clientMessageId;
+    return {
+      text: item.text,
+      key: id && id.trim().length > 0 ? `id:${id}` : `at:${index}:${item.text}`,
+    };
   }
-  return "";
+  return { text: "", key: null };
+}
+
+export function triggeringUserMessage(timeline: Timeline): string {
+  return triggeringUserMessageInfo(timeline).text;
 }
 
 /**
@@ -67,17 +91,20 @@ export function turnItems(timeline: Timeline): TimelineItem[] {
 }
 
 /**
- * Whether the turn's tool calls show a browser check. Tool calls are serialized as JSON so a
- * command, tool name, or argument anywhere in them counts, whichever provider produced them.
+ * Whether the turn's tool calls show a browser check. Only the tool name and, for shell calls,
+ * the executed command are inspected: outputs and file contents must not count. Claude, Codex,
+ * and OMP all normalize shell calls to a `shell` detail with a string `command`.
  */
 export function hasBrowserVerification(items: readonly TimelineItem[]): boolean {
-  const toolCalls = items.filter((item) => item.type === "tool_call");
-  if (toolCalls.length === 0) return false;
-  try {
-    return BROWSER_VERIFICATION.test(JSON.stringify(toolCalls));
-  } catch {
-    return false;
+  for (const item of items) {
+    if (item.type !== "tool_call") continue;
+    if (BROWSER_TOOL.test(item.name)) return true;
+    const detail = item.detail;
+    if (detail?.type === "shell" && typeof detail.command === "string") {
+      if (PLAYWRIGHT_RUN.test(detail.command)) return true;
+    }
   }
+  return false;
 }
 
 export function nudgeText(files: readonly string[]): string {
