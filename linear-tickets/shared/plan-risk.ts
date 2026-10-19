@@ -46,7 +46,7 @@ export function riskSteps(): string {
     "- Processes: <the business processes and steps affected, e.g. order → delivery note>",
     "- Impact: <0-4> — <why>",
     "- Reversibility: <revert | data-fix | irreversible> — <why>",
-    "- Feature flag: <yes | no> — <which flag keeps the change off until it is switched on>",
+    "- Feature flag: <yes | no> — <existing/planned admin control and rollback, staging default, and any justified activation restriction; no when none is needed>",
     "- Migration: <yes | no>",
     "- Auth: <yes | no> (authentication, authorization or permissions)",
     "- New rule: <yes | no> — <the rule this plan sets for future work (as in `## Principles and rules`), or why it sets none>",
@@ -57,7 +57,7 @@ export function riskSteps(): string {
     ...IMPACT_LEVELS.map((text, level) => `${level} — ${text}`),
     "Reversibility:",
     ...REVERSIBILITY.map((value) => `${value} — ${REVERSIBILITY_TEXT[value]}`),
-    "Rate the worst plausible outcome of the change, not its size. When unsure between two levels, take the higher.",
+    "Rate the enabled workflow's worst plausible impact, not the change's size or its temporary disabled state. When unsure between two levels, take the higher. Keep admin controls and rollback without making universal off the default; justify any activation restriction under the scope and staging delivery rule. Do not add a flag merely to qualify for auto-approval.",
   ].join("\n");
 }
 

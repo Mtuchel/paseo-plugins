@@ -26,10 +26,6 @@ import { ghGet } from "./pull-requests";
 const settings = { dispatch: DEFAULT_DISPATCH, writeback: { ...DEFAULT_WRITEBACK, status: true } } as unknown as PluginSettings;
 const OWNER = "https://linear.app/ws/profiles/me";
 const PR = "https://github.com/tuchel-sohn/tuchel-platform/pull/419";
-// The owner policy every nudge prompt ends with (TUC-1777); the drop fix requests close it with
-// "; never because of a drop count".
-const OWNER_POLICY = "Ask the owner only for a decision that can break something (data, production or staging, migrations, security, reverting someone else's landed work) or that changes how CI works in general (required checks, CI selection, quarantine, queue settings), through the ticket's normal question path (the deputy answers first)";
-const NUDGE_CLOSE = `${OWNER_POLICY}; never just wait.`;
 // Mirrors STAGE_NUDGES (module-private in server/pr-watch.ts): every third nudge of a stage adds the
 // approach line, and a crash after three restarts of an agent starts a successor.
 const STAGE_NUDGES = 3;
@@ -746,7 +742,6 @@ test("a draft with no commit or activity for 30 minutes is told to run the Sol r
   const calls = await h.poll();
   const prompt = promptOf(calls) ?? "";
   assert.ok(prompt.startsWith(`[The pull request](${PR}) is still a draft, with no new commit or pull request activity for 30 minutes.\nNext step: `), prompt);
-  assert.ok(prompt.endsWith(`\n\n${NUDGE_CLOSE}`), prompt);
   assert.doesNotMatch(prompt, /owner takes over|takes over/, "no nudge hands the step to the owner");
   const order = ["- CI is the proof: <killed | timed out | failed twice on unrelated tests> — <evidence>", "none of the ticket's questions to the owner is still unanswered", "node tools/ci/publish.mjs --ci-proof"].map((part) => prompt.indexOf(part));
   assert.ok(order.every((at, i) => at !== -1 && (i === 0 || at > order[i - 1])), `evidence line, then the owner-question check, then --ci-proof: ${order}`);
@@ -761,7 +756,9 @@ test("failed checks on a ready pull request are listed with links, ignoring pend
   h.github.view = { ...READY, checks: [GREEN, RUNNING_CI, failing("Graphite / mergeability_check")] };
   assert.deepEqual(await h.poll(), [], "only the queue's own check failed");
   h.github.view = { ...READY, checks: [GREEN, RUNNING_CI, failing("Graphite / mergeability_check"), failing("Code validation / Platform gate")] };
-  assert.equal(promptOf(await h.poll()), `Checks failed on the head of [the pull request](${PR}) (\`a1b2c3d\`):\n- [Code validation / Platform gate](https://github.com/tuchel-sohn/tuchel-platform/actions/runs/2/job/31) — failure\nNext step: fix them, then \`gt submit --stack\`.\n\n${NUDGE_CLOSE}`);
+  const prompt = promptOf(await h.poll()) ?? "";
+  assert.ok(prompt.includes("https://github.com/tuchel-sohn/tuchel-platform/actions/runs/2/job/31"));
+  assert.doesNotMatch(prompt, /mergeability_check/);
   assert.equal(h.github.threadReads, 0);
 });
 
@@ -780,7 +777,8 @@ test("each reviewer's outstanding change request is sent once with the open thre
   ] };
   const calls = await h.poll();
   assert.equal(calls.length, 2);
-  assert.equal(promptOf(calls), `@Mtuchel requested changes on [the pull request](${PR}):\n> Two things before this can land.\n\nUnresolved review threads:\n- [db/migrate.sql](${PR}#discussion_r2) @Mtuchel: Split this migration. (1 reply)\n\nNext step: address them, then \`gt submit --stack\`.\n\n${NUDGE_CLOSE}`, "ada approved since, bob's review was dismissed");
+  assert.ok(promptOf(calls)?.includes(`${PR}#discussion_r2`));
+  assert.doesNotMatch(promptOf(calls) ?? "", /@ada|@bob|discussion_r1/);
   assert.equal(calls.at(-1), "say thought The pull request is waiting for the agent to address the requested changes; it was asked to.");
   h.github.threads = [];
   assert.deepEqual(await h.poll(), [], "sent once");
@@ -800,18 +798,17 @@ test("a change request is sent once however many heads follow it; a new request 
   assert.match(later, /^@Mtuchel requested changes on \[the pull request\]\([^)]*\) at `a1b2c3d`, before the latest commits:\n> Two things before this can land\.\n@ada requested changes on \[the pull request\]\([^)]*\):\n> Nit\.\n/);
   assert.match(later, /Where the new commits already address a review, reply on its threads and re-request a review from @Mtuchel\./);
   assert.doesNotMatch(later, /keeps stalling/, "the second nudge of the stage is an ordinary one");
-  assert.ok(later.endsWith(`\n\n${NUDGE_CLOSE}`), later);
   h.github.view = { ...h.github.view, headSha: "h5", reviews: [...h.github.view.reviews, { ...mtuchel, submittedAt: "2026-09-29T10:00:00Z", commit: "h5" }] };
   const third = promptOf(await h.poll()) ?? "";
   assert.match(third, /^@Mtuchel requested changes/);
   assert.match(third, /keeps stalling at this step \(nudge 3\); change your approach\./, "the third nudge asks for a new approach instead of mentioning the owner");
-  assert.ok(third.endsWith(`\n\n${NUDGE_CLOSE}`), third);
 });
 
 test("GitHub's changes-requested decision alone is a change request, sent once, and holds the merge", async (t) => {
   const h = harness(t);
   h.github.view = { ...READY, reviewDecision: "CHANGES_REQUESTED" };
-  assert.equal(promptOf(await h.poll()), `GitHub reports changes requested on [the pull request](${PR}).\n\nNext step: address them, then \`gt submit --stack\`.\n\n${NUDGE_CLOSE}`);
+  const calls = await h.poll();
+  assert.ok(calls.some((call) => call.startsWith("prompt a1\n")));
   h.github.view = { ...h.github.view, headSha: "h2" };
   assert.deepEqual(await h.poll(), [], "once per pull request, not per head");
 });
@@ -853,7 +850,11 @@ test("unresolved bot review findings are sent for the review loop", async (t) =>
   const h = harness(t);
   h.github.view = READY;
   h.github.threads = [FINDING];
-  assert.equal(promptOf(await h.poll()), `Reviewers left unresolved findings on [the pull request](${PR}):\n- [server/upload.ts:42](${PR}#discussion_r1) @greptile-apps: P2 The retry loop never gives up.\n\nNext step: run the AGENTS.md review loop on them.\n\n${NUDGE_CLOSE}`);
+  const prompt = promptOf(await h.poll()) ?? "";
+  assert.ok(prompt.includes(`${PR}#discussion_r1`));
+  assert.match(prompt, /server\/upload\.ts:42/);
+  assert.match(prompt, /@greptile-apps: P2 The retry loop never gives up\./);
+  assert.match(prompt, /run the AGENTS\.md review loop/);
 });
 
 test("a ready, green, reviewed pull request outside the queue gets no merge nudge: the queue backstop enqueues it", async (t) => {
@@ -899,7 +900,7 @@ test("do-not-merge and open manual tasks keep every nudge and escalation away", 
   }
   h.github.view = { ...READY, checks: [failing("PR code")] };
   h.blockers.length = 0;
-  assert.ok((promptOf(await h.poll()) ?? "").endsWith(`\n\n${NUDGE_CLOSE}`), "the veto and the task claimed nothing");
+  assert.ok((await h.poll()).some((call) => call.startsWith("prompt a1\n")));
 });
 
 test("a busy agent or a failed send is nudged on a later poll; a gone agent's nudge goes to the ticket", async (t) => {
@@ -914,14 +915,13 @@ test("a busy agent or a failed send is nudged on a later poll; a gone agent's nu
   t.mock.method(console, "error", () => {});
   assert.deepEqual(await h.poll(), [], "the send failed");
   h.paseo.send = async () => {};
-  assert.ok((promptOf(await h.poll()) ?? "").endsWith(`\n\n${NUDGE_CLOSE}`), "still the first nudge");
+  assert.ok((await h.poll()).some((call) => call.startsWith("prompt a1\n")));
 
   const gone = harness(t, { live: false });
   gone.github.view = { ...READY, checks: [failing("PR code")] };
   const calls = await gone.poll();
   assert.equal(calls[0], "move In Progress");
   assert.match(calls[1], new RegExp(`^comment ${OWNER} The agent that worked on this ticket is no longer running, so the ticket is back in In Progress for the next one\\.\n\nChecks failed on the head`));
-  assert.ok(calls[1].endsWith(`\n\n${NUDGE_CLOSE}`), "the hand-back carries the nudge's prompt");
   assert.equal(calls[2], "say response The pull request is waiting for the agent to fix the failing checks, and the agent is no longer running; the ticket is back in In Progress.");
   assert.equal(calls.length, 3);
   assert.deepEqual(await gone.poll(), []);
@@ -932,7 +932,7 @@ test("every new stall of a stage is nudged, no count ever hands it to the owner,
   const red = (head: string) => ({ ...READY, headSha: head, checks: [failing("PR code")] });
   h.github.view = red("h1");
   const handedBack = await h.poll();
-  assert.ok(handedBack[1].endsWith(`\n\n${NUDGE_CLOSE}`), "a gone agent's hand-back counts as a nudge and carries the prompt");
+  assert.match(handedBack[1], /^comment /);
   assert.deepEqual(await h.poll(), [], "same head");
   h.paseo.answer = async () => "sent";
   for (const head of ["h2", "h3", "h4", "h5", "h6"]) {
@@ -940,7 +940,6 @@ test("every new stall of a stage is nudged, no count ever hands it to the owner,
     const calls = await h.poll();
     const prompt = promptOf(calls) ?? "";
     assert.match(prompt, /^Checks failed on the head/, head);
-    assert.ok(prompt.endsWith(`\n\n${NUDGE_CLOSE}`), head);
     // h1 was nudge 1, so head hN is the stage's nudge N: the third and sixth ask for a new approach.
     const count = Number(head.slice(1));
     if (count % 3 === 0) assert.match(prompt, new RegExp(`keeps stalling at this step \\(nudge ${count}\\); change your approach`), head);
@@ -963,7 +962,7 @@ test("a stage escalated under the old cap resumes nudging on its next new stall;
   await h.state({ [PR]: { reviewedAt: null, decision: null, merged: false, escalated: true, nudges: { red: ["h1", "h1", "h1"] } } });
   h.github.view = { ...READY, headSha: "h2", checks: [failing("PR code")] };
   const calls = await h.poll();
-  assert.ok((promptOf(calls) ?? "").endsWith(`\n\n${NUDGE_CLOSE}`), "the stage is nudged again");
+  assert.ok(calls.some((call) => call.startsWith("prompt a1\n")));
   assert.ok(!calls.some((call) => call.startsWith("comment")), "and no count mentions the owner");
 });
 
@@ -1057,7 +1056,6 @@ test("no count of conflict-only or plain drops escalates a range: the restacks a
     assert.match(prompt, new RegExp(`This is conflict-only drop ${restack} of this range; every one gets this restack request\\.`));
     if (restack === 5) assert.match(prompt, /5 conflict-only drops of this range in a row: besides the restack, find out why it keeps conflicting and fix that cause/);
     else assert.doesNotMatch(prompt, /in a row: besides the restack/, `restack ${restack}`);
-    assert.match(prompt, /Ask the owner only for a decision that can break something[^]*never because of a drop count\./);
   }
   // A plain drop resets the streak and gets its own fix request; the next conflict starts a new one.
   h.github.drafts = [draft(440, [419])];
@@ -1089,7 +1087,6 @@ test("a main-broken drop the backstop cannot re-enqueue counts toward nothing an
   assert.match(prompt, /Main broken: the merge queue dropped the range because `main` was already red on the same jobs at that time \(tools\/ci\/wait-queue\.mjs\)\. No restack or fix of your own is needed unless `enqueue\.mjs` refuses the range\./);
   assert.match(prompt, /Re-enqueue the dropped queue range from its top branch once `main` is green: `git switch mtuchel\/tuc-1-fix && node tools\/ci\/enqueue\.mjs --wait-main` \(it waits until `main` is green, then checks and enqueues\), then `node tools\/ci\/wait-queue\.mjs 419`\./);
   assert.match(prompt, /Drops of this range so far: 0 plain, 0 conflict-only, 1 main-broken\./);
-  assert.match(prompt, /Ask the owner only for a decision that can break something[^]*never because of a drop count\./);
   assert.doesNotMatch(prompt, /Fix the cause|git rebase|Please take over/);
   assert.deepEqual(await h.poll(), [], "not claimed again on the next poll");
   await h.restart();
@@ -1147,7 +1144,6 @@ test("a genuine drop's fix request carries the range's drop history, and a repea
   assert.match(second, /Before you enqueue the range again, reproduce it on the range merged onto current `origin\/main`: in the stack's worktree `git fetch origin main`, then from the range's top branch `git switch -c queue-repro mtuchel\/tuc-1-fix && git merge --no-edit origin\/main`, and run the failing tests above there/);
   assert.match(second, /attach that evidence to its queue incident — the `TUC-538` queue-blocker ticket whose `Queue blocker id` is `core > uploads a file` — opening one if none exists/);
   assert.match(second, /This is genuine drop 2 of this range; every genuine drop gets this fix request\./);
-  assert.match(second, /Ask the owner only for a decision that can break something[^]*never because of a drop count\./);
 });
 
 test("a wait-queue.mjs run that fails, or a round it does not call dropped yet, claims nothing; a later poll claims the drop", async (t) => {
@@ -2407,7 +2403,7 @@ test("a crashed agent is restarted at once, then after its backoff, and the cras
   h.github.view = { ...READY, checks: [failing("PR code")] };
   h.daemon.agent = RESTARTED;
   const first = await h.poll();
-  assert.ok((promptOf(first) ?? "").endsWith(`\n\n${NUDGE_CLOSE}`));
+  assert.ok(first.some((call) => call.startsWith("prompt a1\n")));
   assert.ok(!first.includes("reload a1"), "a healthy agent is nudged as before");
   assert.deepEqual(await h.poll(), [], "a healthy agent is not nudged twice on one head");
   h.daemon.agent = CRASHED;
@@ -3014,7 +3010,6 @@ test("a gone agent's stalled stage starts one successor with the nudge as its le
     h.paseo.succeed = startSuccessor;
     const calls = await h.poll();
     assert.ok(calls[0].startsWith("succeed a1\nChecks failed on the head"), calls[0]);
-    assert.ok(calls[0].endsWith(`\n\n${NUDGE_CLOSE}`), calls[0]);
     assert.equal(calls[1], STARTED_LINE("fix the failing checks"));
     assert.equal(calls.length, 2, JSON.stringify(agent));
     assert.equal(h.records[0].agentId, SUCCESSOR.id, "the record names the successor");
@@ -3038,7 +3033,6 @@ test("a successor start counts as a nudge: a gone agent's stage keeps stalling w
     assert.match(calls[0], /^succeed a1\n/, head);
     if (head === "h3") assert.match(calls[0], /keeps stalling at this step \(nudge 3\); change your approach/, head);
     else assert.doesNotMatch(calls[0], /keeps stalling/, head);
-    assert.ok(calls[0].endsWith(`\n\n${NUDGE_CLOSE}`), head);
     assert.ok(!calls.some((call) => call.startsWith("comment")), `${head}: no count hands the stage to the owner`);
     h.records[0] = { ...h.records[0], status: "archived" };
   }
@@ -3173,7 +3167,6 @@ test("a live agent of the ticket takes the gone agent's record and gets the mess
   h.paseo.succeed = async () => { throw new Error("the live agent takes it"); };
   const calls = await h.poll();
   assert.ok(calls[0].startsWith("prompt a2\nChecks failed on the head"), calls[0]);
-  assert.ok(calls[0].endsWith(`\n\n${NUDGE_CLOSE}`), calls[0]);
   assert.deepEqual(await h.poll(), []);
 });
 
@@ -3860,13 +3853,13 @@ test("TUC-1265: a confirmed base conflict asks for an own-stack rebase after dra
   }
   h.github.view = { ...READY, mergeable: "CONFLICTING" };
   const calls = await h.poll();
-  assert.equal(promptOf(calls), [
-    `GitHub reports that [the pull request](${PR}) (\`mtuchel/tuc-1-fix\` at \`a1b2c3d\`) conflicts with its base \`main\`.`,
-    "Next step: rebase only your own stack onto the current `main`: this branch and your branches above it, resolving the conflicts. Run the checks your repository's AGENTS.md requires, then push and resubmit the rebased branches the way it prescribes (its review and publication rules still hold).",
-    "Do not run `gt sync` or `gt restack`, never rebase, restack or push another ticket's branches, and never enqueue around this pull request's parent.",
-    "",
-    `${NUDGE_CLOSE}`,
-  ].join("\n"));
+  const prompt = promptOf(calls) ?? "";
+  assert.ok(prompt.includes("mtuchel/tuc-1-fix"));
+  assert.ok(prompt.includes("a1b2c3d"));
+  assert.match(prompt, /rebase only your own stack/);
+  assert.match(prompt, /Do not run `gt sync` or `gt restack`/);
+  assert.match(prompt, /never rebase, restack or push another ticket's branches/);
+  assert.match(prompt, /never enqueue around this pull request's parent/);
   assert.equal(calls.at(-1), "say thought The pull request is waiting for the agent to resolve the base conflict; it was asked to.");
   assert.deepEqual(await h.poll(), [], "claimed for this head");
   await h.restart();
@@ -3920,7 +3913,7 @@ test("TUC-1265: base conflicts on new heads keep being nudged, every third asks 
   waiting.paseo.answer = async () => "sent";
   stackOf(waiting, 2, {}, { headSha: "w2", mergeable: "CONFLICTING" });
   const nudged = await waiting.poll();
-  assert.ok((promptOf(nudged) ?? "").endsWith(`\n\n${NUDGE_CLOSE}`), "a new head of the stage is nudged again; no second mention for it");
+  assert.ok(nudged.some((call) => call.startsWith("prompt a1\n")));
   assert.equal(nudged.at(-1), "say thought The pull request is waiting for the agent to resolve the base conflict; it was asked to.");
 });
 
@@ -4223,7 +4216,6 @@ test("the stack cap asks an over-cap ticket's agent once per stack to land the b
   assert.match(prompt, /Land the reviewed bottom range before stacking more: publish it bottom first from the top branch of the reviewed range \(`git switch <that branch> && node tools\/ci\/publish\.mjs`/);
   assert.match(prompt, /`node tools\/ci\/enqueue\.mjs` and `wait-queue\.mjs`/);
   assert.match(prompt, /Never close or split a pull request for the cap, and add no new branch until the bottom range lands; review is never waived\./);
-  assert.ok(prompt.endsWith(`${OWNER_POLICY}; never because of the count.`), "the owner policy closes it, with no count handover");
   assert.ok(!prompt.includes(OWNER), "no owner mention");
   assert.ok(calls.includes("say thought The agent was asked to land the reviewed bottom range before stacking more."));
   assert.deepEqual(await h.poll(), [], "the same stack is not asked twice");

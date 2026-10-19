@@ -11,9 +11,9 @@ import { field, type Impact } from "./plan-risk";
 
 export const REACH_SECTION = "Reach";
 export const PRINCIPLES_SECTION = "Principles and rules";
-// A plan files at most this many follow-ups (in Backlog, when the plan is approved); everything
-// past it becomes an `include` or an `n/a — minor`. The filer enforces it too, on the plans the
-// gate never saw, and records the items it stopped as `over-cap` (server/plan-follow-ups.ts).
+// A plan files at most this many follow-ups (in Backlog, when the plan is approved).
+// The cap never expands scope: outside-scope overflow stays explicit as observations, not minor
+// by fiat. The filer records stopped items as `over-cap` (server/plan-follow-ups.ts).
 export const MAX_PLAN_FOLLOW_UPS = 3;
 // Every place a change can reach; the planner goes through each.
 export const REACH_DIMENSIONS = [
@@ -42,6 +42,7 @@ export type PlanSections = {
 // The sections the planner writes, word for word in the prompt so the parser below can read them.
 export function sectionSteps(): string {
   return [
+    "In the existing Approach, concisely state the requested outcome, necessary integration adaptations, first complete usable staging workflow, remaining agreed scope and concrete blockers. Distinguish implementation prerequisites, activation restrictions and nonblocking follow-up verification; explain each blocker's failure, narrow affected action, release evidence and why proof cannot accompany use. This is ordinary plan prose, not new required fields or a new approval stage.",
     `Before \`## Risk and impact\`, the plan carries two sections in exactly this format, one line per item:`,
     `\`## ${REACH_SECTION}\`: everywhere else the thing this ticket changes is used.`,
     "- Changes: <the concept the ticket changes, not the page it names>",
@@ -49,7 +50,7 @@ export function sectionSteps(): string {
     "- <place>: follow-up — <title of the follow-up ticket>",
     "- <place>: existing — <TICKET-ID> [note]",
     "- <place>: n/a — <reason | minor: <what>>",
-    `Go through every dimension: ${REACH_DIMENSIONS.join("; ")}. Every \`include\` names its own acceptance criterion (AC-N, defined in the plan's verification) that proves that place; no two places share one. Repository records that describe the change (principles and decisions, glossary, process map, runbooks, env examples) are not places: they ship in the pull request of the code they describe, under its acceptance criterion, and are an \`include\` with their own only when no code changes (e.g. an owner decision). A \`follow-up\` is only for a substantial finding outside this ticket — a defect, a data, security or money risk, or a missing guarantee a user or another system relies on — and becomes a ticket in Backlog, with that title and related to this ticket, when the plan is approved: search Linear's open tickets (\`search_issues\`) before writing one, and keep at most ${MAX_PLAN_FOLLOW_UPS} per plan. Small work on code this ticket already touches is an \`include\` (fixed now); polish, docs, naming, refactors, ideas and "could consider" are \`n/a — minor: <what>\`, never a ticket. \`existing — <TICKET-ID>\` says an open ticket already covers the place: nothing is filed, and a \`follow-up\` whose title only points at that ticket is refused. When the right behaviour for a role is a business choice that no approved principle covers, ask the owner instead of guessing.`,
+    `Go through every dimension: ${REACH_DIMENSIONS.join("; ")}. Every \`include\` names its own acceptance criterion (AC-N, defined in the plan's verification) that proves that place; no two places share one. Repository records that describe the change (principles and decisions, glossary, process map, runbooks, env examples) are not places: they ship in the pull request of the code they describe, under its acceptance criterion, and are an \`include\` with their own only when no code changes (e.g. an owner decision). A \`follow-up\` is only for a substantial finding outside this ticket — a defect, a data, security or money risk, or a missing guarantee a user or another system relies on — and becomes a ticket in Backlog, with that title and related to this ticket, when the plan is approved: search Linear's open tickets (\`search_issues\`) before writing one, and keep at most ${MAX_PLAN_FOLLOW_UPS} per plan. Necessary behavior-preserving corrections within authorized scope are an \`include\`; being small or touching the same code does not make an optional extension in scope. Optional improvements do not block delivery. Use \`n/a — outside scope: <reason; observation>\` for optional overflow; use \`n/a — minor: <what>\` for minor polish, docs, naming, refactors, ideas and "could consider", not a ticket. Retain substantial risks explicitly as observations when the filing cap prevents another follow-up: do not hide them, call them minor or force them into \`include\`. \`existing — <TICKET-ID>\` says an open ticket already covers the place: nothing is filed, and a \`follow-up\` whose title only points at that ticket is refused. When the right behaviour for a role is a business choice that no approved principle covers, ask the owner instead of guessing.`,
     `\`## ${PRINCIPLES_SECTION}\`: which approved rules apply, and whether this change sets a new one.`,
     "- Applies: <IDs of the approved principles and ADRs that apply | none apply — reason>",
     "- Exceptions: <none | ID — why this change needs one>",
@@ -197,7 +198,7 @@ export function parsePlanSections(plan: string, impact: Impact | null): { sectio
     if (place.kind === "existing" && !ticketRefs(place.rest).length) problems.push(`"${place.place}" is existing without a ticket identifier; write "- ${place.place}: existing — <TICKET-ID>".`);
   }
   const followUps = [...places, ...decisions(principles!.text)].filter((place) => place.kind === "follow-up");
-  if (followUps.length > MAX_PLAN_FOLLOW_UPS) problems.push(`The plan has ${followUps.length} follow-ups; a plan files at most ${MAX_PLAN_FOLLOW_UPS}. Keep the ${MAX_PLAN_FOLLOW_UPS} that matter most and turn the rest into "include" (fixed now) or "n/a — minor: <what>".`);
+  if (followUps.length > MAX_PLAN_FOLLOW_UPS) problems.push(`The plan has ${followUps.length} follow-ups; a plan files at most ${MAX_PLAN_FOLLOW_UPS}. Keep the ${MAX_PLAN_FOLLOW_UPS} that matter most. Use "include" only for necessary corrections within authorized scope; optional overflow may be "n/a — outside scope: <reason; observation>". Retain real risks explicitly as observations, not "minor", and do not expand scope to satisfy the cap.`);
   for (const place of followUps) {
     const title = cleanTitle(place.rest);
     const covered = title ? coveredFollowUp(title) : null;
