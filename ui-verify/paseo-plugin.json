@@ -1,0 +1,6 @@
+{
+  "id": "ui-verify",
+  "description": "Asks an agent to check changed core-web UI in a browser before finishing a turn.",
+  "requirements": { "paseo": ">=0.10.3" },
+  "build": [["npm", "ci", "--include=dev"]]
+}
