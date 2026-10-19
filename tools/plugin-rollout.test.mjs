@@ -8,9 +8,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn, execFileSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 import { classify, decide, resolvePending, settled } from "./plugin-rollout.mjs";
@@ -137,7 +137,10 @@ function writePlugin(root, id, extra = {}) {
   writeFileSync(join(root, id, "index.server.ts"), "export default {};\n");
 }
 
-function setup(t) {
+// `daemonCli: true` models a host whose daemon runs its own Paseo install (the `paseo` on PATH
+// is another one: a Paseo.app launcher, a mise CLI of another version): the install the daemon's
+// command line names sits in the process table, and a decoy `paseo` on PATH records being run.
+function setup(t, { daemonCli = false } = {}) {
   const root = mkdtempSync(join(tmpdir(), "rollout-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const bin = join(root, "bin");
@@ -175,17 +178,46 @@ function setup(t) {
   writeFileSync(npmCalls, "");
   const env = {
     ...process.env,
-    PASEO_BIN: join(bin, "paseo.mjs"),
     NPM_BIN: join(bin, "npm.mjs"),
-    PASEO_SERVER_DIR: server,
     PASEO_HOME: home,
     FAKE_PASEO_STATE: stateFile,
     FAKE_NPM_CALLS: npmCalls,
     PLUGIN_ROLLOUT_POLL_MS: "50",
     PLUGIN_ROLLOUT_DEADLINE_MS: "20000",
   };
+  // The host's own PASEO_* settings (an agent session has PASEO_CLI) must not reach the tool.
+  for (const name of ["PASEO_BIN", "PASEO_SERVER_DIR", "PASEO_CLI"]) delete env[name];
+  if (!daemonCli) {
+    env.PASEO_BIN = join(bin, "paseo.mjs");
+    env.PASEO_SERVER_DIR = server;
+  }
+  if (daemonCli) {
+    if (env.PASEO_BIN || env.PASEO_SERVER_DIR || env.PASEO_CLI) throw new Error("the daemon fixture sets no PASEO_* override");
+    const modules = join(root, "runtime", "node_modules");
+    const cli = join(modules, "@getpaseo", "cli");
+    const cliServer = join(modules, "@getpaseo", "server");
+    mkdirSync(join(cli, "bin"), { recursive: true });
+    mkdirSync(join(modules, ".bin"), { recursive: true });
+    mkdirSync(join(cliServer, "dist", "server", "server", "plugins"), { recursive: true });
+    writeFileSync(join(cli, "package.json"), JSON.stringify({ name: "@getpaseo/cli", version: VERSION, bin: { paseo: "bin/paseo" } }));
+    writeFileSync(join(cli, "bin", "paseo"), FAKE_PASEO);
+    chmodSync(join(cli, "bin", "paseo"), 0o755);
+    symlinkSync(join("..", "@getpaseo", "cli", "bin", "paseo"), join(modules, ".bin", "paseo"));
+    writeFileSync(join(cliServer, "package.json"), JSON.stringify({ name: "@getpaseo/server", version: VERSION, main: "index.js" }));
+    writeFileSync(join(cliServer, "index.js"), "export {};\n");
+    writeFileSync(join(cliServer, "dist", "server", "server", "plugins", "runtime.js"), STUB_RUNTIME);
+    // The daemon's command line, as a host's `ps -ww -Ao pid=,ppid=,uid=,args=` shows it.
+    writeFileSync(join(bin, "ps"), `#!/bin/sh\ncat <<'TABLE'\n4242 1 ${process.getuid()} ${process.execPath} ${join(modules, ".bin", "paseo")} daemon run\nTABLE\n`);
+    chmodSync(join(bin, "ps"), 0o755);
+    const decoy = join(root, "decoy");
+    mkdirSync(decoy);
+    writeFileSync(join(decoy, "paseo"), `#!/bin/sh\ntouch "${join(root, "decoy-ran")}"\nexit 42\n`);
+    chmodSync(join(decoy, "paseo"), 0o755);
+    env.PATH = [bin, decoy, process.env.PATH ?? ""].join(delimiter);
+  }
   // A post-merge hook records each pull among the fake daemon's lifecycle events.
-  writeFileSync(join(checkout, ".git", "hooks", "post-merge"), `#!/bin/sh\nexec "${process.execPath}" "${env.PASEO_BIN}" __event pull\n`);
+  const fakeCli = daemonCli ? join(root, "runtime", "node_modules", "@getpaseo", "cli", "bin", "paseo") : env.PASEO_BIN;
+  writeFileSync(join(checkout, ".git", "hooks", "post-merge"), `#!/bin/sh\nexec "${process.execPath}" "${fakeCli}" __event pull\n`);
   chmodSync(join(checkout, ".git", "hooks", "post-merge"), 0o755);
 
   const initial = {
@@ -237,6 +269,8 @@ function setup(t) {
     return existsSync(file) ? JSON.parse(readFileSync(file, "utf8")) : null;
   };
   const npmCount = () => readFileSync(npmCalls, "utf8").split("\n").filter(Boolean).length;
+  // daemonCli: whether the decoy `paseo` on PATH was run (it must never be).
+  const decoyRan = () => existsSync(join(root, "decoy-ran"));
   // The first rollout per host and plugin has no receipt: exit 2, then --force loads it once.
   const prime = async (id = "alpha") => {
     const first = await rollout(id);
@@ -244,10 +278,20 @@ function setup(t) {
     const forced = await rollout(id, "--force");
     assert.equal(forced.code, 0, forced.out);
   };
-  return { root, dev, checkout, home, env, state, update, addLog, start, rollout, push, receipt, npmCount, npmCalls, prime };
+  return { root, dev, checkout, home, env, state, update, addLog, start, rollout, push, receipt, npmCount, npmCalls, prime, decoyRan };
 }
 
 const reloads = (ctx, id = "alpha") => ctx.state().reloads.filter((r) => r === id).length;
+
+test("a host whose daemon runs its own Paseo is driven through that install, not the `paseo` on PATH", async (t) => {
+  const ctx = setup(t, { daemonCli: true });
+  const run = await ctx.rollout("alpha", "--force");
+  assert.equal(run.code, 0, run.out);
+  assert.match(run.out, new RegExp(`^alpha: Paseo ${VERSION} builds alpha$`, "m"), run.out);
+  assert.equal(reloads(ctx), 1);
+  assert.equal(ctx.receipt("alpha").state, "loaded");
+  assert.equal(ctx.decoyRan(), false, "the decoy `paseo` on PATH was not run");
+});
 
 test("a reload whose CLI times out is waited for until Plugin ready; the receipt records the loaded tree", async (t) => {
   const ctx = setup(t);
