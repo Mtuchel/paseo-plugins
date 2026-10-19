@@ -8,8 +8,9 @@ import type { HandoverRecord } from "./handover";
 import type { OwnerAskComment, OwnerAskIssue } from "./linear";
 import { answerText, askRoute, deliveryText, extractionInputParts, OwnerAsks, ownerAsksPage, selectAskSources, type AnswerAskInput, type ContinueOutcome, type OwnerAsksDeps } from "./owner-asks";
 import { answerAskRpc, ownerAsksRpc, triageAskRpc, type OwnerAsk } from "../shared/contracts";
-import { isSourceReview, type BrowserOwnerAsk } from "../shared/decision-inbox";
-import { checkExtraction, type ExtractInput, type Extraction } from "./owner-ask-extract";
+import { isSourceReview, type BrowserOwnerAsk, type DecisionView } from "../shared/decision-inbox";
+import { checkExtraction, type ExtractInput, type Extraction, type ExtractedAsk } from "./owner-ask-extract";
+import { curateDecisions, ownerSourceId } from "./decision-curation";
 import { askContext, askTimeline, type AskContext, type AskSource } from "./owner-ask-admission";
 import { PermissionReplies, type DeliveryOrigin, type DeliveryResult } from "./permission-replies";
 import { NeedsYouIssues } from "./needs-you";
@@ -1449,4 +1450,256 @@ test("an unchanged comment history retries failed persistence and survives resta
   t.after(() => restarted.stop());
   const current = await restarted.snapshot(h.paseo);
   assert.deepEqual(current.asks, first.asks, "all original sources and revisions survive without another full-history read");
+});
+
+// ---------------------------------------------------------------------------------------------
+// Owner holds and deferrals (linear-tickets, 2026-10-19)
+//
+// The extraction policy changed: an owner deferral/hold the owner already decided, with nothing
+// requested now, extracts as assessment.state "dependency" (curation priority "waiting");
+// ownerBoundary "owner-hold" with state "owner" is only a CURRENT owner-only request. Stored
+// owner/owner-hold results produced before this policy are stale and are re-extracted once. No
+// other stored result is re-extracted, and EXTRACTION_VERSION is not bumped. While a stale source
+// waits for its one re-extraction it keeps showing the stored card (fail-open).
+
+const HOLD_SOURCE = "The owner has put the Hamburg subnet router on hold until the new firewall is in place. Nothing is requested from the owner now.";
+const BUSINESS_SOURCE = "Owner decision still required: which package quantity is contracted?";
+const INFO_SOURCE = "Staging deployment finished successfully; this is a status update with no request.";
+const OWNER_ONLY_SOURCE = "Apply the owner-only approved-test-change label to PR #4816. This current step needs the owner's account.";
+const CURRENT_OWNER_SUMMARY = "Apply the owner-only approved-test-change label to PR #4816.";
+const HOLD_DEPENDENCY_SUMMARY = "Deferred until the new firewall; nothing is requested from the owner now.";
+
+const oldHoldResult = (): ExtractedAsk => ({
+  kind: "decision",
+  summary: "Old policy: the router hold was listed as an owner decision.",
+  questions: [{ key: "q1", question: "Is the Hamburg subnet router still on hold?", options: [], multiSelect: false }],
+  assessment: {
+    state: "owner",
+    reason: "The old extraction treated the owner's hold as a current owner request.",
+    ownerBoundary: "owner-hold",
+    evidence: [{ sourceId: "description", quote: HOLD_SOURCE }],
+  },
+});
+
+const oldBusinessResult = (): ExtractedAsk => ({
+  kind: "decision",
+  summary: "Old policy: the contracted package quantity is still an owner decision.",
+  questions: [{ key: "q1", question: "Which package quantity is contracted?", options: [], multiSelect: false }],
+  assessment: {
+    state: "owner",
+    reason: "The owner has not chosen the contracted quantity.",
+    ownerBoundary: "business",
+    evidence: [{ sourceId: "description", quote: BUSINESS_SOURCE }],
+  },
+});
+
+const oldInfoResult = (): ExtractedAsk => ({
+  kind: "info",
+  summary: "Old policy: staging deployment finished; nothing is asked.",
+  questions: [],
+  assessment: {
+    state: "info",
+    reason: "Status update with no request.",
+    ownerBoundary: null,
+    evidence: [{ sourceId: "description", quote: INFO_SOURCE }],
+  },
+});
+
+const dependencyResult = (input: ExtractInput): Extraction => checkExtraction(JSON.stringify({
+  kind: "info",
+  summary: HOLD_DEPENDENCY_SUMMARY,
+  questions: [],
+  assessment: {
+    state: "dependency",
+    reason: "The owner already chose to wait on a named condition; nothing is asked now.",
+    ownerBoundary: null,
+    evidence: [{ sourceId: "description", quote: HOLD_SOURCE }],
+  },
+}), input.text, input.context);
+
+const currentOwnerResult = (input: ExtractInput): Extraction => checkExtraction(JSON.stringify({
+  kind: "decision",
+  summary: CURRENT_OWNER_SUMMARY,
+  questions: [{ question: "Apply the owner-only label to PR #4816?", options: [] }],
+  assessment: {
+    state: "owner",
+    reason: "Only the owner can perform this current step.",
+    ownerBoundary: "owner-hold",
+    evidence: [{ sourceId: "description", quote: OWNER_ONLY_SOURCE }],
+  },
+}), input.text, input.context);
+
+// The stored-extraction record exactly as it existed before the policy marker: same hash, same
+// version, no per-result policy field. The marker is written by the implementation with every new
+// result; an old owner/owner-hold result without it is the only stale shape.
+async function rewriteAsOldPolicy(directory: string, file: string, result: ExtractedAsk, attempts = 0): Promise<void> {
+  const path = join(directory, "extract", file);
+  const stored = JSON.parse(await readFile(path, "utf8")) as { hash: string; version: string; model: string; at: string };
+  await writeFile(path, JSON.stringify({ hash: stored.hash, version: stored.version, model: stored.model, result, attempts, nextAt: null, at: stored.at }));
+}
+
+const decisionView = (asks: BrowserOwnerAsk[]): DecisionView => ({
+  hosts: [{ host: "canonical", asks, live: [], history: [], updatedAt: new Date(NOW).toISOString(), error: null, flow: null }],
+  canonicalHost: "canonical",
+  unreachable: [],
+});
+
+const settle = async (): Promise<void> => {
+  for (let index = 0; index < 20; index++) await new Promise((resolve) => setImmediate(resolve));
+};
+
+const untilAskIn = async (ownerAsks: OwnerAsks, paseo: PaseoApi, predicate: (ask: BrowserOwnerAsk) => boolean): Promise<BrowserOwnerAsk> => {
+  const deadline = Date.now() + 5_000;
+  let ask: BrowserOwnerAsk | undefined;
+  while (Date.now() < deadline) {
+    ask = (await ownerAsks.snapshot(paseo)).asks.find(predicate);
+    if (ask) return ask;
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  throw new Error(`the ask never reached the expected state: ${JSON.stringify(ask)}`);
+};
+
+// One first collection in which every source's extraction has landed on disk.
+const extractedAll = async (h: Harness): Promise<BrowserOwnerAsk[]> => {
+  await untilAsync(async () => {
+    const asks = (await h.ownerAsks.snapshot(h.paseo)).asks;
+    return asks.length > 0 && asks.every((ask) => ask.extracted);
+  });
+  return (await h.ownerAsks.snapshot(h.paseo, true)).asks;
+};
+
+test("a stored owner-hold extraction from the old policy is re-extracted exactly once", async (t) => {
+  const h = await setup({ issues: [issue({ title: "Hamburg subnet router", description: HOLD_SOURCE, labels: [], parentId: null, parentIdentifier: null })] });
+  t.after(() => h.ownerAsks.stop());
+  await extractedAll(h);
+  h.ownerAsks.stop();
+  await rewriteAsOldPolicy(h.directory, "i1.json", oldHoldResult());
+  h.state.extraction = async (input) => dependencyResult(input);
+  let models = 0;
+  h.deps.resolveModel = async () => { models++; return "omp/test-model"; };
+  const before = h.extractedWith.length;
+  const restarted = new OwnerAsks(h.deps);
+  t.after(() => restarted.stop());
+  const queued = await restarted.snapshot(h.paseo);
+  assert.equal(queued.asks.length, 1, "the stale source is still shown");
+  assert.equal(queued.asks[0]?.attention, "owner", "the old card keeps its pre-policy attention until re-extraction lands");
+  assert.equal(queued.asks[0]?.summary, oldHoldResult().summary, "the old value is displayed meanwhile");
+  assert.equal(models, 1, "only the stale owner/owner-hold source reaches the model");
+  const current = await untilAskIn(restarted, h.paseo, (ask) => ask.sourceId === "description" && ask.attention === "dependency");
+  assert.equal(current.issueId, "i1");
+  assert.equal(current.summary, HOLD_DEPENDENCY_SUMMARY);
+  assert.equal(h.extractedWith.length, before + 1, "one re-extraction, not a loop");
+  await restarted.snapshot(h.paseo, true);
+  await settle();
+  assert.equal(models, 1, "the replacement result is stored and not re-extracted again");
+  assert.equal(h.extractedWith.length, before + 1);
+});
+
+// The original extraction's attempt count belongs to that extraction: a result that succeeded on
+// its last allowed attempt (one such record on server087) still gets its one re-extraction.
+test("an old owner-hold result that used its whole attempt budget is still re-extracted once", async (t) => {
+  const h = await setup({ issues: [issue({ title: "Hamburg subnet router", description: HOLD_SOURCE, labels: [], parentId: null, parentIdentifier: null })] });
+  t.after(() => h.ownerAsks.stop());
+  await extractedAll(h);
+  h.ownerAsks.stop();
+  await rewriteAsOldPolicy(h.directory, "i1.json", oldHoldResult(), 3);
+  h.state.extraction = async (input) => dependencyResult(input);
+  const before = h.extractedWith.length;
+  const restarted = new OwnerAsks(h.deps);
+  t.after(() => restarted.stop());
+  await restarted.snapshot(h.paseo);
+  const current = await untilAskIn(restarted, h.paseo, (ask) => ask.sourceId === "description" && ask.attention === "dependency");
+  assert.equal(current.summary, HOLD_DEPENDENCY_SUMMARY);
+  assert.equal(h.extractedWith.length, before + 1);
+});
+
+test("old stored owner-business and info results are not re-extracted", async (t) => {
+  const h = await setup({ issues: [
+    issue({ id: "i1", identifier: "TUC-1001", title: "Contract quantity", description: BUSINESS_SOURCE, labels: [], parentId: null, parentIdentifier: null }),
+    issue({ id: "i2", identifier: "TUC-1002", title: "Staging status", description: INFO_SOURCE, labels: [], parentId: null, parentIdentifier: null }),
+  ] });
+  t.after(() => h.ownerAsks.stop());
+  await extractedAll(h);
+  h.ownerAsks.stop();
+  await rewriteAsOldPolicy(h.directory, "i1.json", oldBusinessResult());
+  await rewriteAsOldPolicy(h.directory, "i2.json", oldInfoResult());
+  let models = 0;
+  h.deps.resolveModel = async () => { models++; return "omp/test-model"; };
+  const before = h.extractedWith.length;
+  const restarted = new OwnerAsks(h.deps);
+  t.after(() => restarted.stop());
+  const asks = (await restarted.snapshot(h.paseo, true)).asks;
+  await settle();
+  assert.equal(models, 0, "the policy targets only owner/owner-hold results");
+  assert.equal(h.extractedWith.length, before);
+  assert.deepEqual(Object.fromEntries(asks.map((ask) => [ask.issueId, { attention: ask.attention, extracted: ask.extracted, summary: ask.summary }])), {
+    i1: { attention: "owner", extracted: true, summary: oldBusinessResult().summary },
+    i2: { attention: "info", extracted: true, summary: oldInfoResult().summary },
+  });
+});
+
+test("a stored owner-hold result produced under the current policy is not re-extracted", async (t) => {
+  const h = await setup({
+    issues: [issue({ title: "PR #4816 label", description: OWNER_ONLY_SOURCE, labels: [], parentId: null, parentIdentifier: null })],
+    extraction: async (input) => currentOwnerResult(input),
+  });
+  t.after(() => h.ownerAsks.stop());
+  const first = await untilAskIn(h.ownerAsks, h.paseo, (ask) => ask.sourceId === "description" && ask.extracted);
+  assert.equal(first.attention, "owner");
+  h.ownerAsks.stop();
+  let models = 0;
+  h.deps.resolveModel = async () => { models++; return "omp/test-model"; };
+  const before = h.extractedWith.length;
+  const restarted = new OwnerAsks(h.deps);
+  t.after(() => restarted.stop());
+  const current = await untilAskIn(restarted, h.paseo, (ask) => ask.sourceId === "description");
+  await settle();
+  assert.equal(models, 0, "the marker written under the current policy keeps this result fresh");
+  assert.equal(h.extractedWith.length, before);
+  assert.equal(current.attention, "owner");
+  assert.equal(current.extracted, true);
+  assert.equal(current.summary, CURRENT_OWNER_SUMMARY);
+});
+
+test("a stale owner-hold card stays visible while its one re-extraction runs, then curates as waiting", async (t) => {
+  const h = await setup({ issues: [issue({ title: "Hamburg subnet router", description: HOLD_SOURCE, labels: [], parentId: null, parentIdentifier: null })] });
+  t.after(() => h.ownerAsks.stop());
+  await extractedAll(h);
+  h.ownerAsks.stop();
+  const old = oldHoldResult();
+  await rewriteAsOldPolicy(h.directory, "i1.json", old);
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  h.state.extraction = async (input) => { await gate; return dependencyResult(input); };
+  let starts = 0;
+  h.deps.resolveModel = async () => { starts++; return "omp/test-model"; };
+  const before = h.extractedWith.length;
+  const restarted = new OwnerAsks(h.deps);
+  t.after(() => restarted.stop());
+  const pending = (await restarted.snapshot(h.paseo)).asks.find((ask) => ask.issueId === "i1");
+  assert.equal(pending?.extracted, true, "the source is not dropped while it waits for the model");
+  assert.equal(pending?.attention, "owner", "the old card is displayed unchanged until the re-extraction lands");
+  assert.equal(pending?.summary, old.summary);
+  assert.deepEqual(pending?.questions, old.questions, "the owner keeps the card's questions while the re-extraction runs");
+  assert.equal(starts, 1, "the stale owner/owner-hold source is queued for exactly one re-extraction");
+  release();
+  const current = await untilAskIn(restarted, h.paseo, (ask) => ask.attention === "dependency");
+  assert.equal(current.summary, HOLD_DEPENDENCY_SUMMARY);
+  const tasks = curateDecisions(decisionView([current]), h.state.now);
+  assert.equal(tasks.find((task) => task.id === ownerSourceId(current))?.priority, "waiting");
+  assert.equal(tasks.filter((task) => task.priority === "owner").length, 0, "a hold the owner already decided is not 'Needs your decision'");
+  await settle();
+  assert.equal(h.extractedWith.length, before + 1);
+});
+
+test("an owner-only action requested now stays owner in the curated list", async (t) => {
+  const h = await setup({
+    issues: [issue({ title: "PR #4816 label", description: OWNER_ONLY_SOURCE, labels: [], parentId: null, parentIdentifier: null })],
+    extraction: async (input) => currentOwnerResult(input),
+  });
+  t.after(() => h.ownerAsks.stop());
+  const current = await untilAskIn(h.ownerAsks, h.paseo, (ask) => ask.sourceId === "description" && ask.extracted);
+  assert.equal(current.attention, "owner");
+  const tasks = curateDecisions(decisionView([current]), h.state.now);
+  assert.equal(tasks.find((task) => task.id === ownerSourceId(current))?.priority, "owner");
 });
