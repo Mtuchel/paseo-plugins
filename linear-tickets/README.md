@@ -4820,6 +4820,12 @@ The frontdoor rechecks incomplete coverage after its two-second minimum snapshot
 than holding a cold partial snapshot until the next thirty-second expiry. Notification collection
 still waits for peer coverage, so a routine refresh does not forget and re-announce waiting reviews.
 The task list groups owner decisions, unresolved source review, research/delegated waits and receipts.
+The owner and other-wait sections group displayed sources by ticket for presentation only: one
+expandable entry per ticket (`ticketIdentifier` for owner asks, `identifier` for live questions)
+whose members are the unchanged per-source rows. Sources without a ticket stay separate, and
+grouping never merges source identity or actions: each member keeps its own selection, draft and
+answer controls. The section count reports tickets and adds the source count when a ticket carries
+more than one source.
 Source counts are separate from steward ticket-state counts: `waiting-owner` is not a count of
 actionable questions. Per-host collection timestamps and incomplete/stale coverage stay visible.
 Standalone live questions without a Linear identifier remain included. Original lettered choices,
