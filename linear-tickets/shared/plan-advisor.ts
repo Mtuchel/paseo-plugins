@@ -7,6 +7,7 @@
 import { RISK_SECTION, riskSteps } from "./plan-risk";
 import { REACH_SECTION } from "./plan-sections";
 import { MODEL_SECTION } from "./plan-model";
+import { DELIVERY_POLICY_NOTE } from "./delivery-policy";
 
 export const ADVISOR_PROVIDER = "omp/openai-codex/gpt-6-astra";
 // The model id Paseo reports for an omp agent started with ADVISOR_PROVIDER.
@@ -28,8 +29,9 @@ export function advisorSteps(options: { contextPath?: string | null; omp: boolea
       : "saved at the file named by the `LINEAR_TICKETS_CONTEXT` environment variable";
   const steps = [
     `Plan advisor: before the owner sees your plan, a GPT-6 Astra advisor reviews it with the same ticket context, and you settle its points together.`,
+    `Give the advisor this operative delivery rule verbatim:\n${DELIVERY_POLICY_NOTE}`,
     `1. Create the advisor with the Paseo \`create_agent\` tool: provider \`${ADVISOR_PROVIDER}\`, thinkingOptionId \`${ADVISOR_THINKING}\`, modeId \`full\`, in your own workspace (the default). Tell it that it is a read-only plan advisor (no edits, commits, pushes or comments) and give it: the ticket exactly as you received it, ${context} to read first; the absolute path of your plan file; what you learned while investigating (relevant files, constraints, options you rejected and why); the impact and reversibility scales below; and the question whether this is the right plan for the ticket (scope, approach, risks, missing steps, acceptance criteria, tests), and specifically: is a place missing from \`## ${REACH_SECTION}\`, does the plan contradict an approved principle or ADR, should it set a rule, does each \`include\` and new rule have its own acceptance criterion that really proves it, and is the \`## ${MODEL_SECTION}\` tier right (could a cheap model implement it from the plan as written, and do the strong steps cover every step that needs judgment); answered as must-change points and suggestions, or agreement. Ask it for its own rating too, from the ticket and the code rather than from yours: impact level and reversibility, with reasons; a plan that rates lower than the advisor is a must-change point.`,
-    `2. Adopt each point into the plan or answer it with a reason. Send your changes and answers to the same advisor with \`send_agent_prompt\` (it keeps its context) until you agree, at most ${ADVISOR_MAX_ROUNDS} rounds.`,
+    `2. Adopt each point into the plan or answer it with a reason. Send your changes and answers to the same advisor with \`send_agent_prompt\` (it keeps its context) until you agree, at most ${ADVISOR_MAX_ROUNDS} rounds. The advisor must challenge unjustified scope additions, optional improvements treated as blockers, blanket staging holds, extra activation projects and evidence-only gates on unrelated use. It must check the Approach's requested outcome, necessary adaptations, first complete usable staging workflow, remaining agreed scope and concrete blockers against the delivery rule. Unresolved unjustified scope or gates are disagreements, not agreement with a caveat: record \`disagreements\`, never \`agreed\`, while they remain unresolved.`,
     `3. ${riskSteps()}\nThe \`Advisor rating\` line carries the advisor's latest rating as it gave it. The owner's threshold applies to the higher of both ratings: a plan rated low enough, with no migration, auth change or new rule, reversible by a revert, recommended \`auto\` and agreed by the advisor is approved without the owner.`,
     `4. End the plan with a \`## ${ADVISOR_SECTION}\` section after \`## ${RISK_SECTION}\`: the advisor's model, the number of rounds, what changed because of it, and every point you still disagree on with both positions, so the owner decides.`,
     options.omp

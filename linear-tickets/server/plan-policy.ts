@@ -21,9 +21,9 @@ export function advisorNote(providerKey: string): string {
 // Every ticket plan says where else the change applies and which rules it follows or sets
 // (README, "Plan-first"); the omp extension's record gate reads the same format.
 export const PLAN_SECTIONS_NOTE = sectionSteps();
-// How a plan slices its acceptance criteria into pull requests (README, "Plan-first"): by size and
-// risk, not one per criterion (TUC-1854), within the 3-unlanded-PR cap (TUC-1824).
-export const PLAN_SLICING_NOTE = "Delivery slices: group the acceptance criteria into pull requests by size and risk, not one pull request per criterion. Thin criteria share a pull request (its body says e.g. `Covers: AC-1, AC-2`), aiming at roughly 200-600 changed lines; split above roughly 1,500 changed lines or where the risk changes (a database migration, auth or permissions, money or the ERP, a contract other packages build on). A ticket keeps at most 3 unlanded pull requests, so plan landable ranges that land bottom first. Acceptance criteria stay one per `## Reach` place; only pull requests group them.";
+// Slice by cohesion and risk, not mechanical counts (README, "Plan-first"); the existing
+// 3-unlanded-PR queue cap limits concurrent delivery, not the agreed scope.
+export const PLAN_SLICING_NOTE = "Delivery slices: group acceptance criteria into cohesive, reviewable pull requests by workflow and risk, not one pull request per criterion or a mechanical line/file/criterion count. Thin criteria share a pull request (its body says e.g. `Covers: AC-1, AC-2`). Roughly 200-600 changed lines and a closer look above roughly 1,500 are advisory, not mandatory splits; separate real risk boundaries (a database migration, auth or permissions, money or the ERP, a contract other packages build on) when that makes delivery safer. Aim for a first complete usable staging workflow, not disconnected infrastructure or a separate activation project, and preserve all remaining agreed scope. Respect the existing 3-unlanded-PR queue cap by landing coherent ranges bottom first; it does not dictate slice size or create an owner decision. Acceptance criteria stay one per `## Reach` place; only pull requests group them.";
 
 // Marks a ticket whose plan is approved (TUC-9's feedback intake reads it as "planned"). A machine
 // flag next to the status (README, "Statuses and labels"): the next agent implements the plan.

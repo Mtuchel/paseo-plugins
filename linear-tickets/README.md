@@ -722,14 +722,55 @@ implemented (below), and a small ticket an omp agent takes on the **Small-ticket
 The sidebar's Plan-first toggle is gone. The prompt asks to keep the plan as short as the ticket
 allows.
 
-**Delivery slices.** A plan groups its acceptance criteria into pull requests by size and risk, not
-one pull request per criterion (TUC-1854): thin criteria share one (its body says
-`Covers: AC-1, AC-2`), aiming at roughly 200–600 changed lines; a pull request is split above
-roughly 1,500 lines or where the risk changes (a database migration, auth or permissions, money or
-the ERP, a contract other packages build on). A ticket keeps at most 3 unlanded pull requests
-(TUC-1824), so the slices are landable ranges that land bottom first. Acceptance criteria stay one
-per `## Reach` place; only pull requests group them. Every planner gets this note
-(`PLAN_SLICING_NOTE` in [`server/plan-policy.ts`](server/plan-policy.ts)), the project planner too.
+**Delivery slices.** A plan groups its acceptance criteria into cohesive, reviewable pull requests
+by workflow and risk, not one pull request per criterion (TUC-1854) or a mechanical line/file/AC
+count. Thin criteria share one (`Covers: AC-1, AC-2`). Roughly 200–600 changed lines and a closer
+look above roughly 1,500 are advisory, not mandatory splits. Separate real risk boundaries
+(a database migration, auth or permissions, money or the ERP, a contract other packages build on)
+when that makes delivery safer. Aim for a first complete usable staging workflow, not disconnected
+infrastructure or a separate activation project; all remaining agreed scope stays in the plan.
+The existing 3-unlanded-PR queue cap (TUC-1824) limits concurrent delivery, not slice size or scope:
+land coherent ranges bottom first. Acceptance criteria stay one per `## Reach` place; only pull
+requests group them. Every planner gets `PLAN_SLICING_NOTE` in
+[`server/plan-policy.ts`](server/plan-policy.ts), the project planner too.
+
+**Scope and staging delivery.** Core's `docs/engineering/testing.md#scope-and-staging-delivery`
+is the authority. The dependency-free instruction in
+[`shared/delivery-policy.ts`](shared/delivery-policy.ts) is included verbatim in standing
+engineering authority and the advisor instructions, so launch/resume, implementation and deputy
+decisions use the same rule. In the existing Approach, the planner concisely identifies the
+requested outcome, necessary integration adaptations, first complete usable staging workflow,
+remaining agreed scope and concrete blockers. This adds no parser-required fields or approval stage.
+
+1:1 means behavior parity, not redesign or extra capabilities. Review findings distinguish
+requested defects, necessary integration/security corrections and optional improvements.
+Necessary security/auth/financial correctness adaptations remain real work; small does not imply
+in scope, and optional improvements do not block delivery.
+
+Keep admin switches and rollback. Safe completed staging functionality within approved scope is
+usable by default, without an automatic second deployment-admission flag or activation project.
+Absent, partial or invalid configuration still fails closed; provision and verify staging-scoped
+configuration or Admin state explicitly. Never seed a global flag on for a staging-only default
+or infer production authorization. Auth, money, stock, food safety, external effects, production
+holds and applicable approved principles remain protected. Do not invent elaborate partial-access
+infrastructure just to narrow a blocker.
+
+Separate implementation prerequisites, activation restrictions and nonblocking follow-up
+verification. A blocker names its concrete failure, narrow affected action, release evidence and
+why proof cannot accompany use. Performance measurements, monitoring acknowledgements, observations
+and evidence uploads do not automatically block unrelated staging use; their own ACs remain
+unfinished until proved. Linear `blocks` means an actual dependency; observations and follow-ups
+use `related`, and an open parent does not automatically lock its children.
+
+A shared staging hold needs separately explicit owner approval of risk, scope, release condition,
+expiry and restoration, not implicit approval of the whole plan. Existing explicit restrictions
+remain until concretely superseded, without retroactive silent waivers. Technical prerequisites
+may be reordered autonomously when scope, business behavior, cost and risk stay unchanged.
+Report merged versus actually usable honestly.
+
+Enforcement is semantic review through the existing planner/advisor, implementation review and
+standing-authority paths, not a deterministic semantic parser gate. The advisor must disagree
+with unresolved unjustified scope or gates, not record agreement while leaving them as caveats.
 
 **Small-ticket route.** A small, low-risk ticket you wrote skips the plan review (TUC-1854,
 option A). The plugin offers the route to an omp planner at launch only when the ticket is yours
@@ -826,14 +867,17 @@ when no code changes, e.g. an owner decision (TUC-1644). A `follow-up` is only f
 finding outside this ticket — a defect, a data, security or money risk, or a missing guarantee a
 user or another system relies on — and is filed in **Backlog**, at most three per plan, when the
 plan is approved (**Plan follow-ups** below), where it waits for the owner rather than being
-planned or handed out (see **Projects**); small work on code the ticket already touches is an
-`include`, and polish, docs, naming, refactors, ideas and "could consider" are `n/a — minor:
-<what>`, never a ticket. `existing — <TICKET-ID>` says an open ticket already covers the place:
-nothing is filed for it. The gate refuses a fourth follow-up, a follow-up that only names the
-ticket already covering it, and an `existing` without an identifier. Every ticket agent, the one
-that plans and then implements as well as one that implements an approved plan later, is told to
-fix a small missed place in the ticket and to file a substantial one as a follow-up (`create_issue`)
-instead of quietly doing more; minor findings go into its final comment.
+planned or handed out (see **Projects**). Necessary behavior-preserving corrections within
+authorized scope are an `include`; small work or touching the same code does not authorize an
+optional extension. Optional overflow may be `n/a — outside scope: <reason; observation>`;
+minor polish, docs, naming, refactors, ideas and "could consider" are `n/a — minor: <what>`,
+not tickets. The filing cap never forces extra scope into `include`: retain real risks explicitly
+as observations, not relabelled minor. `existing — <TICKET-ID>` says an open ticket already covers
+the place: nothing is filed for it. The gate refuses a fourth follow-up, a follow-up that only
+names the ticket already covering it, and an `existing` without an identifier. Every implementer
+is told to correct necessary missed reach within scope and file substantial outside-scope findings
+as follow-ups (`create_issue`), not quietly extend the ticket. Optional overflow and minor
+findings go into the final comment without blocking delivery.
 
 ### Model tiers
 
@@ -981,6 +1025,11 @@ planner adopts or answers each point and sends changes back to the same advisor 
 `send_agent_prompt` until they agree, at most three rounds. The plan then ends with an
 `## Advisor review` section: the advisor's model, the rounds, what changed, and every point still
 disputed with both positions, for you to decide in Plannotator.
+The advisor receives the shared scope and staging delivery instruction verbatim. It challenges
+unjustified scope additions, optional improvements treated as blockers, blanket staging holds,
+extra activation projects and evidence-only gates on unrelated use. Unresolved unjustified scope
+or gates require `disagreements`, never `agreed` with a caveat. The existing record gate checks
+the review record and plan structure, not the semantic truth of that verdict.
 
 omp planners cannot skip this. Every ticket agent carries its ticket in `LINEAR_TICKETS_ISSUE`,
 also in a session Paseo resumes after a daemon restart or reload (see "The omp extension" below),
@@ -1006,6 +1055,10 @@ Area labels and business processes, an **impact** level, **reversibility**, feat
 migration yes/no, auth yes/no, **new rule** yes/no (the plan sets a rule for future work, stated in
 `## Principles and rules`), the failure mode, the advisor's own rating, and a recommendation
 (`auto` or `owner`).
+The feature-flag field describes existing/planned admin control, rollback, staging default and any
+justified activation restriction; it does not require universal off. Rate the **enabled workflow's
+worst plausible impact**, not its temporary disabled state. Do not add a flag merely to qualify
+for auto-approval. Risk parsing, thresholds and approval APIs are unchanged.
 
 | Impact | Meaning |
 |---|---|
@@ -1832,11 +1885,13 @@ restack or fix of its own, and asks for `git switch <range top> && node tools/ci
 --wait-main` (it waits until `main` is green, then checks and enqueues) and `node
 tools/ci/wait-queue.mjs <its PR>`; its message carries the counts, as every drop message does.
 Every drop message also carries the range's drop history (each earlier drop's time, class, failed
-checks and failing tests) and the owner policy: ask the owner only for a decision that can break
-something (data, production or staging, migrations, security, reverting someone else's landed
-work) or that changes how CI works in general (required checks, CI selection, quarantine policy,
-queue settings), through the ticket's usual question path (the deputy answers first) — never
-because of a drop count. When the failing signature (the job families and failing tests) repeats
+checks and failing tests) and the owner policy: routine staging setup, deployment and verification
+within approved scope are delegated, not a separate activation gate. Escalate actual retained
+authority boundaries (consequential business/security changes, destructive data or production
+effects, explicit holds, shared staging interruptions, reverting someone else's landed work, or
+CI policy changes), through the ticket's normal question path (the deputy answers first), never
+because of a drop count. Required evidence and explicit restrictions remain binding.
+When the failing signature (the job families and failing tests) repeats
 an earlier genuine drop of the range, the fix request also requires reproducing the failing tests
 on the range merged onto current `origin/main` before the next enqueue, and, when they pass there
 (the cause is outside the change), attaching that evidence to the queue incident — the `TUC-538`
@@ -2141,10 +2196,10 @@ stall of a stage gets its message, and every third nudge of the same stage and p
 3rd, 6th, …) adds the approach-change line: the step keeps stalling, change the approach, and if
 a decision only you can make blocks it, ask through the ticket's normal question path (the
 deputy answers first) now instead of waiting. Every nudge prompt ends with the same owner policy
-a drop's fix request states: involve you only for a decision that can break something (data,
-production or staging, migrations, security, reverting someone else's landed work) or that
-changes how CI works in general (required checks, CI selection, quarantine, queue settings),
-through the ticket's normal question path (the deputy answers first); never just wait.
+a drop's fix request states: routine staging work is delegated; only actual retained authority
+boundaries require the ticket's normal question path (the deputy answers first), not staging
+as a category or a nudge count. Required evidence and explicit restrictions remain binding;
+never just wait.
 Requested changes are claimed per review instead: a change request is sent once, however many
 commits follow it (it keeps holding the merge until the reviewer settles it), and a new request is
 sent again. A busy or disconnected agent is asked on a later poll; a gone or archived
@@ -4247,11 +4302,13 @@ The directional aim of 5–10% owner decisions is observational, **never a quota
 Plan, tool and mode approvals remain outside this question-answer path.
 
 **Authority and consequences.** The versioned owner contract is
-`shared/autonomy-policy.ts` (`owner-autonomy-2026-10-15-v3`). Routine engineering, independent
+`shared/autonomy-policy.ts` (`owner-autonomy-2026-10-19-v4`). Routine engineering, independent
 review, repairing prerequisites, meaningful fixture/test maintenance, the documented lifecycle
 on the task's own branches, and safe capable model fallback are delegated. Unavailable Opus 5.5
 does not require an owner exception: use available `openai-codex/gpt-6.1-sol`, high thinking.
 This does not configure host retry chains or authorize additional material spend.
+Its engineering passage includes the shared scope and staging delivery instruction, preserving
+the existing `standing-policy:engineering` citation authority.
 
 Known least-privilege, reversible **task-scoped staging access/setup**, including acquisition and
 use of existing approved credentials through approved channels, is delegated without an owner
@@ -4448,7 +4505,7 @@ block, without Paseo, Linear or GitHub credentials in its environment. A tool ev
 unreadable/oversized answer, abstention or failed check refuses the whole request. Citations
 retain source ID, revision and quote.
 
-Evidence is versioned as `deputy-19-scoped-authority-reconciliation/owner-autonomy-2026-10-15-v3/<model>/high`.
+Evidence is versioned as `deputy-19-scoped-authority-reconciliation/owner-autonomy-2026-10-19-v4/<model>/high`.
 Old-policy predictions never satisfy current empirical readiness. On restart, an old-version
 refusal/prediction is reevaluated only after the exact unanswered request is freshly verified;
 old selections, citations, intent and grace are discarded. An equivalent new request ID retires
@@ -4525,7 +4582,7 @@ retains its real outcome.
 - **Specific/mixed authority:** at least 30 real current-version shadow predictions paired with
   attributed owner answers, at least 90% agreement, exactly as below.
 - **Explicit owner-authorized standing activation:** `deputy.standingPolicy` must equal
-  `owner-autonomy-2026-10-15-v3`, and the latest private `deputy-activation` audit entry must record
+  `owner-autonomy-2026-10-19-v4`, and the latest private `deputy-activation` audit entry must record
   that same revision through `linear.set-settings`. This bypasses **only** the empirical threshold,
   **only** when every selected action has checked current positive standing-policy authority.
   Default is `null`; an unknown/old non-null revision normalizes to `null` **and mode `off`**,
@@ -4632,15 +4689,15 @@ authenticated plugin RPC, not a direct file edit, for the opt-in:
   "deputy": {
     "mode": "live",
     "model": "openai-codex/gpt-6.1-sol",
-    "standingPolicy": "owner-autonomy-2026-10-15-v3"
+    "standingPolicy": "owner-autonomy-2026-10-19-v4"
   }
 }
 ```
 
 Send to `linear.set-settings` on **each actual agent host** only after independent safety review
-and current-policy boundary replay. V1/v2 opt-ins normalize off: v3 requires a new explicit
+and current-policy boundary replay. V1/v2/v3 opt-ins normalize off: v4 requires a new explicit
 audited opt-in. Offline cache keys must include current policy, implementation and complete
-evaluator input; v1/v2 replay verdicts cannot authorize or satisfy readiness under v3.
+evaluator input; v1/v2/v3 replay verdicts cannot authorize or satisfy readiness under v4.
 The RPC persists settings, revokes unsent work and appends a private activation audit. An audit
 write failure is reported, not forged; retry the explicit RPC. Read back settings and
 `deputy.live.standingPolicyReady`; a false generic `live.ready` remains truthful until real paired

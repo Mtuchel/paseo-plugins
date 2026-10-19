@@ -88,7 +88,7 @@ const POLICY_PER_POLL = 3;
 // itself unless a real decision blocks it, and asks the owner then through the ticket's question
 // path. The drop fix requests close it with "; never because of a drop count", the stage nudges
 // with "; never just wait", the stack-cap message with "; never because of the count".
-const OWNER_POLICY = "Ask the owner only for a decision that can break something (data, production or staging, migrations, security, reverting someone else's landed work) or that changes how CI works in general (required checks, CI selection, quarantine, queue settings), through the ticket's normal question path (the deputy answers first)";
+const OWNER_POLICY = "Routine staging setup, deployment and verification within approved scope are delegated, not a separate owner activation gate. Ask through the ticket's normal question path (the deputy answers first) only when the actual action crosses retained authority: consequential business/security changes, destructive data or production effects, an explicit hold, a shared staging interruption, reverting someone else's landed work, or changes to CI policy (required checks, CI selection, quarantine, queue settings). Preserve required evidence and existing explicit restrictions";
 // The owner's veto: such a pull request is never nudged.
 const DO_NOT_MERGE_LABEL = "do-not-merge";
 // Check conclusions that do not fail a pull request.
