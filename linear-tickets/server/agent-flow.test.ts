@@ -514,92 +514,101 @@ test("one failed Linear read skips only its part of the sweep: a reply in anothe
   await h.cleanup();
 });
 
-test("a session Linear webhooks for is read at once and then skipped by the minute sweep", async () => {
-  let clock = Date.parse("2026-01-01T00:00:00Z");
-  const reads: string[] = [];
+test("a prompted webhook delivers its payload without rereading Linear, while the minute sweep recovers a missed prompt", async () => {
+  let reads = 0;
+  let clock = Date.parse("2026-01-02T00:00:00Z");
   const h = routerHarness([], {
     now: () => clock,
     api: {
       activity: async () => {},
+      updateSession: async () => {},
       openSessions: async () => [{ id: "s1", status: "active" }],
       sessionActivities: async () => new Map(),
-      activities: async (id: string) => { reads.push(id); return []; },
+      activities: async () => {
+        reads++;
+        return [
+          { id: "missed", type: "prompt", userId: OWNER, createdAt: "2026-01-01T12:00:00Z", body: "Also update the README" },
+          { id: "delivered", type: "prompt", userId: OWNER, createdAt: "2026-01-02T00:00:00Z", body: "carry on" },
+        ];
+      },
     } as never,
   });
-  await h.store.put({ ...link, sessionId: "s1" });
-  h.router.receive({ type: "AgentSessionEvent", action: "prompted", agentSession: { id: "s1" }, agentActivity: { id: "p1", content: { body: "carry on" }, userId: OWNER } });
-  await h.router.settled();
-  assert.deepEqual(reads, ["s1"], "the webhook read the session at once");
-  clock += 60_000;
-  await h.router.sweep();
-  assert.deepEqual(reads, ["s1"], "a minute later the sweep skips it: the webhook delivered the prompt");
-  assert.deepEqual(h.router.readStats(), { sweepReads: 0, sweepSkips: 1, webhookReads: 1 });
-  await h.cleanup();
-});
-
-test("a session Linear webhooks for is re-read on the 5-minute fallback, and every minute again once its webhooks stop", async () => {
-  const start = Date.parse("2026-01-01T00:00:00Z");
-  let clock = start;
-  const reads: number[] = [];
-  const h = routerHarness([], {
-    now: () => clock,
-    api: {
-      activity: async () => {},
-      openSessions: async () => [{ id: "s1", status: "active" }],
-      sessionActivities: async () => new Map(),
-      activities: async (id: string) => { reads.push(Math.floor((clock - start) / 60_000)); return []; },
-    } as never,
-  });
-  await h.store.put({ ...link, sessionId: "s1" });
-  const webhook = (n: number) => h.router.receive({ type: "AgentSessionEvent", action: "prompted", agentSession: { id: "s1" }, agentActivity: { id: `p${n}`, content: { body: "go on" }, userId: OWNER } });
-  webhook(1);
-  await h.router.settled();
-  for (let minute = 1; minute <= 4; minute++) {
-    clock = start + minute * 60_000;
-    webhook(minute + 1);
+  try {
+    await h.store.put({ ...link, sessionId: "s1" });
+    const event = { type: "AgentSessionEvent" as const, action: "prompted", agentSession: { id: "s1" }, agentActivity: { id: "delivered", content: { body: "carry on" }, userId: OWNER } };
+    h.router.receive(event);
     await h.router.settled();
+    assert.equal(reads, 0, "the webhook already contains the prompt; no activity-history request");
+    assert.equal(h.calls.filter((call) => call.startsWith("send a1:") && call.includes("carry on")).length, 1);
+    h.router.receive(event);
+    await h.router.settled();
+    clock += 60_000;
     await h.router.sweep();
-  }
-  assert.deepEqual(reads, [0], "the webhooks cover it, so the sweep skips it every minute");
-  // The last webhook was 90 s ago (still fresh), but nothing has read the session for 5 minutes.
-  clock = start + 5 * 60_000 + 30_000;
-  await h.router.sweep();
-  assert.deepEqual(reads, [0, 5], "the fallback read is due again");
-  // The webhooks stop: once the freshness window is over it is back on the minute sweep.
-  clock = start + 10 * 60_000;
-  await h.router.sweep();
-  await h.router.sweep();
-  assert.deepEqual(reads, [0, 5, 10, 10], "no webhook for 5 minutes: today's reads every sweep");
-  await h.cleanup();
+    assert.equal(reads, 1, "a webhook does not postpone the first recovery read");
+    assert.equal(h.calls.filter((call) => call.startsWith("send a1:") && call.includes("carry on")).length, 1, "webhook retry and reconciliation do not repeat the message");
+    assert.equal(h.calls.filter((call) => call.startsWith("send a1:") && call.includes("Also update the README")).length, 1, "the lost webhook is recovered");
+  } finally { await h.cleanup(); }
 });
 
-test("a webhook pulls a due fallback read forward, and one that is not due does not read", async () => {
-  const start = Date.parse("2026-01-01T00:00:00Z");
-  let clock = start;
-  const reads: string[] = [];
+test("a webhook does not advance the reconciliation checkpoint past an earlier missed prompt", async () => {
+  let clock = Date.parse("2026-01-02T00:00:00Z");
+  let reads = 0;
   const h = routerHarness([], {
     now: () => clock,
     api: {
       activity: async () => {},
+      updateSession: async () => {},
       openSessions: async () => [{ id: "s1", status: "active" }],
       sessionActivities: async () => new Map(),
-      activities: async (id: string) => { reads.push(id); return []; },
+      activities: async (_id: string, since?: string) => {
+        reads++;
+        if (reads === 1) throw new Error("HTTP 503");
+        const missed = { id: "missed", type: "prompt", userId: OWNER, createdAt: "2026-01-01T12:00:00Z", body: "Do not forget the docs" };
+        return !since || missed.createdAt >= since ? [missed] : [];
+      },
     } as never,
   });
-  await h.store.put({ ...link, sessionId: "s1" });
-  const webhook = (n: number) => h.router.receive({ type: "AgentSessionEvent", action: "prompted", agentSession: { id: "s1" }, agentActivity: { id: `p${n}`, content: { body: "go on" }, userId: OWNER } });
-  webhook(1);
-  await h.router.settled();
-  clock += 10_000;
-  webhook(2);
-  await h.router.settled();
-  assert.deepEqual(reads, ["s1"], "a prompt ten seconds later does not read again");
-  clock = start + 5 * 60_000 + 6_000;
-  webhook(3);
-  await h.router.settled();
-  assert.deepEqual(reads, ["s1", "s1"], "the due read happens at the webhook, not at the next sweep");
-  assert.deepEqual(h.router.readStats(), { sweepReads: 0, sweepSkips: 0, webhookReads: 2 });
-  await h.cleanup();
+  try {
+    await h.store.put({ ...link, sessionId: "s1" });
+    h.router.receive({ type: "AgentSessionEvent", action: "prompted", agentSession: { id: "s1" }, agentActivity: { id: "newer", content: { body: "carry on" }, userId: OWNER, createdAt: new Date(clock).toISOString() } });
+    await h.router.settled();
+    clock += 60_000;
+    await h.router.sweep();
+    clock += 60_000;
+    await h.router.sweep();
+    assert.ok(h.calls.some((call) => call.startsWith("send a1:") && call.includes("Do not forget the docs")), "a failed read and a newer webhook cannot skip the older prompt");
+  } finally { await h.cleanup(); }
+});
+
+test("reconciliation survives reload without replaying evicted handled IDs and accepts a new prompt at the checkpoint timestamp", async () => {
+  const prompts = Array.from({ length: 201 }, (_, index) => ({
+    id: `p${index}`, type: "prompt", userId: OWNER,
+    createdAt: new Date(Date.parse("2026-01-01T12:00:00Z") + index * 1000).toISOString(),
+    body: `Follow up ${index}`,
+  }));
+  const api = {
+    activity: async () => {},
+    updateSession: async () => {},
+    openSessions: async () => [{ id: "s1", status: "active" }],
+    sessionActivities: async (ids: string[], since?: ReadonlyMap<string, string>) =>
+      new Map(ids.map((id) => {
+        const cutoff = since?.get(id);
+        return [id, prompts.filter((prompt) => !cutoff || prompt.createdAt >= cutoff)];
+      })),
+  };
+  const first = routerHarness([], { api: api as never });
+  try {
+    await first.store.put(link);
+    await first.router.sweep();
+    assert.equal(first.calls.filter((call) => call.startsWith("send a1:")).length, 201);
+    await first.replies.stop();
+    prompts.push({ ...prompts.at(-1)!, id: "same-time", body: "Same timestamp follow-up" });
+    const resumed = routerHarness([], { api: api as never, store: new SessionStore(first.store.path) });
+    try {
+      await resumed.router.sweep();
+      assert.deepEqual(resumed.calls.filter((call) => call.startsWith("send a1:")), ["send a1: Same timestamp follow-up"], "the persistent frontier prevents replay after the handled-ID window evicts the oldest prompt, without dropping a timestamp tie");
+    } finally { await resumed.cleanup(); }
+  } finally { await first.cleanup(); }
 });
 
 test("a session with no webhook keeps the minute sweep", async () => {
@@ -620,7 +629,7 @@ test("a session with no webhook keeps the minute sweep", async () => {
     clock += 60_000;
   }
   assert.deepEqual(reads, ["s1", "s1", "s1"]);
-  assert.deepEqual(h.router.readStats(), { sweepReads: 3, sweepSkips: 0, webhookReads: 0 });
+  assert.deepEqual(h.router.readStats(), { sweepReads: 3, sweepSkips: 0 });
   await h.cleanup();
 });
 
@@ -645,7 +654,7 @@ test("the minute sweep reads the due sessions' activities in batches of SESSION_
   assert.deepEqual(batches.flat().sort(), [...ids].sort(), "every due session is in exactly one batch");
   assert.deepEqual(singles, [], "no session is read alone when the batch returned it");
   assert.ok(h.calls.some((call) => call.startsWith("send a7:") && call.includes("Also update the README")), JSON.stringify(h.calls));
-  assert.deepEqual(h.router.readStats(), { sweepReads: 25, sweepSkips: 0, webhookReads: 0 });
+  assert.deepEqual(h.router.readStats(), { sweepReads: 25, sweepSkips: 0 });
   await h.cleanup();
 });
 

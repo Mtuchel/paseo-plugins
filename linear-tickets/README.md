@@ -3449,17 +3449,26 @@ No tokens, query bodies or ticket text appear in the report.
   one `agentActivity` per running agent at most every 15 s (`session-live-feed`). Before, it ran
   every 4 s outside any caller and showed as `op:agentActivity`: 200–1,150 app requests an hour
   on server087 (2026-10-08). While a question waits in the panel, the feed holds its actions.
-- **The session sweep's per-session reads follow the webhooks.** It still lists Linear's open
-  agent sessions every minute (one request, shared by the parts of a sweep that need it), because
-  that is how a session whose `created` webhook was missed is found, but it reads a session's
-  activities only when they are due: at most every 5 minutes while Linear webhooks for that
-  session, at once when such a webhook arrives with the read due, and every minute once no webhook
-  has arrived for 5 minutes (a session that was never webhooked for keeps the minute sweep). With
-  22–35 live sessions this is `1 + N/5` requests a minute instead of `1 + N`: about 320–480/h
-  instead of 1,380–2,160/h while every session is covered. `linear.agent-status` reports
-  `webhooks` (delivered since the plugin loaded), `sweepReads`, `sweepSkips` and `webhookReads`;
-  `sweepSkips` against `sweepReads + sweepSkips` is how much of the saving the webhooks actually
-  cover.
+- **Prompted webhooks deliver their payload without an activity-history read.** Linear already
+  sends the message, signal and author in `AgentSessionEvent.agentActivity`; the router handles
+  that payload immediately and deduplicates it against recovery reads. It still lists open
+  sessions every minute (one request shared by the sweep's parts) to recover missed `created`
+  events. A session's first recovery read remains due at the next sweep: receiving a newer webhook
+  does not prove every earlier message arrived. After a complete successful read, recent webhooks
+  cover the session between the existing five-minute recovery reads. Sessions without webhooks,
+  whose webhooks stopped five minutes ago, or whose recovery read failed keep minute recovery.
+  No blanket five-minute polling slowdown is applied. `linear.agent-status` reports `webhooks`,
+  `sweepReads` and `sweepSkips`; the obsolete `webhookReads` counter is removed.
+- **Recovery reads are incremental and prompt-only.** The API filters `type = prompt` and
+  `createdAt >= activityReadThrough`, starting from the session's creation time for older links.
+  The durable frontier advances only after the complete read has been processed, to the latest
+  prompt's timestamp, never to the host's clock or a webhook's timestamp. The inclusive boundary
+  and handled activity IDs preserve timestamp ties and prevent replay after reload. Every cursor
+  page is read; a failed page or missing/repeated continuation cursor cannot mark a partial history
+  complete. A read-only server087 comparison across 20 real sessions returned 2 prompt activities
+  instead of 251 mixed activities from the old first-page query. This reduces transferred history,
+  not the number of first-page requests. See Linear's [agent interaction payloads](https://linear.app/developers/agent-interaction),
+  [filters](https://linear.app/developers/filtering) and [rate-limit guidance](https://linear.app/developers/rate-limiting).
 - **Reads of many sessions or tickets go out in batches.** The router spends both pools on
   background reads (the key first while it has at least the app's headroom), so only less total
   demand lowers the app's hourly count. On server087 in the first hour after the per-session status
@@ -3468,11 +3477,14 @@ No tokens, query bodies or ticket text appear in the report.
   watchdog's screening, now go out in batches, as fresh as before because every batch is read in
   the pass that uses it:
   - The minute sweep reads the due sessions' activities 20 per request (`sessionActivities`,
-    aliased `agentSession` lookups at about 181 points a session) instead of one request each
-    (`session-sweep.missed replies`: 737 requests in that hour). A session Linear no longer has is
+    aliased `agentSession` lookups) instead of one request each (`session-sweep.missed replies`:
+    737 requests in that hour). A full first page now costs 4,820 points for 20 sessions in the
+    live smoke check, below Linear's 10,000-point per-query ceiling; filtering and pagination
+    metadata cost more complexity than the old 3,620-point mixed-history query. Only sessions
+    with another page are included in continuation requests. A session Linear no longer has is
     dropped from the batch and the rest read again; a due session the batch does not return is read
     alone. A failed batch fails its sessions for this sweep, and the next sweep reads them again.
-    Webhooks still read their session alone, at once.
+    Webhooks do not initiate separate history reads.
   - The PR watch reads the attachment links of a run's tickets without a worktree 50 per request
     (`issuesAttachmentUrls`) the first time discovery, a ticket's pull-request lookup or the stack
     policy needs one, instead of one `issueAttachmentUrls` per ticket (896 requests in that hour,

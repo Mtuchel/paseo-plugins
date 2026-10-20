@@ -133,29 +133,19 @@ function sessionStatusesQuery(count: number): string {
   const indexes = Array.from({ length: count }, (_, index) => index);
   return `query sessionStatuses(${indexes.map((index) => `$s${index}: String!`).join(", ")}) {\n${indexes.map((index) => `  s${index}: agentSession(id: $s${index}) { status }`).join("\n")}\n}`;
 }
-const SESSION_ACTIVITIES_QUERY = `query sessionActivities($id: String!) {
-  agentSession(id: $id) { activities(first: 50) { nodes { id createdAt signal user { id } content {
-    __typename
-    ... on AgentActivityPromptContent { body }
-    ... on AgentActivityResponseContent { body }
-    ... on AgentActivityElicitationContent { body }
-    ... on AgentActivityThoughtContent { body }
-    ... on AgentActivityErrorContent { body }
-  } } } }
-}`;
-// Aliased lookups: `s0`…`s<n-1>` bound to the session ids. A session's activities cost about 181
-// points at `first: 50`, so a full batch stays far below Linear's 10,000-point query ceiling.
+// Twenty aliased, prompt-only activity pages stay below Linear's 10,000-point query ceiling.
 export const SESSION_ACTIVITIES_BATCH = 20;
 function sessionActivitiesQuery(count: number): string {
   const indexes = Array.from({ length: count }, (_, index) => index);
-  return `query sessionActivities(${indexes.map((index) => `$s${index}: String!`).join(", ")}) {\n${indexes.map((index) => `  s${index}: agentSession(id: $s${index}) { activities(first: 50) { nodes { id createdAt signal user { id } content {
-    __typename
-    ... on AgentActivityPromptContent { body }
-    ... on AgentActivityResponseContent { body }
-    ... on AgentActivityElicitationContent { body }
-    ... on AgentActivityThoughtContent { body }
-    ... on AgentActivityErrorContent { body }
-  } } } }`).join("\n")}\n}`;
+  return `query sessionActivities(${indexes.map((index) => `$s${index}: String!, $f${index}: AgentActivityFilter!, $c${index}: String`).join(", ")}) {\n${indexes.map((index) => `  s${index}: agentSession(id: $s${index}) {
+    activities(first: 50, after: $c${index}, filter: $f${index}, orderBy: createdAt) {
+      nodes { id createdAt signal user { id } content {
+        __typename
+        ... on AgentActivityPromptContent { body }
+      } }
+      pageInfo { hasNextPage endCursor }
+    }
+  }`).join("\n")}\n}`;
 }
 // An `activities` page's nodes as activities, oldest first: the same mapping for a single session's
 // read and for every alias of a batch.
@@ -324,15 +314,23 @@ export class AgentApi {
   // batch that names an id it has no session for with no data at all, so those ids are dropped and
   // the rest read again; a dropped id is absent from the result, as is one with no session data,
   // and its caller reads it alone (`activities`). Every other failure propagates.
-  async sessionActivities(sessionIds: string[]): Promise<Map<string, AgentActivity[]>> {
+  async sessionActivities(sessionIds: string[], since?: ReadonlyMap<string, string>): Promise<Map<string, AgentActivity[]>> {
     const result = new Map<string, AgentActivity[]>();
     const ids = [...new Set(sessionIds)];
     for (let start = 0; start < ids.length; start += SESSION_ACTIVITIES_BATCH) {
-      let chunk = ids.slice(start, start + SESSION_ACTIVITIES_BATCH);
+      let chunk: { id: string; after: string | null; cursors: Set<string>; activities: AgentActivity[] }[] =
+        ids.slice(start, start + SESSION_ACTIVITIES_BATCH).map((id) => ({ id, after: null, cursors: new Set<string>(), activities: [] }));
       while (chunk.length) {
+        const variables: Record<string, unknown> = {};
+        chunk.forEach(({ id, after }, index) => {
+          variables[`s${index}`] = id;
+          const cutoff = since?.get(id);
+          variables[`f${index}`] = { type: { eq: "prompt" }, ...(cutoff ? { createdAt: { gte: cutoff } } : {}) };
+          variables[`c${index}`] = after;
+        });
         let data: Record<string, unknown>;
         try {
-          data = await this.call(sessionActivitiesQuery(chunk.length), Object.fromEntries(chunk.map((id, index) => [`s${index}`, id])));
+          data = await this.call(sessionActivitiesQuery(chunk.length), variables);
         } catch (error) {
           const missing = new Set(error instanceof LinearApiError && entityNotFound(error) && error.reasons.every((reason) => /^Entity not found\b/.test(reason)) ? error.fields : []);
           const rest = chunk.filter((_, index) => !missing.has(`s${index}`));
@@ -340,19 +338,29 @@ export class AgentApi {
           chunk = rest;
           continue;
         }
-        chunk.forEach((id, index) => {
+        chunk = chunk.filter((pending, index) => {
           const session = data[`s${index}`];
-          if (session === undefined || session === null) return;
-          result.set(id, activityNodes(record(record(session).activities ?? {})));
+          if (session === undefined || session === null) return false;
+          const page = record(record(session).activities ?? {});
+          pending.activities.push(...activityNodes(page));
+          const info = record(page.pageInfo ?? {});
+          if (info.hasNextPage === true) {
+            if (typeof info.endCursor !== "string" || !info.endCursor || pending.cursors.has(info.endCursor)) throw new Error("Linear returned a non-advancing activity cursor");
+            pending.cursors.add(info.endCursor);
+            pending.after = info.endCursor;
+            return true;
+          }
+          result.set(pending.id, pending.activities.sort((a, b) => a.createdAt.localeCompare(b.createdAt)));
+          return false;
         });
-        break;
       }
     }
     return result;
   }
 
-  async activities(sessionId: string): Promise<AgentActivity[]> {
-    const session = record(record(await this.call(SESSION_ACTIVITIES_QUERY, { id: sessionId })).agentSession ?? {});
-    return activityNodes(record(session.activities ?? {}));
+  async activities(sessionId: string, since?: string): Promise<AgentActivity[]> {
+    const found = (await this.sessionActivities([sessionId], since ? new Map([[sessionId, since]]) : undefined)).get(sessionId);
+    if (!found) throw new Error(`Linear returned no activity history for session ${sessionId}`);
+    return found;
   }
 }

@@ -580,7 +580,6 @@ export const agentStatusRpc = defineRpc({
     webhooks: z.number().int().nonnegative(),
     sweepReads: z.number().int().nonnegative(),
     sweepSkips: z.number().int().nonnegative(),
-    webhookReads: z.number().int().nonnegative(),
     usage: linearUsageSchema,
     budget: z.object({
       pools: z.array(z.object({

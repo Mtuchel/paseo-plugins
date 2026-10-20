@@ -108,12 +108,12 @@ test("only this app's sessions are open here: another host's app never has its t
 test("sessionActivities reads up to SESSION_ACTIVITIES_BATCH sessions per aliased request; a session Linear has none for leaves the batch", async () => {
   const sent: Record<string, unknown>[] = [];
   const prompt = (id: string) => ({ id: `p-${id}`, createdAt: "2026-01-02T00:00:00Z", signal: null, user: { id: OWNER }, content: { __typename: "AgentActivityPromptContent", body: `reply in ${id}` } });
-  const api = new AgentApi({ accessToken: async () => "t" }, async (_key, query, variables) => {
-    sent.push(variables);
-    assert.match(query, /^query sessionActivities\(/);
-    const gone = Object.entries(variables).find(([, id]) => id === "s3");
+  const api = new AgentApi({ accessToken: async () => "t" }, async (_key, _query, variables) => {
+    const sessions = Object.entries(variables).filter(([key]) => /^s\d+$/.test(key));
+    sent.push(Object.fromEntries(sessions));
+    const gone = sessions.find(([, id]) => id === "s3");
     if (gone) throw new LinearApiError("The Linear API request failed: Entity not found: AgentSession", 400, ["INPUT_ERROR"], ["Entity not found: AgentSession"], [gone[0]]);
-    return Object.fromEntries(Object.entries(variables).map(([alias, id]) => [alias, { activities: { nodes: [prompt(String(id))] } }]));
+    return Object.fromEntries(sessions.map(([alias, id]) => [alias, { activities: { nodes: [prompt(String(id))], pageInfo: { hasNextPage: false, endCursor: null } } }]));
   });
   const ids = Array.from({ length: 23 }, (_, index) => `s${index}`);
   const found = await api.sessionActivities(ids);
@@ -126,6 +126,36 @@ test("sessionActivities reads up to SESSION_ACTIVITIES_BATCH sessions per aliase
   const failing = new AgentApi({ accessToken: async () => "t" }, async () => { throw new LinearApiError("The Linear API request failed (HTTP 503). Try again.", 503); });
   await assert.rejects(failing.sessionActivities(["s1"]), /HTTP 503/, "every other failure propagates");
   assert.deepEqual(await failing.sessionActivities([]), new Map(), "no ids, no request");
+});
+
+test("session activity reconciliation returns prompts beyond the first page without rereading completed sessions", async () => {
+  const pages: string[] = [];
+  const prompt = (id: string, createdAt: string) => ({ id, createdAt, signal: null, user: { id: OWNER }, content: { __typename: "AgentActivityPromptContent", body: id } });
+  const api = new AgentApi({ accessToken: async () => "t" }, async (_key, _query, variables) => {
+    const sessions = Object.entries(variables).filter(([key]) => /^s\d+$/.test(key));
+    return Object.fromEntries(sessions.map(([alias, id]) => {
+      const index = alias.slice(1);
+      const after = variables[`c${index}`];
+      pages.push(`${id}:${after ?? "first"}`);
+      if (id === "quiet") return [alias, { activities: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } }];
+      const nodes = after
+        ? [prompt("p51", "2026-01-02T00:00:51Z"), prompt("p52", "2026-01-02T00:00:51Z")]
+        : Array.from({ length: 50 }, (_, n) => prompt(`p${n + 1}`, `2026-01-02T00:00:${String(n + 1).padStart(2, "0")}Z`));
+      return [alias, { activities: { nodes, pageInfo: { hasNextPage: !after, endCursor: after ? "done" : "page-1" } } }];
+    }));
+  });
+  const found = await api.sessionActivities(["busy", "quiet"]);
+  assert.deepEqual(found.get("busy")?.map((activity) => activity.id), Array.from({ length: 52 }, (_, n) => `p${n + 1}`));
+  assert.deepEqual(found.get("quiet"), []);
+  assert.deepEqual(pages, ["busy:first", "quiet:first", "busy:page-1"], "only the session with another page is read again");
+});
+
+test("an incomplete activity history is rejected rather than mistaken for a successful reconciliation", async () => {
+  const api = new AgentApi({ accessToken: async () => "t" }, async (_key, _query, variables) => {
+    if (variables.c0) throw new Error("HTTP 503 on the second page");
+    return { s0: { activities: { nodes: [{ id: "p1", createdAt: "2026-01-01T00:00:00Z", content: { __typename: "AgentActivityPromptContent", body: "continue" } }], pageInfo: { hasNextPage: true, endCursor: "page-1" } } } };
+  });
+  await assert.rejects(api.sessionActivities(["busy"]), /HTTP 503 on the second page/);
 });
 
 const NOW = 1_000_000_000_000;
