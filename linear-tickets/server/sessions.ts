@@ -1610,8 +1610,10 @@ export class SessionRouter {
       if (record.status === "cancelled" || record.status === "started") return record;
       const finish = async (result: ContinuationResult) => { await save(result); return result; };
       if (!this.paseo) return { status: record.status, reason: "Paseo is not connected" };
-      // Rechecked inside prompt's ticket gate, immediately before the durable dispatch claim.
-      const authority = async (): Promise<string | null> => {
+      // Checked before the delivery attempt without Linear: a busy worker's continuation is retried
+      // every minute, so the ticket's status is read (`fresh`) only inside prompt's ticket gate,
+      // immediately before the durable dispatch claim.
+      const authority = async (fresh: boolean): Promise<string | null> => {
         if (this.continuationsStopped) throw new Error("the plugin is unloading");
         if ((await this.deps.watchdog?.read())?.holds[input.issueId]) return "owner stopped this ticket";
         if (await this.deps.deletions?.blocked(input.issueId)) return "ticket is paused for deletion";
@@ -1622,14 +1624,16 @@ export class SessionRouter {
         if (recoveryWait) throw new Error(recoveryWait);
         const link = await this.deps.store.forAgent(input.agentId);
         if (link && !link.closed && (link.questions || link.review || link.offer === "parked" || link.offer === "later")) throw new Error("the worker waits for an owner decision");
-        const status = await this.deps.linear.issueStatus(input.issueId);
-        if (["completed", "canceled", "duplicate"].includes(status.statusType.trim().toLowerCase())) return `ticket is ${status.status}`;
+        if (fresh) {
+          const status = await this.deps.linear.issueStatus(input.issueId);
+          if (["completed", "canceled", "duplicate"].includes(status.statusType.trim().toLowerCase())) return `ticket is ${status.status}`;
+        }
         const agents = await issueAgents(this.paseo!, input.issueId);
         if (agents.some((agent) => agent.id !== input.agentId && !agent.archivedAt && !agent.labels?.["paseo.parent-agent-id"] && !agent.labels?.["linear-tickets.steward"] && agent.status !== "closed" && !crashedProcess(agent))) return "a different worker generation owns this ticket";
         return null;
       };
       try {
-        const veto = await authority();
+        const veto = await authority(false);
         if (veto) return finish({ status: "cancelled", reason: veto });
         const found = await this.agent(input.agentId);
         if (!found) return finish({ status: "cancelled", reason: "worker no longer exists" });
@@ -1641,7 +1645,7 @@ export class SessionRouter {
         let claimed = false;
         try {
           const outcome = await this.prompt(input.agentId, `${input.text}\n\n${continuationMarker(input.operationId)}`, async () => {
-            const veto = await authority();
+            const veto = await authority(true);
             if (veto) { await finish({ status: "cancelled", reason: veto }); throw new Error(veto); }
             await save({ status: "unknown", reason: "dispatch claimed; awaiting transport receipt" });
             if (this.continuationsStopped) throw new Error("the plugin unloaded before dispatch");
