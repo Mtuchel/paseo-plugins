@@ -4990,6 +4990,30 @@ test("completion checks fresh multi-repository PRs, including reopened and vetoe
   assert.equal(await watch.completionPulls("i1", "TUC-1", [PR]), "unknown", "an unreadable PR is never proof of completion");
 });
 
+test("PR-veto checks share one open pull request listing per repo for a minute; a failed listing is read again", async (t) => {
+  const h = harness(t);
+  const watch = await h.watch();
+  const queued = await Promise.all([1, 2, 3].map(() => watch.recoveryWait("i1", "TUC-1")));
+  assert.deepEqual(queued, [null, null, null]);
+  assert.equal(await watch.recoveryWait("i1", "TUC-1"), null);
+  assert.deepEqual(h.github.listings, ["tuchel-sohn/tuchel-platform"], "four checks within the minute list the repo once");
+
+  h.github.open = [{ ...listed(prUrl(1700), OPEN_PR, "Implement TUC-1"), labels: ["do-not-merge"] }];
+  h.scripts.now += 59_999;
+  assert.equal(await watch.recoveryWait("i1", "TUC-1"), null, "the minute's listing still answers");
+  h.scripts.now += 1;
+  assert.equal(await watch.recoveryWait("i1", "TUC-1"), "a ticket pull request carries do-not-merge", "after the minute the label added meanwhile vetoes");
+  assert.equal(h.github.listings.length, 2);
+
+  h.scripts.now += 60_000;
+  h.github.listFailure = new Error("HTTP 502");
+  assert.equal(await watch.recoveryWait("i1", "TUC-1"), "the ticket's pull requests cannot be read");
+  h.github.listFailure = null;
+  h.github.open = [];
+  assert.equal(await watch.recoveryWait("i1", "TUC-1"), null, "a failed listing is not kept for the minute");
+  assert.equal(h.github.listings.length, 4);
+});
+
 test("steward PR evidence persists head and CI transitions without timestamp, URL or ordering churn", async (t) => {
   const h = harness(t);
   h.github.view = { ...OPEN_PR, checks: [RUNNING_CI, { ...RUNNING_CI, name: "typecheck" }] };
