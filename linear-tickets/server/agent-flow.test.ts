@@ -633,6 +633,45 @@ test("a session with no webhook keeps the minute sweep", async () => {
   await h.cleanup();
 });
 
+test("verified quiet session coverage reconciles missed prompts at five minutes and falls back immediately when coverage fails", async () => {
+  let clock = Date.parse("2026-01-02T00:00:00Z");
+  let covered = true;
+  let missed = false;
+  let reads = 0;
+  const h = routerHarness([], {
+    now: () => clock,
+    webhookCovered: () => covered,
+    api: {
+      activity: async () => {},
+      updateSession: async () => {},
+      openSessions: async () => [{ id: "s1", status: "active" }],
+      sessionActivities: async () => {
+        reads++;
+        return new Map([["s1", missed ? [{ id: "missed", type: "prompt", userId: OWNER, createdAt: new Date(clock).toISOString(), body: "Recover the missing delivery" }] : []]]);
+      },
+    } as never,
+  });
+  try {
+    await h.store.put(link);
+    await h.router.sweep();
+    missed = true;
+    for (let minute = 1; minute < 5; minute++) {
+      clock += 60_000;
+      await h.router.sweep();
+    }
+    assert.equal(reads, 1, "a quiet subscription remains covered without repeated webhook traffic");
+    assert.equal(h.calls.some((call) => call.includes("Recover the missing delivery")), false);
+    clock += 60_000;
+    await h.router.sweep();
+    assert.equal(reads, 2);
+    assert.equal(h.calls.filter((call) => call.includes("Recover the missing delivery")).length, 1);
+    covered = false;
+    clock += 60_000;
+    await h.router.sweep();
+    assert.equal(reads, 3, "transport failure restores minute recovery even after a successful read");
+  } finally { await h.cleanup(); }
+});
+
 test("the minute sweep reads the due sessions' activities in batches of SESSION_ACTIVITIES_BATCH, not one request per session", async () => {
   const batches: string[][] = [];
   const singles: string[] = [];

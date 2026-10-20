@@ -3,6 +3,7 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { setImmediate } from "node:timers/promises";
 import { parseLabelRules, SETTLE_MS, type LabelEvent, type LabelRules, type SweptIssue } from "./label-rules";
 import { LabelSync, PullRequestFiles, type PullRequestRead } from "./label-sync";
 import type { CatalogLabel } from "./linear";
@@ -138,6 +139,191 @@ test("without the Paseo app nothing is written: its authorship is what marks the
   assert.deepEqual([off.writes, off.sweeps], [[], []], "no rules file: the feature is off");
 });
 
+test("covered periodic sweeps reconcile at five minutes, coverage loss restores two minutes, and explicit sync stays immediate", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: NOW });
+  t.mock.method(console, "error", () => {});
+  const linear = new FakeLinear();
+  let covered = true;
+  const labels = new LabelSync({ linear, pullRequests: noFiles, rules: async () => RULES, covered: () => covered });
+  t.after(() => labels.stop());
+  labels.start();
+  await setImmediate();
+  assert.deepEqual(linear.sweeps, [null], "startup does not wait for an event");
+  t.mock.timers.tick(4 * 60_000);
+  await setImmediate();
+  assert.deepEqual(linear.sweeps, [null]);
+  t.mock.timers.tick(60_000);
+  await setImmediate();
+  assert.deepEqual(linear.sweeps, [null, new Date(NOW - 60_000).toISOString()]);
+  await labels.sync();
+  assert.equal(linear.sweeps.length, 3, "an explicit request bypasses the covered interval");
+  covered = false;
+  t.mock.timers.tick(2 * 60_000);
+  await setImmediate();
+  assert.equal(linear.sweeps.length, 4);
+  t.mock.timers.tick(23 * 60_000);
+  await setImmediate();
+  assert.equal(linear.sweeps.at(-1), null, "the thirty-minute full sweep still runs");
+});
+
+test("creating local rules applies them on the next minute even with five-minute webhook coverage", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: NOW });
+  t.mock.method(console, "log", () => {});
+  const linear = new FakeLinear();
+  linear.issues = [issue("a", "Invoice routing")];
+  let rules: LabelRules | null = null;
+  const labels = new LabelSync({ linear, pullRequests: noFiles, rules: async () => rules, covered: () => true });
+  t.after(() => labels.stop());
+  labels.start();
+  await setImmediate();
+  rules = parseLabelRules(JSON.stringify({ teamKeys: ["TUC"], groups: [{ name: "Area", labels: [{ name: "Billing", title: ["invoice"] }] }] }));
+  t.mock.timers.tick(60_000);
+  await setImmediate();
+  const billing = linear.catalog.find((label) => label.name === "Billing");
+  assert.ok(billing);
+  assert.ok(linear.writes.includes(`a +${billing.id} -`), "new local rules label existing issues without waiting for reconciliation");
+});
+
+test("without coverage the periodic sweep retains its original two-minute interval", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: NOW });
+  t.mock.method(console, "error", () => {});
+  const linear = new FakeLinear();
+  const labels = new LabelSync({ linear, pullRequests: noFiles, rules: async () => RULES });
+  t.after(() => labels.stop());
+  labels.start();
+  await setImmediate();
+  t.mock.timers.tick(60_000);
+  await setImmediate();
+  assert.deepEqual(linear.sweeps, [null]);
+  t.mock.timers.tick(60_000);
+  await setImmediate();
+  assert.deepEqual(linear.sweeps, [null, new Date(NOW - 60_000).toISOString()]);
+});
+
+test("a covered read failure retries at the fast interval and still finds an issue from the failed window", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: NOW });
+  t.mock.method(console, "error", () => {});
+  t.mock.method(console, "log", () => {});
+  const linear = new FakeLinear();
+  const labels = new LabelSync({ linear, pullRequests: noFiles, rules: async () => RULES, covered: () => true });
+  t.after(() => labels.stop());
+  labels.start();
+  await setImmediate();
+  const sweep = linear.labelSweep.bind(linear);
+  let failing = true;
+  t.mock.method(linear, "labelSweep", async (teams: string[], since: string | null, after: string | null) => {
+    if (failing) throw new Error("read refused");
+    return sweep(teams, since, after);
+  });
+  linear.issues = [{ ...issue("missed", "Customer list"), updatedAt: new Date(NOW + 1).toISOString() }];
+  t.mock.timers.tick(5 * 60_000);
+  await setImmediate();
+  failing = false;
+  t.mock.timers.tick(60_000);
+  await setImmediate();
+  assert.deepEqual(linear.sweeps, [null]);
+  t.mock.timers.tick(60_000);
+  await setImmediate();
+  assert.deepEqual(linear.sweeps, [null, new Date(NOW - 60_000).toISOString()]);
+  assert.ok(linear.writes.includes("missed +new-3 -"));
+});
+
+
+test("issue events debounce into incremental sweeps even while a full recovery sweep is due", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: NOW });
+  t.mock.method(console, "error", () => {});
+  t.mock.method(console, "log", () => {});
+  const linear = new FakeLinear();
+  linear.issues = [{ ...issue("new", "Customer list"), createdAt: new Date(NOW).toISOString(), updatedAt: new Date(NOW).toISOString() }];
+  const labels = new LabelSync({ linear, pullRequests: noFiles, rules: async () => RULES, covered: () => true });
+  t.after(() => labels.stop());
+  labels.start();
+  await setImmediate();
+  const watermark = new Date(NOW - 60_000).toISOString();
+  labels.issueChanged("new");
+  t.mock.timers.tick(1_000);
+  labels.issueChanged("another");
+  t.mock.timers.tick(1_999);
+  await setImmediate();
+  assert.deepEqual(linear.sweeps, [null]);
+  t.mock.timers.tick(1);
+  await setImmediate();
+  assert.deepEqual(linear.sweeps, [null, watermark]);
+  labels.stop();
+  labels.issueChanged("new");
+  t.mock.timers.tick(5_000);
+  await setImmediate();
+  assert.deepEqual(linear.sweeps, [null, watermark], "stopped hooks do not run");
+});
+
+test("catalog events resolve groups again and apply the newly available label without a restart", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: NOW });
+  t.mock.method(console, "error", () => {});
+  t.mock.method(console, "log", () => {});
+  const linear = new FakeLinear();
+  linear.issues = [issue("a", "Add feature")];
+  const labels = new LabelSync({ linear, pullRequests: noFiles, rules: async () => RULES, covered: () => true });
+  t.after(() => labels.stop());
+  labels.start();
+  await setImmediate();
+  assert.equal(linear.writes.some((write) => write.startsWith("a +")), false);
+  linear.catalog.find((entry) => entry.id === "feature")!.parentId = linear.catalog.find((entry) => entry.name === "Type")!.id;
+  labels.catalogChanged();
+  t.mock.timers.tick(2_000);
+  await setImmediate();
+  assert.ok(linear.writes.includes("a +feature -"));
+});
+
+test("a failed label write keeps the incremental watermark so the next cycle retries the issue", async (t) => {
+  t.mock.method(console, "error", () => {});
+  t.mock.method(console, "log", () => {});
+  const linear = new FakeLinear();
+  let now = NOW;
+  const labels = sync(linear, RULES, () => now);
+  await labels.sync();
+  const watermark = new Date(NOW - 60_000).toISOString();
+  linear.issues = [{ ...issue("a", "Customer list"), updatedAt: new Date(NOW + 1).toISOString() }];
+  now += 5 * 60_000;
+  let failing = true;
+  const changeLabels = linear.changeLabels.bind(linear);
+  t.mock.method(linear, "changeLabels", async (id: string, added: string[], removed: string[]) => {
+    if (failing) throw new Error("write refused");
+    await changeLabels(id, added, removed);
+  });
+  await labels.sync();
+  failing = false;
+  now += 5 * 60_000;
+  await labels.sync();
+  assert.deepEqual(linear.sweeps, [null, watermark, watermark]);
+  assert.ok(linear.writes.includes("a +new-3 -"));
+});
+
+test("a self-write issue event settles after one incremental pass instead of creating a write loop", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: NOW });
+  t.mock.method(console, "error", () => {});
+  t.mock.method(console, "log", () => {});
+  const linear = new FakeLinear();
+  linear.issues = [issue("a", "Customer list")];
+  const labels = new LabelSync({ linear, pullRequests: noFiles, rules: async () => RULES, covered: () => true });
+  t.after(() => labels.stop());
+  const changeLabels = linear.changeLabels.bind(linear);
+  t.mock.method(linear, "changeLabels", async (id: string, added: string[], removed: string[]) => {
+    await changeLabels(id, added, removed);
+    const item = linear.issues.find((entry) => entry.id === id)!;
+    item.labelIds = [...item.labelIds.filter((label) => !removed.includes(label)), ...added];
+    item.updatedAt = new Date().toISOString();
+    labels.issueChanged(id);
+  });
+  labels.start();
+  await setImmediate();
+  t.mock.timers.tick(2_000);
+  await setImmediate();
+  t.mock.timers.tick(2_000);
+  await setImmediate();
+  assert.deepEqual(linear.writes.filter((write) => write.startsWith("a +")), ["a +new-3 -"]);
+  assert.deepEqual(linear.sweeps, [null, new Date(NOW - 60_000).toISOString()]);
+});
+
 test("pull request files: merged ones are kept on disk, open ones read again when stale, missing ones never again", async (t) => {
   t.mock.method(console, "error", () => {});
   const home = await mkdtemp(join(tmpdir(), "paseo-pr-files-"));
@@ -165,4 +351,33 @@ test("pull request files: merged ones are kept on disk, open ones read again whe
     assert.deepEqual(reads, ["open"], "the limit counts reads, not known pull requests");
     assert.deepEqual(restarted.filesOf("merged"), ["o/r/a.ts"]);
   } finally { await rm(home, { recursive: true, force: true }); }
+});
+
+test("a catalog event during group resolution is not lost behind the in-flight catalog snapshot", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: NOW });
+  t.mock.method(console, "error", () => {});
+  t.mock.method(console, "log", () => {});
+  const linear = new FakeLinear();
+  linear.issues = [issue("a", "Add feature")];
+  // Executor form: the plugin's ES2023 lib has no Promise.withResolvers.
+  let finish!: (catalog: CatalogLabel[]) => void;
+  const snapshot = new Promise<CatalogLabel[]>((resolve) => { finish = resolve; });
+  const oldCatalog = linear.catalog.map((entry) => ({ ...entry }));
+  let reads = 0;
+  t.mock.method(linear, "labelCatalog", async () => {
+    reads++;
+    return reads === 1 ? snapshot : linear.catalog;
+  });
+  const labels = new LabelSync({ linear, pullRequests: noFiles, rules: async () => RULES, covered: () => true });
+  t.after(() => labels.stop());
+  labels.start();
+  await setImmediate();
+  labels.catalogChanged();
+  finish(oldCatalog);
+  await setImmediate();
+  assert.equal(linear.writes.some((write) => write.startsWith("a +")), false);
+  linear.catalog.find((entry) => entry.id === "feature")!.parentId = linear.catalog.find((entry) => entry.name === "Type")!.id;
+  t.mock.timers.tick(2_000);
+  await setImmediate();
+  assert.ok(linear.writes.includes("a +feature -"), "the catalog event forces a fresh resolution after the old snapshot completes");
 });

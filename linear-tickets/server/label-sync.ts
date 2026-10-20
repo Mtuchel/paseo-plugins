@@ -8,6 +8,10 @@ import { GitHubRateLimitedError, RateLimitedError, withPriority } from "./rate-b
 import { paseoHome } from "./ticket-mcp";
 
 const SYNC_MS = 2 * 60 * 1000;
+const COVERED_SYNC_MS = 300_000;
+// Check coverage cheaply each minute so losing it restores the original two-minute cadence.
+const TIMER_MS = 60_000;
+const SOON_MS = 2_000;
 // A full sweep reads every issue of the teams; the ones in between only issues updated since the last.
 const FULL_SWEEP_MS = 30 * 60 * 1000;
 // Incremental sweeps overlap by this much, so an update made while a sweep ran is not missed.
@@ -103,6 +107,7 @@ type Deps = {
   pullRequests: Pick<PullRequestFiles, "filesOf" | "refresh">;
   rules?: () => Promise<LabelRules | null>;
   now?: () => number;
+  covered?: () => boolean;
 };
 
 // Keeps the configured label groups on the teams' issues (see label-rules.ts). Every cycle sweeps the
@@ -111,12 +116,17 @@ type Deps = {
 // is how the plugin tells its own labels from the ones people set.
 export class LabelSync {
   private timer: NodeJS.Timeout | null = null;
+  private soonTimer: NodeJS.Timeout | null = null;
   private running: Promise<void> | null = null;
-  private again = false;
+  private again: "event" | "sync" | null = null;
+  private lastAttempt = -Infinity;
+  private retry = false;
   private stopped = false;
   private readonly logged = new Set<string>();
   // `complete`: every configured label was found or made in its group; else checked again with the next full sweep.
   private groups: { hash: string; resolved: ResolvedGroup[]; complete: boolean } | null = null;
+  private catalogVersion = 0;
+  private rulesHash: string | null = null;
   private lastFull = -Infinity;
   private watermark: string | null = null;
   // "<issue id> <group id>" → the issue's updatedAt when a person's choice was found; read again once the issue changes.
@@ -126,7 +136,12 @@ export class LabelSync {
 
   start(): void {
     if (this.timer || this.stopped) return;
-    this.timer = setInterval(() => { void this.sync(); }, SYNC_MS);
+    this.timer = setInterval(() => {
+      void (this.deps.rules ?? readLabelRules)().then((rules) => {
+        const interval = this.deps.covered?.() && !this.retry ? COVERED_SYNC_MS : SYNC_MS;
+        if ((rules?.hash ?? null) !== this.rulesHash || (this.deps.now?.() ?? Date.now()) - this.lastAttempt >= interval) void this.sync();
+      }).catch((error: unknown) => this.report(error));
+    }, TIMER_MS);
     this.timer.unref?.();
     void this.sync();
   }
@@ -134,14 +149,48 @@ export class LabelSync {
   stop(): void {
     this.stopped = true;
     clearInterval(this.timer ?? undefined);
-    this.timer = null;
+    clearTimeout(this.soonTimer ?? undefined);
+    this.timer = this.soonTimer = null;
+  }
+
+  // No targeted-ID labelSweep seam exists: debounce issue events into one incremental sweep.
+  issueChanged(_issueId: string): void {
+    this.soon();
+  }
+
+  catalogChanged(): void {
+    this.catalogVersion++;
+    this.groups = null;
+    this.soon();
+  }
+
+  private soon(): void {
+    if (this.stopped || !this.timer) return;
+    clearTimeout(this.soonTimer ?? undefined);
+    this.soonTimer = setTimeout(() => {
+      this.soonTimer = null;
+      void this.requestSync(true);
+    }, SOON_MS);
+    this.soonTimer.unref?.();
   }
 
   sync(): Promise<void> {
-    if (this.running) { this.again = true; return this.running; }
-    this.running = this.run().catch((error: unknown) => this.report(error)).finally(() => {
+    return this.requestSync(false);
+  }
+
+  private requestSync(event: boolean): Promise<void> {
+    if (this.running) {
+      if (!event || !this.again) this.again = event ? "event" : "sync";
+      return this.running;
+    }
+    // Event traffic must not postpone the periodic full/recovery sweeps indefinitely.
+    if (!event) this.lastAttempt = this.deps.now?.() ?? Date.now();
+    this.retry = true;
+    this.running = this.run(event).then((success) => { this.retry = !success; }).catch((error: unknown) => this.report(error)).finally(() => {
       this.running = null;
-      if (this.again && !this.stopped) { this.again = false; void this.sync(); }
+      const again = this.again;
+      this.again = null;
+      if (again && !this.stopped) void this.requestSync(again === "event");
     });
     return this.running;
   }
@@ -154,24 +203,29 @@ export class LabelSync {
     console.error(`[linear-tickets] label rules: ${message}`);
   }
 
-  private async run(): Promise<void> {
+  private async run(event: boolean): Promise<boolean> {
     // Background priority covers the whole round, the rules read and the app check included, so a
     // direct call pauses at the pool's reserve before its first request (see rate-budget.ts).
-    await withPriority("background", "label-sync", async () => {
-      if (this.stopped) return;
+    return withPriority("background", "label-sync", async () => {
+      if (this.stopped) return false;
       const rules = await (this.deps.rules ?? readLabelRules)();
-      if (!rules) { this.groups = null; return; }
+      this.rulesHash = rules?.hash ?? null;
+      if (!rules) { this.groups = null; return true; }
       const pluginUser = await this.deps.linear.appUserId();
       if (!pluginUser) throw new Error("the Paseo Linear app is not usable on this host; labels wait for it, since the app's authorship tells the plugin's labels from people's.");
       const now = this.deps.now?.() ?? Date.now();
-      const full = now - this.lastFull >= FULL_SWEEP_MS;
-      if (this.groups?.hash !== rules.hash || (!this.groups.complete && full)) {
-        this.groups = { hash: rules.hash, ...await this.ensureGroups(rules) };
+      const full = !event && now - this.lastFull >= FULL_SWEEP_MS;
+      let groups = this.groups;
+      if (groups?.hash !== rules.hash || (!groups.complete && full)) {
+        const version = this.catalogVersion;
+        groups = { hash: rules.hash, ...await this.ensureGroups(rules) };
+        // A catalog event received during resolution must still cause another resolution.
+        if (version === this.catalogVersion) this.groups = groups;
         this.watermark = null;
       }
       const issues = await this.sweep(rules.teamKeys, full ? null : this.watermark);
       await this.deps.pullRequests.refresh(issues.flatMap((issue) => issue.pullRequests), PULL_REQUEST_READS);
-      const { changes, waiting } = planLabelChanges(issues, this.groups.resolved, (url) => this.deps.pullRequests.filesOf(url), now);
+      const { changes, waiting } = planLabelChanges(issues, groups.resolved, (url) => this.deps.pullRequests.filesOf(url), now);
       let failures = 0;
       let failed = false;
       for (const change of changes) {
@@ -193,12 +247,17 @@ export class LabelSync {
           this.report(error);
         }
       }
+      if (this.stopped) return false;
       if (failures >= MAX_FAILURES) throw new Error(`stopped this round after ${MAX_FAILURES} failed label changes; retrying with the next cycle.`);
-      // Undecided issues are not updated again by themselves, so the next cycle reads them all.
-      if (waiting) this.lastFull = -Infinity;
-      else if (full) this.lastFull = now;
-      this.watermark = new Date(now - SWEEP_OVERLAP_MS).toISOString();
-      if (!failed) this.logged.clear();
+      // Failed processing must not move the cursor beyond issues that still need a retry.
+      if (!failed) {
+        // Undecided issues are not updated again by themselves, so the next periodic cycle reads them all.
+        if (waiting) this.lastFull = -Infinity;
+        else if (full) this.lastFull = now;
+        this.watermark = new Date(now - SWEEP_OVERLAP_MS).toISOString();
+        this.logged.clear();
+      }
+      return !failed;
     });
   }
 

@@ -8,8 +8,9 @@ import { PLAN_APPROVED_STATE, PLAN_REVIEW_STATE, PLANNING_STATE, planStage, type
 // belong to the plugin: it assigns, swaps and removes them. Every other label is left alone.
 export const STATE_LABEL_PREFIX = "Linear: ";
 const SYNC_MS = 60_000;
-// States read within this window are not read again; just under one cycle, so each cycle reads all.
+// Uncovered receivers retain the original fast polling; verified coverage bounds missed events.
 const FRESH_MS = 50_000;
+const COVERED_FRESH_MS = 300_000;
 // Tickets Linear did not return (deleted, archived, invisible) are asked about again after this.
 const MISSING_RETRY_MS = 60 * 60 * 1000;
 // After an agent is created: long enough for its workspace and labels to settle.
@@ -147,6 +148,7 @@ type Deps = {
   linear: Pick<LinearService, "issueStatuses">;
   daemon: () => Promise<LabelDaemon | null>;
   now?: () => number;
+  covered?: () => boolean;
 };
 
 export class StateLabels {
@@ -157,6 +159,7 @@ export class StateLabels {
   private stopped = false;
   private readonly states = new Map<string, { state: TicketState; at: number }>();
   private readonly missing = new Map<string, number>();
+  private readonly reading = new Set<string>();
   private readonly logged = new Set<string>();
 
   constructor(private readonly deps: Deps) {}
@@ -178,8 +181,24 @@ export class StateLabels {
   // A state the plugin just wrote: shown without reading it back from Linear.
   noteState(issueId: string, state: WrittenState): void {
     this.states.set(issueId, { state, at: this.deps.now?.() ?? Date.now() });
+    this.reading.delete(issueId);
     this.missing.delete(issueId);
     this.soon();
+  }
+
+  // An issue event invalidates only that ticket, including a previous missing result.
+  issueChanged(issueId: string): void {
+    this.states.delete(issueId);
+    this.missing.delete(issueId);
+    this.reading.delete(issueId);
+    this.soon();
+  }
+
+  recover(): Promise<void> {
+    this.states.clear();
+    this.missing.clear();
+    this.reading.clear();
+    return this.sync();
   }
 
   // A new agent or workspace: label it now rather than at the next cycle.
@@ -237,15 +256,23 @@ export class StateLabels {
   // shown are dropped.
   private async readStates(tickets: Set<string>): Promise<void> {
     const now = this.deps.now?.() ?? Date.now();
-    for (const [id, entry] of this.states) if (!tickets.has(id) && now - entry.at > FRESH_MS) this.states.delete(id);
+    const fresh = this.deps.covered?.() ? COVERED_FRESH_MS : FRESH_MS;
+    for (const [id, entry] of this.states) if (!tickets.has(id) && now - entry.at >= fresh) this.states.delete(id);
     for (const [id, until] of this.missing) if (!tickets.has(id) || until <= now) this.missing.delete(id);
-    const due = [...tickets].filter((id) => !this.missing.has(id) && now - (this.states.get(id)?.at ?? -Infinity) > FRESH_MS);
+    const due = [...tickets].filter((id) => !this.missing.has(id) && now - (this.states.get(id)?.at ?? -Infinity) >= fresh);
     if (!due.length) return;
-    const found = await withPriority("background", "state-labels", () => this.deps.linear.issueStatuses(due));
-    for (const id of due) {
-      const status = found.get(id);
-      if (status?.status) this.states.set(id, { state: { name: status.status, type: status.statusType }, at: now });
-      else { this.states.delete(id); this.missing.set(id, now + MISSING_RETRY_MS); }
+    for (const id of due) this.reading.add(id);
+    try {
+      const found = await withPriority("background", "state-labels", () => this.deps.linear.issueStatuses(due));
+      for (const id of due) {
+        // A later event or local write wins over the snapshot this request started reading.
+        if (!this.reading.delete(id)) continue;
+        const status = found.get(id);
+        if (status?.status) this.states.set(id, { state: { name: status.status, type: status.statusType }, at: now });
+        else { this.states.delete(id); this.missing.set(id, now + MISSING_RETRY_MS); }
+      }
+    } finally {
+      this.reading.clear();
     }
   }
 }

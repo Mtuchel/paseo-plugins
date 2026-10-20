@@ -39,11 +39,9 @@ const HANDLED_LIMIT = 200;
 const SWEEP_MS = 60_000;
 const QUEUED_OWNER_MAX_PAGES = 100;
 const PARENT_HANDOUT_LIMIT = 12;
-// A session Linear webhooks for is re-read on this fallback cadence instead of every sweep, and a
-// webhook whose read is due pulls it forward instead of waiting for the sweep (README, "Rate
-// limits"). The webhook delivers the prompt itself, so the read only backstops a delivery Linear
-// dropped: with no webhook for this long the session returns to the per-minute sweep, exactly the
-// cost of a missed webhook before.
+// A verified live agent subscription delivers prompts immediately. History remains a five-minute
+// backstop even while quiet; unavailable coverage restores minute reads. A failed history read
+// never starts this window.
 const WEBHOOK_FALLBACK_MS = 5 * 60 * 1000;
 const ADOPT_WINDOW_MS = 2 * 60 * 60 * 1000;
 export const APPROVE_PLAN = "approve-plan";
@@ -421,6 +419,7 @@ type Deps = {
   // The clock the webhook fallback windows are measured against.
   now?: () => number;
   budget?: Pick<RateBudget, "pausedUntil" | "blockedUntil">;
+  webhookCovered?: () => boolean;
   deletions?: Pick<ReviewDeletions, "get" | "blocked" | "forAgent">;
   // The watchdog's durable owner Stop and owner continuations (watchdog.ts).
   watchdog?: Pick<WatchdogStore, "hold" | "continued" | "read">;
@@ -449,6 +448,7 @@ export class SessionRouter {
   private waiting: AgentSessionWebhook[] = [];
   private timer: NodeJS.Timeout | null = null;
   private sweeping = false;
+  private recoveryPending = false;
   private pausedSweep: string | null = null;
   private pauseDuringSweep = false;
   // Agents the user stopped from Linear: a turn the provider starts on its own is stopped again.
@@ -457,9 +457,7 @@ export class SessionRouter {
   // `asking`: Linear shows an elicitation's options only while it is the newest activity, so the
   // feed holds its actions from a question until the owner's reply.
   private readonly live = new Map<string, { sessionId: string; stop: () => void; pending: string[]; timer: NodeJS.Timeout | null; posted: number; asking: boolean }>();
-  // Webhooks deliver prompts directly. Recovery reads remain due until a full history read
-  // succeeded; only then can recent webhooks cover this session between fallback reads.
-  private readonly webhookedAt = new Map<string, number>();
+  // Only a complete successful history read starts the covered fallback window.
   private readonly activityReadAt = new Map<string, number>();
   private readonly readingSession = new Set<string>();
   private readonly reads = { sweep: 0, skipped: 0 };
@@ -499,8 +497,9 @@ export class SessionRouter {
   }
 
   attach(paseo: PaseoApi): void {
-    if (this.paseo) return;
+    const first = !this.paseo;
     this.paseo = paseo;
+    if (!first) return;
     for (const event of this.waiting.splice(0)) this.track(this.handle(event));
     this.timer = setInterval(() => { void this.sweep(); }, SWEEP_MS);
     this.timer.unref?.();
@@ -510,8 +509,17 @@ export class SessionRouter {
     void this.drainContinuations();
   }
 
+  // A receiver/daemon reconnection must not inherit the old successful-read window.
+  reconcile(): void {
+    if (this.sweeping) { this.recoveryPending = true; return; }
+    this.recoveryPending = false;
+    this.activityReadAt.clear();
+    void this.sweep();
+  }
+
   stop(): void {
     this.continuationsStopped = true;
+    this.recoveryPending = false;
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
     clearInterval(this.continuationTimer ?? undefined);
@@ -558,7 +566,6 @@ export class SessionRouter {
   // Entry point for webhooks. Acknowledges `created` right away — Linear marks sessions without
   // an activity within 10 s as unresponsive — even before Paseo is reachable.
   receive(event: AgentSessionWebhook): void {
-    this.webhookedAt.set(event.agentSession.id, this.clock());
     if (event.action === "created") void this.acknowledge(event.agentSession);
     if (!this.paseo) { this.waiting.push(event); return; }
     this.track(this.handle(event));
@@ -1473,6 +1480,7 @@ export class SessionRouter {
     } finally {
       this.sweeping = false;
       if (!this.pauseDuringSweep) this.pausedSweep = null;
+      if (this.recoveryPending) this.reconcile();
     }
   }
 
@@ -1492,10 +1500,8 @@ export class SessionRouter {
     this.pauseDuringSweep = true;
   }
 
-  // New sessions nobody started and prompts not yet handled. A thread whose read fails is tried
-  // again next minute; the threads after it go ahead. A session Linear webhooks for is skipped
-  // until the fallback cadence is due (README, "Rate limits"); with no webhook it is read here
-  // every minute, as before.
+  // Read every minute unless the receiver has verified agent-event coverage and this session
+  // completed its initial history read. Even a silent lost delivery is recovered within five minutes.
   private async catchUp(): Promise<void> {
     const sessions = await this.listSessions();
     const failures: string[] = [];
@@ -1520,9 +1526,8 @@ export class SessionRouter {
         }
         if (!["pending", "active", "awaitingInput"].includes(session.status)) continue;
         const now = this.clock();
-        const hookedAt = this.webhookedAt.get(session.id);
         const readAt = this.activityReadAt.get(session.id);
-        if (hookedAt !== undefined && now - hookedAt < WEBHOOK_FALLBACK_MS && readAt !== undefined && now - readAt < WEBHOOK_FALLBACK_MS) {
+        if (this.deps.webhookCovered?.() && readAt !== undefined && now - readAt < WEBHOOK_FALLBACK_MS) {
           this.reads.skipped += 1;
           continue;
         }
