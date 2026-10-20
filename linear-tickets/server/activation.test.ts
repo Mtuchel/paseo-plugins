@@ -21,6 +21,7 @@ import { Launcher, type ResumeTarget } from "./launch";
 import { PermissionReplies } from "./permission-replies";
 import { SessionStore } from "./sessions";
 import { isUntrusted, ResumeUnavailableError, TicketStarter } from "./starter";
+import { RepairBusyError } from "./repair-exclusion";
 import { DEFAULT_WORKTREE_SHARDS, DEFAULT_ACTIVATION, DEFAULT_BACKSTOP, DEFAULT_DISPATCH, DEFAULT_WRITEBACK, DEFAULT_WATCHDOG, DEFAULT_STEWARD, DEFAULT_DEPUTY, Settings, type ActivationSettings, type PluginSettings } from "./settings";
 import { WATCHDOG_LABEL, WatchdogStore } from "./watchdog";
 
@@ -928,7 +929,7 @@ const RESUME_SETTINGS: PluginSettings = {
   projectMappings: { "project:lp-1": { projectId: "p1", label: "App", baseBranch: "refs/heads/dev" } },
 };
 
-function resumeDestination(home: string, repo: string): { intake: ActivationIntake; resumes: (ResumeTarget | undefined)[]; comments: string[] } {
+function resumeDestination(home: string, repo: string, failure: { error?: Error } = {}): { intake: ActivationIntake; resumes: (ResumeTarget | undefined)[]; comments: string[]; failure: { error?: Error } } {
   const daemon = fakeDaemon([]);
   Object.assign(daemon.paseo, { projects: { list: async () => ({ projects: [{ projectId: "p1", projectKind: "git", projectRootPath: repo, projectDisplayName: "repo" }] }) } });
   const resumes: (ResumeTarget | undefined)[] = [];
@@ -946,7 +947,7 @@ function resumeDestination(home: string, repo: string): { intake: ActivationInta
   };
   const starter = new TicketStarter({
     linear: linear as never,
-    launcher: { start: async (_input: unknown, _paseo: unknown, launchOptions: { resume?: ResumeTarget }) => { resumes.push(launchOptions.resume); return { agentId: "agent-1", warnings: [] }; } } as never,
+    launcher: { start: async (_input: unknown, _paseo: unknown, launchOptions: { resume?: ResumeTarget }) => { resumes.push(launchOptions.resume); if (failure.error) throw failure.error; return { agentId: "agent-1", warnings: [] }; } } as never,
     // A record of this host's own, which a forwarded resume must never silently fall back to.
     handover: { resumeTarget: async () => ({ branch: "local-old-work", worktreePath: null, handover: "This host's own record." }) } as never,
     branches: async () => ({ branches: [{ id: "refs/heads/mtuchel/tuc-1-fix", label: "mtuchel/tuc-1-fix" }], defaultBranch: null }),
@@ -958,7 +959,7 @@ function resumeDestination(home: string, repo: string): { intake: ActivationInta
     launcher: () => ({ gate: () => ({ release: () => {} }) }),
     starter: () => starter,
   });
-  return { intake, resumes, comments };
+  return { intake, resumes, comments, failure };
 }
 
 // The actual failure, end to end with real git on both sides: the source host has the record and
@@ -1032,6 +1033,46 @@ test("a source-only handover resume starts on the receiving host at the exact re
   assert.equal((await dest.intake.status()).handoffs, 2, "it waits as a queued handoff for the sending host's snapshot");
   assert.match(dest.comments.at(-1) ?? "", /did not carry the recorded branch, its exact commit and the dirty state/);
   assert.match(dest.comments.at(-1) ?? "", /The sending host must forward the recorded branch's exact commit and dirty state/, "the way to fix it is named");
+});
+
+// A destination whose launcher is refused by the repair's reservation: the recorded resume is
+// attempted once, the envelope stays pending, and its own retry starts it after the repair.
+test("a resume refused while a repair holds the ticket stays pending and starts on its retry, not as a handoff", async (t) => {
+  const home = await withHome(t);
+  const repo = await mkdtemp(join(tmpdir(), "paseo-repair-resume-"));
+  t.after(() => rm(repo, { recursive: true, force: true }));
+  const git = async (...args: string[]) => (await exec("git", ["-C", repo, ...args], { maxBuffer: 1_000_000 })).stdout.trim();
+  await git("init", "--quiet");
+  await git("config", "user.email", "test@example.com");
+  await git("config", "user.name", "Test");
+  await writeFile(join(repo, "work.txt"), "the fix\n");
+  await git("add", "work.txt");
+  await git("commit", "--quiet", "-m", "fix");
+  await git("checkout", "--quiet", "-b", "mtuchel/tuc-1-fix");
+  const head = await git("rev-parse", "HEAD");
+  const dest = resumeDestination(home, repo, { error: new RepairBusyError() });
+  const resume: ActivationResume = { branch: "mtuchel/tuc-1-fix", commit: head, dirty: false, handover: "Continue the recorded work." };
+  const envelope = activationEnvelopeSchema.parse({ id: "watchdog:i1:cycle-1:succeed", kind: "recover", issueId: ISSUE, identifier: "TUC-1", text: "The previous agent stopped making progress.", strictResume: true, resume, watchdog: { v: 1 }, host: "mac", requestedAt: "2026-01-01T00:00:00Z" });
+
+  assert.equal((await dest.intake.accept(envelope)).status, 202);
+  await dest.intake.idle();
+  const waiting = await dest.intake.status();
+  assert.deepEqual({ pending: waiting.pending, handoffs: waiting.handoffs }, { pending: 1, handoffs: 0 }, "kept for its retry pass, never queued for the owner");
+  assert.deepEqual(dest.resumes, [{ branch: "mtuchel/tuc-1-fix", worktreePath: null, handover: resume.handover }], "the recorded resume was tried once, no fresh start");
+  assert.deepEqual(dest.comments, [], "no handoff note");
+
+  const file = JSON.parse(await readFile(join(home, "activation-pending.json"), "utf8")) as { entries: Record<string, { retryAt: string }> };
+  for (const entry of Object.values(file.entries)) entry.retryAt = "";
+  await writeFile(join(home, "activation-pending.json"), JSON.stringify(file));
+  // A fresh intake reads the due record: the same envelope goes through its retry pass, which
+  // now finds no repair holding the ticket.
+  const restarted = resumeDestination(home, repo);
+  await restarted.intake.retry();
+  await restarted.intake.idle();
+  assert.equal(restarted.resumes.length, 1, "the retry continues the recorded branch, once");
+  assert.deepEqual(restarted.resumes[0], { branch: "mtuchel/tuc-1-fix", worktreePath: null, handover: resume.handover });
+  assert.equal((await restarted.intake.status()).done, 1);
+  assert.deepEqual(restarted.comments, [], "still nothing waits as a handoff");
 });
 
 // A queued strict resume whose snapshot did not travel when it was first forwarded (the six

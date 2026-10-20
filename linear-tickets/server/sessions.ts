@@ -31,6 +31,7 @@ import { ghostAgents, LIVE_AGENT, ticketProcessLiveness, type ProcessAgent, type
 import { WATCHDOG_LABEL, type TicketRoots, type WatchdogOutcome, type WatchdogRequest, type WatchdogStore } from "./watchdog";
 import type { ReviewDeletions } from "./review-deletions";
 import { DecisionPendingError, FencedError } from "./decision-journal";
+import { RepairBusyError } from "./repair-exclusion";
 import { candidates, normalizeModel } from "../shared/model-fallbacks";
 import { availability, claims, finishPending, incidentFor, LIMIT_SPACING, limitError, limitSchedule, limitTime, updateEpisode, type LimitPending, type LimitResumeStore, type UsageReader } from "./limit-resume";
 import { rateBudget, RateLimitedError, withPriority, type RateBudget } from "./rate-budget";
@@ -858,6 +859,13 @@ export class SessionRouter {
       await this.linkToPaseo(link.sessionId, started.agentId).catch(() => {});
     } catch (error) {
       await this.deps.linear.removeLabel(link.issueId, running).catch(() => {});
+      if (error instanceof RepairBusyError) {
+        // Nothing was created, and the repair holds the ticket only briefly: keep the thread's
+        // place, its owner text and its offers for the queue's next pass.
+        await this.deps.store.patch(link.sessionId, { queued: true, queueReason: error.message, pendingText: link.pendingText ?? null, pendingFrom: link.pendingFrom ?? null });
+        await this.say(link.sessionId, "thought", `Queued: ${error.message}; this thread keeps its place and retries.`);
+        return;
+      }
       throw error;
     }
   }
@@ -2260,6 +2268,9 @@ export class SessionRouter {
         agentId = (await this.deps.starter.start(issueId, paseo, settings, { retryHint: options.retryHint ?? "the project's next read starts it again", ...(options.lead ? { lead: options.lead } : {}) })).agentId;
       } catch (error) {
         await this.deps.linear.removeLabel(issueId, running).catch(() => {});
+        // A repair holds the ticket and nothing was created: the caller retries on its next pass
+        // instead of counting a refusal or a failed start.
+        if (error instanceof RepairBusyError) return { kind: "deferred", reason: error.message };
         return { kind: "failed", error: error instanceof Error ? error : new Error(String(error)) };
       }
       await later("opening the new agent's thread", () => this.openFor(issueId, identifier, agentId));
@@ -2419,6 +2430,9 @@ export class SessionRouter {
         agentId = (await this.deps.starter.start(issue.id, paseo, settings, { retryHint: "assign Paseo again", resumeOnly: !verifiedParent || Boolean(target), lead })).agentId;
       } catch (error) {
         await this.deps.linear.removeLabel(issue.id, running).catch(() => {});
+        // The repair holds the ticket briefly and the start made nothing; the claimed message
+        // waits for the caller's next pass rather than becoming impossible.
+        if (error instanceof RepairBusyError) return { kind: "wait", reason: error.message };
         return { kind: "impossible", reason: error instanceof Error ? error.message : String(error), ...(error instanceof ContextTooLargeError ? { tooLarge: true as const } : {}) };
       }
       console.log(`[linear-tickets] ${issue.identifier}: started a successor (agent ${agentId.slice(0, 8)}) for ${gone}`);
@@ -2676,6 +2690,9 @@ export class SessionRouter {
       agentId = (await this.deps.starter.start(issueId, paseo, settings, { retryHint: "assign Paseo again", resumeOnly: true, lead: request.text, labels: { [WATCHDOG_LABEL]: request.marker } })).agentId;
     } catch (error) {
       await this.deps.linear.removeLabel(issueId, running).catch(() => {});
+      // A repair holds the ticket briefly and nothing was created: the cycle is retried on the
+      // next watchdog pass, not reported as a failed replacement.
+      if (error instanceof RepairBusyError) return { kind: "failed", reason: error.message, retry: true };
       return { kind: "failed", reason: error instanceof Error ? error.message : String(error) };
     }
     const later = (step: string, work: () => Promise<unknown>) => work().catch((error: unknown) => {

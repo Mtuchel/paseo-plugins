@@ -24,6 +24,7 @@ import { launchTier, recordStart, TIER_AGENT_LABEL, tierModel, tierNote, type Ti
 import { eligibilityProblems, SMALL_ROUTE_POLICY, type RouteRecord, type SmallRoutes } from "./small-route";
 import { NO_PLAN_LABEL, SMALL_ROUTE_ENV, smallRouteNote } from "../shared/small-route";
 import type { ReviewDeletions } from "./review-deletions";
+import { type EffectToken, RepairBusyError, type RepairExclusion } from "./repair-exclusion";
 import type { DoneTickets } from "./steward";
 import { shardDependencies, type ShardAssignor } from "./worktree-shards";
 
@@ -55,6 +56,11 @@ type Deps = {
   // Finished tickets (README, "Who starts next"): an agent of a Done or Canceled ticket quiet for
   // more than an hour holds no slot (steward.ts).
   doneTickets?: Pick<DoneTickets, "releases">;
+  // The responsibility check's repair exclusion (README, "Responsibility check"): a start holds an
+  // effect token from its first read through creation, and a plan the repair parked again while
+  // the caller's admission was read defers the start (RepairBusyError: the caller retries, and its
+  // next admission sees the parked plan).
+  repairs?: { exclusion: Pick<RepairExclusion, "enterEffect">; parked: Pick<ParkedPlans, "get"> };
 };
 
 export const WAITING_PLAN_REASON = "A plan for this ticket waits for your decision in Plannotator; the next agent starts once you approve it or send it back.";
@@ -305,6 +311,8 @@ export class ResumeUnavailableError extends Error {
   }
 }
 
+type StartOptions = { labels?: Record<string, string>; retryHint: string; fresh?: boolean; resumeOnly?: boolean; lead?: string; resume?: ActivationResume; verifier?: { brief: string; marker: string; check?: () => Promise<string | null> } };
+
 // Starts the agent for one ticket, whatever asked for it (label, delegation, mention, resume):
 // saved project mapping, remembered provider, base branch — and, when an earlier agent left a
 // handover on this ticket, the same branch and worktree so the new agent continues its work.
@@ -351,9 +359,19 @@ export class TicketStarter {
   // fresh branch (always the recorded one), the cheap tier, and instructions instead of the plan
   // notes, so a verifier never plans, implements or pushes. Its `marker` is the generation the
   // steward created for this check: it goes into the launch, so the verdict answers that verifier.
-  async start(issueId: string, paseo: PaseoApi, settings: PluginSettings, options: { labels?: Record<string, string>; retryHint: string; fresh?: boolean; resumeOnly?: boolean; lead?: string; resume?: ActivationResume; verifier?: { brief: string; marker: string; check?: () => Promise<string | null> } }): Promise<Started> {
+  async start(issueId: string, paseo: PaseoApi, settings: PluginSettings, options: StartOptions): Promise<Started> {
+    // Taken for the unresolved id (the caller may name the ticket by its identifier), bound to the
+    // UUID once the detail names it; the launcher's own token nests under it without waiting.
+    const token = this.deps.repairs?.exclusion.enterEffect(null) ?? null;
+    try { return await this.startExcluded(issueId, paseo, settings, options, token); }
+    finally { token?.release(); }
+  }
+
+  private async startExcluded(issueId: string, paseo: PaseoApi, settings: PluginSettings, options: StartOptions, token: EffectToken | null): Promise<Started> {
     if (await this.deps.deletions?.blocked(issueId)) throw new Error("This ticket is paused for deletion; no agent was started.");
     const detail: TicketDetail = await this.deps.linear.detail(issueId);
+    token?.bind(detail.issue.id);
+    if ((await this.deps.repairs?.parked.get(detail.issue.id))?.responsibilityRepairId) throw new RepairBusyError();
     const source = { projectId: detail.projectId, projectName: detail.issue.project, teamId: detail.teamId, teamName: detail.issue.team };
     // Only saved mappings launch. The sidebar's name-match preselection is a UI hint;
     // guessing the repository for an unattended launch is not.
@@ -447,6 +465,9 @@ export class TicketStarter {
         await started(result);
         return { ...result, warnings: [...result.warnings, ...shardWarnings], provider: model.provider, target, resumed: true, ...plan };
       } catch (error) {
+        // A repair holds the ticket: nothing was created, and the same request can be retried.
+        // It is neither a resume failure nor a reason to branch off.
+        if (error instanceof RepairBusyError) throw error;
         const message = error instanceof Error ? error.message : String(error);
         // A failed launch may already have created its worker. The steward reconciles the
         // persisted marker; never launch a second verifier on an ambiguous failure.

@@ -7,6 +7,7 @@ import { Dispatcher, type GroupHandoff } from "./dispatch";
 import { Launcher } from "./launch";
 import { MISSED_REACH_NOTE, MODEL_NOTE, OVERLAP_NOTE, QUESTIONS_NOTE, TicketStarter, WAITING_PLAN_REASON } from "./starter";
 import { advisorNote, PLAN_REQUIRED_NOTE, PLAN_SECTIONS_NOTE, PLAN_SLICING_NOTE } from "./plan-policy";
+import { RepairBusyError } from "./repair-exclusion";
 import type { IssueGroup, LabeledIssue } from "./linear";
 import { DEFAULT_WORKTREE_SHARDS, DEFAULT_ACTIVATION, DEFAULT_BACKSTOP, DEFAULT_DISPATCH, DEFAULT_WRITEBACK, DEFAULT_WATCHDOG, DEFAULT_STEWARD, DEFAULT_DEPUTY, type PluginSettings } from "./settings";
 import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
@@ -85,12 +86,12 @@ function fakePaseo(activeAgents: { id: string; title: string }[] = []): PaseoApi
   } as unknown as PaseoApi;
 }
 
-function setup(t: TestContext, linear: FakeLinear, settings: PluginSettings = baseSettings, paseo = fakePaseo(), handOff?: (issueId: string, openChildren: boolean) => Promise<GroupHandoff>, gates = new Launcher(linear as never)) {
+function setup(t: TestContext, linear: FakeLinear, settings: PluginSettings = baseSettings, paseo = fakePaseo(), handOff?: (issueId: string, openChildren: boolean) => Promise<GroupHandoff>, gates = new Launcher(linear as never), failure: { error?: Error } = {}) {
   t.mock.timers.enable({ apis: ["setTimeout"] });
   const launches: RpcInput<typeof launchAgentRpc>[] = [];
   const starter = new TicketStarter({
     linear,
-    launcher: { start: async (input) => { launches.push(input); return { agentId: "agent-1", warnings: [] }; } },
+    launcher: { start: async (input) => { launches.push(input); if (failure.error) throw failure.error; return { agentId: "agent-1", warnings: [] }; } },
     branches: async () => ({ branches: [{ id: "refs/heads/dev", label: "dev" }, { id: "refs/heads/main", label: "main" }], defaultBranch: "refs/heads/main" }),
   });
   const dispatcher = new Dispatcher({ linear, starter, launcher: gates, settings: { read: async () => settings }, handOff });
@@ -113,6 +114,22 @@ test("a labeled ticket is claimed before its agent launches, and is not launched
   await dispatcher.tick();
   assert.equal(launches.length, 1);
   assert.equal(dispatcher.snapshot().recent[0].outcome, "launched");
+});
+
+test("a start refused while a repair holds the ticket restores the trigger, never fails the ticket, and retries on the next poll", async (t) => {
+  const linear = new FakeLinear({ "eng-1": ["paseo"] });
+  const failure: { error?: Error } = { error: new RepairBusyError() };
+  const { dispatcher, launches } = setup(t, linear, baseSettings, fakePaseo(), undefined, undefined, failure);
+  await dispatcher.tick();
+  assert.equal(launches.length, 1, "one attempt, no fallback launch");
+  assert.deepEqual([...linear.labels.get("eng-1")!], ["paseo"], "the trigger is back; no -running and no -failed label");
+  assert.ok(!linear.writes.some((write) => write.includes("could not start an agent")), "no failure note on the ticket");
+  assert.deepEqual(dispatcher.snapshot().recent, [], "no launched or failed attempt is recorded");
+
+  failure.error = undefined;
+  await dispatcher.tick();
+  assert.equal(launches.length, 2, "the next poll tries again");
+  assert.deepEqual([...linear.labels.get("eng-1")!], ["paseo-running"]);
 });
 
 test("a labelled ticket with open sub-issues is handed to Paseo as a group: the label comes off and no agent starts for it", async (t) => {

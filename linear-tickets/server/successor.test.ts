@@ -16,6 +16,7 @@ import type { AdmissionState, IssueCore, IssueState, LabeledIssue } from "./line
 import { SessionRouter, SessionStore, type HostOwnership, type SessionLink, type Succession } from "./sessions";
 import { DEFAULT_WORKTREE_SHARDS, DEFAULT_ACTIVATION, DEFAULT_BACKSTOP, DEFAULT_DISPATCH, DEFAULT_WRITEBACK, DEFAULT_WATCHDOG, DEFAULT_STEWARD, DEFAULT_DEPUTY, type PluginSettings } from "./settings";
 import { ResumeUnavailableError, TicketStarter, runningTicketAgents, type Started } from "./starter";
+import { REPAIR_BUSY_MESSAGE, RepairBusyError } from "./repair-exclusion";
 import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
 import { ticketProcessLiveness, type ProcessAgent, type ProcessInspector } from "./process-liveness";
 import { WATCHDOG_LABEL, type WatchdogHistory, type WatchdogRequest } from "./watchdog";
@@ -560,7 +561,7 @@ test("a start that fails because the ticket cannot fit in a prompt says so, type
 
 // --- TicketStarter: resume-only never falls back to a fresh agent ------------------------------
 
-function starterHarness(options: { resumeTarget?: ResumeTarget | null; projectKind?: string; resumeFails?: boolean; projectRootPath?: string; branchName?: string } = {}) {
+function starterHarness(options: { resumeTarget?: ResumeTarget | null; projectKind?: string; resumeFails?: boolean; resumeError?: Error; projectRootPath?: string; branchName?: string } = {}) {
   const launches: { resume?: ResumeTarget }[] = [];
   const branchName = options.branchName ?? "dev";
   const branches = { branches: [{ id: `refs/heads/${branchName}`, label: branchName }], defaultBranch: `refs/heads/${branchName}` };
@@ -569,6 +570,7 @@ function starterHarness(options: { resumeTarget?: ResumeTarget | null; projectKi
     handover: { resumeTarget: async () => options.resumeTarget ?? null } as never,
     launcher: { start: async (_input: unknown, _paseo: unknown, launchOptions: { resume?: ResumeTarget }) => {
       launches.push({ resume: launchOptions.resume });
+      if (options.resumeError && launchOptions.resume) throw options.resumeError;
       if (options.resumeFails && launchOptions.resume) throw new Error("Could not reopen branch");
       return { agentId: "agent-new", warnings: [] };
     } } as never,
@@ -600,6 +602,14 @@ test("a resume-only start refuses a missing target, a non-git project and a fail
   assert.equal(started.resumed, false);
   assert.equal(fallback.launches.length, 2);
   assert.equal(fallback.launches[1].resume, undefined, "the fallback branches off instead");
+});
+
+test("a resume refused because a repair holds the ticket rejects as transient and never falls back to a fresh start", async () => {
+  const h = starterHarness({ resumeTarget: { branch: BRANCH, worktreePath: null, handover: "Continue." }, resumeError: new RepairBusyError() });
+  await assert.rejects(h.starter.start(ISSUE.id, h.paseo, settings, { retryHint: "assign Paseo again" }),
+    (error: unknown) => error instanceof RepairBusyError && error.message === REPAIR_BUSY_MESSAGE);
+  assert.equal(h.launches.length, 1, "the resume was tried once and not replaced by a fresh start");
+  assert.ok(h.launches[0].resume, "and it was a resume, not a branch-off");
 });
 
 // The resume an activation forwards is continued exactly (starter.ts importedResume): this host
@@ -848,6 +858,25 @@ test("restartFor refuses while the gate is held and starts nothing behind a live
   assert.equal(stopped.starts[0].options.retryHint, "the project's next read starts it again");
   assertGateFree(stopped.gates);
   await stopped.cleanup();
+});
+
+test("a start refused while a repair holds the ticket is deferred, never a failed restart or an impossible successor", async () => {
+  const stopped = routerHarness({
+    agents: [ticketAgent("agent-closed", "2026-01-01T00:00:00Z", { status: "closed" })],
+    failStart: new RepairBusyError(),
+  });
+  assert.deepEqual(await stopped.router.restartFor(ISSUE.id, ISSUE.identifier), { kind: "deferred", reason: REPAIR_BUSY_MESSAGE });
+  assert.equal(stopped.starts.length, 1, "one attempt, and no fallback launch");
+  assert.deepEqual(stopped.calls, ["+paseo-running", "start", "-paseo-running"], "the running label is put back, nothing is reported");
+  assertGateFree(stopped.gates);
+  await stopped.cleanup();
+
+  const successor = routerHarness({ failStart: new RepairBusyError() });
+  assert.deepEqual(await succeed(successor), { kind: "wait", reason: REPAIR_BUSY_MESSAGE });
+  assert.equal(successor.starts.length, 1, "the claimed message waits for the next pass, never an impossible successor");
+  assert.deepEqual(successor.calls, ["claim", "+paseo-running", "start", "-paseo-running"]);
+  assertGateFree(successor.gates);
+  await successor.cleanup();
 });
 
 // --- AC-17: auto-resume after a failure ---------------------------------------------------------
@@ -1490,6 +1519,19 @@ test("a watchdog replacement retires its predecessor, waits while a worker lives
 // As TUC-2205's root stood after server087's daemon restart on 2026-10-14: listed running in its
 // turn, no process. A Stop to it is never acknowledged; a message or reload loads it again.
 const ghostRoot = () => ompRoot("agent-old", { status: "running", activeTurn: { turnId: "turn-1", startedAt: "2026-01-01T00:00:00Z" }, updatedAt: "2026-01-01T00:09:44Z" });
+
+test("a watchdog replacement refused while a repair holds the ticket retries the cycle instead of counting a failed replacement", async () => {
+  const h = routerHarness({ agents: [ghostRoot()], processInspector: processInspection(""), failStart: new RepairBusyError() });
+  const request = watchdogRequest(h.calls, { action: "succeed", marker: "cycle-1:succeed", text: "The previous agent stopped making progress." });
+  const outcome = await h.router.watchdogAct(request);
+  assert.deepEqual(outcome, { kind: "failed", reason: REPAIR_BUSY_MESSAGE, retry: true });
+  assert.deepEqual(h.calls, ["claim", "+paseo-running", "start", "-paseo-running"], "the message is claimed and the running label taken back");
+  assert.deepEqual(h.daemon.archived, ["agent-old"], "the ghost stays retired, as on any replacement");
+  assert.equal(h.starts.length, 1, "one attempt, no fallback");
+  assertGateFree(h.gates);
+  await h.cleanup();
+});
+
 const QUEUED = "Queued: RAM-limited, 11 of 11 slots used (memory). It starts when memory frees up.";
 
 test("the watchdog reloads a ghost without a Stop once a slot admits it, then resumes it", async () => {

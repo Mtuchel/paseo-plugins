@@ -10,6 +10,7 @@ import { rateBudget, RateLimitedError, withPriority, type RateBudget } from "./r
 import type { CommentRelay } from "./relay";
 import type { PluginSettings, Settings } from "./settings";
 import type { TicketStarter } from "./starter";
+import { RepairBusyError } from "./repair-exclusion";
 import { asCaller } from "./linear-usage";
 
 const RECENT_LIMIT = 10;
@@ -318,6 +319,20 @@ export class Dispatcher {
       await linear.comment(issue.id, `Paseo ${started.resumed ? "resumed the previous agent's work" : "started an agent"} for this ticket (${provider} in ${target}).${warnings}`)
         .catch((error: unknown) => console.error(`[linear-tickets] ${issue.identifier}: start comment failed:`, error instanceof Error ? error.message : error));
     } catch (error) {
+      if (error instanceof RepairBusyError) {
+        // The repair holds the ticket and nothing was created: put the trigger back and let the
+        // next poll retry. Never a `-failed` label or a failure note for a retryable refusal.
+        console.log(`[linear-tickets] auto-dispatch ${issue.identifier}: deferred (${error.message} the label stays and the next poll retries)`);
+        await withPriority("interactive", "dispatch deferred report", async () => {
+          for (const step of [
+            () => linear.removeLabel(issue.id, labels.running),
+            () => linear.addLabel(issue.id, trigger),
+          ]) {
+            await step().catch((failure: unknown) => console.error(`[linear-tickets] ${issue.identifier}: deferred reporting failed:`, failure instanceof Error ? failure.message : failure));
+          }
+        });
+        return;
+      }
       const message = error instanceof Error ? error.message : "Unknown error";
       this.record(issue.identifier, "failed", message);
       // Best-effort: surface the failure on the ticket; `<trigger>-failed` keeps it out of the next poll.

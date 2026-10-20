@@ -17,6 +17,7 @@ import { LIVE_AGENT, type ProcessInspector } from "./process-liveness";
 import { PLAN_REVIEW_STATE, planStage } from "./plan-policy";
 import type { PullState, StackState } from "./pr-watch";
 import { RateLimitedError, withPriority } from "./rate-budget";
+import { EXCLUSION_CLOSED_MESSAGE, REPAIR_BUSY_MESSAGE, RepairBusyError } from "./repair-exclusion";
 import type { ReviewDeletions } from "./review-deletions";
 import { AWAY_REASON } from "./scheduler";
 import type { HostOwnership, RestartResult, SessionRouter, Succession } from "./sessions";
@@ -1847,6 +1848,15 @@ export class Steward {
           verifier: { brief: verifierBrief(issue, facts, record), marker },
         });
       } catch (error) {
+        // A repair held the ticket (or the plugin is restarting): the start refused before it
+        // created anything, so the generation is dropped and the pass retries as an admission wait.
+        if (error instanceof RepairBusyError) {
+          await this.deps.store.update((file) => {
+            const ticket = file.tickets[issue.id];
+            if (ticket?.verifier?.marker === marker && !ticket.verifier.agentId) ticket.verifier = null;
+          });
+          return { state: "deferred", reason: error.message };
+        }
         // The generation stays pending: the next pass adopts the agent if the launch created one
         // and drops the generation (with a refusal) if it did not.
         const reason = `the verifier could not start: ${message(error)}`;
@@ -2469,6 +2479,7 @@ function newTicket(identifier: string, at: string): StewardTicket {
 function queueWait(reason: string): boolean {
   return /^(Queued: |This ticket is paused for deletion|Paseo is not connected yet|A launch for this ticket is under way|Waiting for .+ to finish)/.test(reason)
     || reason === FOCUS_REASON || reason === WAITING_PLAN_REASON || reason === AWAY_REASON
+    || reason === REPAIR_BUSY_MESSAGE || reason === EXCLUSION_CLOSED_MESSAGE
     || reason.startsWith(LIVE_AGAIN_PREFIX);
 }
 
