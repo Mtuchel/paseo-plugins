@@ -929,7 +929,10 @@ def budget_items(usage, now):
 # whose Linear state implies a next actor but that have none. The digest only reads it; the fixed
 # kind text is what it renders (the file's `detail` is the same text, but a changed file wording
 # must not garble the document).
-RESPONSIBILITY_STALE_S = 30 * 60  # a check older than this (or never completed) is not read
+# A check older than this (or never completed) is not read. The check runs once per steward pass
+# (at most every 10 minutes), and a pass over server087's tickets takes about an hour (2026-10-20:
+# passes started 10:46, 11:53 and 13:08 UTC), so two slow passes in a row stay fresh.
+RESPONSIBILITY_STALE_S = 3 * 3600
 RESPONSIBILITY_REPAIR_S = 24 * 3600  # repairs of the last day are reported
 RESPONSIBILITY_KINDS = {
     "planning-no-agent": "Planning without an agent",

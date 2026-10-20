@@ -3264,7 +3264,8 @@ the one clear case — a plan review that was lost before the owner's decision w
 reports everything else in the ops digest.
 
 **When it runs.** Inside the steward pass, under the steward's lease, at most every 10 minutes
-(`RESPONSIBILITY_CHECK_MS`), before the pass's ticket actions. It reuses the pass's Linear read,
+(`RESPONSIBILITY_CHECK_MS`), before the pass's ticket actions: once per pass, so on a host whose
+pass takes about an hour (server087) once an hour. It reuses the pass's Linear read,
 ownership fence, live roots and facts: no second Linear poll, no overlap with a steward start. It
 judges only this host's tickets, never on a queue-blocker pass. An exception is logged and the pass
 goes on; the next due pass retries.
@@ -3357,8 +3358,8 @@ reason; never pruned). Another host's snapshot reaches the digest through `--age
 [Ops digest and weekly ops review](#ops-digest-and-weekly-ops-review)) lists one attention item per
 ticket and kind, per host (unit `responsibility` / `responsibility@<host>`), plus the repairs of the
 last 24 hours under the same key, so the weekly review counts repaired cases too. These items are
-notified once ever (`once`). A check older than 30 minutes, or an unreadable snapshot, marks the
-unit failed and keeps its items stale.
+notified once ever (`once`). A check older than 3 hours (two slow steward passes), or an
+unreadable snapshot, marks the unit failed and keeps its items stale.
 
 **Rollback.** Revert the checker, its hold and its digest integration in a new pull request, but
 **keep** the journal's supersession readers and enforcement, the replacement attribution and
