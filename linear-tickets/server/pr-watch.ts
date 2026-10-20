@@ -34,6 +34,8 @@ const INTERVAL_MS = 2 * 60 * 1000;
 // The queue backstop (see queueBackstop) runs this often, and right after a poll claimed a drop
 // it re-enqueues.
 const BACKSTOP_INTERVAL_MS = 10 * 60 * 1000;
+// The PR-veto check (see recoveryWait) shares its open pull request listings this long.
+const RECOVERY_LISTING_MS = 60 * 1000;
 // After GitHub's budget stopped a run, the backstop runs again this long after GitHub's reset;
 // ticks are skipped until this long past it (a lost timer costs at most that and one tick); with no
 // reset known it waits the fallback.
@@ -1499,13 +1501,31 @@ export class PullRequestWatch {
     await this.deps.watchdog.pass({ records: mine, reserved: new Set(), pulls: (ticket) => this.ticketPulls(ticket, context) });
   }
 
+  // The repositories' open pull requests the PR-veto check reads, shared by every check for one
+  // minute: the continuation drain asks once a minute for every queued operation, and a fresh
+  // listing per operation spent one paginated request per repo and operation (TUC-1880). A label
+  // added within that minute vetoes on the next check; recorded pull requests are still read
+  // through `view` on every check. A check that could not read them drops the shared listings, so
+  // a failed listing is not kept: the next check reads again.
+  private recoveryListings: { until: number; pulls: Map<string, Promise<OpenPull[]>> } | null = null;
+
+  private recoveryPulls(): Map<string, Promise<OpenPull[]>> {
+    const now = this.deps.backstop?.now?.() ?? Date.now();
+    if (!this.recoveryListings || now >= this.recoveryListings.until) this.recoveryListings = { until: now + RECOVERY_LISTING_MS, pulls: new Map() };
+    return this.recoveryListings.pulls;
+  }
+
   async recoveryWait(issueId: string, identifier: string, urls: string[] = []): Promise<string | null> {
     try {
       const all = await this.deps.handover.all();
       const record = all.find((item) => item.issueId === issueId);
-      const context = this.context(all);
+      const shared = this.recoveryPulls();
+      const context = this.context(all, shared);
       const pulls = await this.ticketPulls({ issueId, identifier: record?.identifier ?? identifier, worktree: record?.worktreePath ?? null, link: record?.links["Pull request"] ?? urls[0] ?? null }, context);
-      if (!pulls) return "the ticket's pull requests cannot be read";
+      if (!pulls) {
+        if (this.recoveryListings?.pulls === shared) this.recoveryListings = null;
+        return "the ticket's pull requests cannot be read";
+      }
       if (pulls.some((pull) => pull.labels.some((label) => label.toLowerCase() === DO_NOT_MERGE_LABEL))) return "a ticket pull request carries do-not-merge";
       for (const url of new Set([...urls, ...(record ? ownedPullRequests(record) : [])])) {
         const view = await this.view(url);
@@ -1611,10 +1631,14 @@ export class PullRequestWatch {
         return source;
       },
       pulls: (repo) => {
-        const listing = pulls.get(repo) ?? this.github().openPullRequests(repo);
+        const known = pulls.get(repo);
+        if (known) return known;
+        const listing = this.github().openPullRequests(repo);
         pulls.set(repo, listing);
-        // The listing also feeds the cheap first look, before the poll's per-pull-request reads; a
-        // failed listing stays the caller's to report (this derived promise ignores its rejection).
+        // The listing also feeds the cheap first look, once when it is read (a listing shared by
+        // later readers, see recoveryWait, must not replace a newer one the poll fed since), before
+        // the poll's per-pull-request reads; a failed listing stays the caller's to report (this
+        // derived promise ignores its rejection).
         listing.then((open) => this.listed(repo, open), () => {});
         return listing;
       },

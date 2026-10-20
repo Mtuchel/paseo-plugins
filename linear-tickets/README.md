@@ -3079,7 +3079,10 @@ and repairs a ticket that is in none of the five states below with exactly one a
 **Acknowledged continuations.** Recovery messages use a stable operation ID stored under
 `linear-tickets/continuations/`. A busy worker leaves the operation `queued`; an independent
 one-minute drain retries it after fresh owner, worker-generation, process, and PR-veto checks.
-These retries read nothing from Linear: the ticket's status is read once, inside the ticket gate
+The PR-veto checks share one listing of each repository's open pull requests for a minute, however
+many operations are queued (a `do-not-merge` label added within that minute vetoes on the next
+check; the recorded pull requests are still read on every check, and a listing that failed is read
+again). These retries read nothing from Linear: the ticket's status is read once, inside the ticket gate
 right before the dispatch claim, so a ticket that ended meanwhile still cancels the operation
 without a busy worker spending a Linear request every minute. A new operation for the same worker
 and ticket cancels that worker's older `queued` ones (`superseded by continuation …`): only the
