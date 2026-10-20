@@ -251,6 +251,52 @@ test("planner coverage: a remote host whose agents were not read is judged by it
   assert.equal(covered.complete, false);
 });
 
+const RESPONSIBILITY = "responsibility: Plan review without a review";
+
+test("responsibility coverage: the check unit decides per host in 90 % of the window's hours", async () => {
+  const week = NOW - 7 * DAY;
+  // Runs from before the check existed (no responsibility unit): not enough data, not a zero.
+  const first = await analysis(healthy().burst(RESPONSIBILITY, week, 3, { host: SERVER }), NOW, [RESPONSIBILITY]);
+  const firstRow = first.rows.find((found) => found.kind === RESPONSIBILITY)!;
+  assert.deepEqual(firstRow.source, { section: "responsibility", group: null });
+  assert.deepEqual(sourceOf(RESPONSIBILITY, { kinds: new Map() }), { section: "responsibility", group: null });
+  assert.equal(firstRow.coverage.complete, false);
+  // A failed check (stale file) is not covered even when every other source is healthy.
+  const failed = await analysis(new Log().runs(NOW - 40 * DAY, NOW, () => ({ responsibility: false })).burst(RESPONSIBILITY, week, 3, { host: SERVER }), NOW, [RESPONSIBILITY]);
+  assert.equal(failed.rows.find((found) => found.kind === RESPONSIBILITY)!.coverage.complete, false);
+  // A few missed hours stay above 90 %; two missing days of the week do not.
+  const few = await analysis(new Log().runs(NOW - 40 * DAY, NOW, (t) => ({ responsibility: t < NOW - 3 * HOUR })).burst(RESPONSIBILITY, week, 3, { host: SERVER }), NOW, [RESPONSIBILITY]);
+  let covered = few.rows.find((found) => found.kind === RESPONSIBILITY)!.coverage;
+  assert.equal(covered.complete, true);
+  assert.deepEqual(covered.hosts, [SERVER]);
+  const twoDays = await analysis(new Log().runs(NOW - 40 * DAY, NOW, (t) => ({ responsibility: t < NOW - 2 * DAY })).burst(RESPONSIBILITY, week, 3, { host: SERVER }), NOW, [RESPONSIBILITY]);
+  assert.equal(twoDays.rows.find((found) => found.kind === RESPONSIBILITY)!.coverage.complete, false);
+  // The Mac's check is read while its agents are not: it stays a candidate and is covered.
+  const macUnread = { [`agents@${MAC}`]: false, [`silent@${MAC}`]: false };
+  const both = await analysis(new Log().runs(NOW - 40 * DAY, NOW, () => ({ ...macUnread, responsibility: true, [`responsibility@${MAC}`]: true }))
+    .burst(RESPONSIBILITY, week, 3, { host: SERVER }).burst(RESPONSIBILITY, week, 4, { host: MAC }), NOW, [RESPONSIBILITY]);
+  let row = both.rows.find((found) => found.kind === RESPONSIBILITY)!;
+  assert.deepEqual(row.coverage.hosts, [MAC, SERVER]);
+  assert.deepEqual(row.coverage.excluded, []);
+  assert.equal(row.coverage.complete, true);
+  assert.equal(row.this.count, 7);
+  // The Mac's check unread: its problems are left out, server087's count stays.
+  const macStale = await analysis(new Log().runs(NOW - 40 * DAY, NOW, () => ({ ...macUnread, responsibility: true, [`responsibility@${MAC}`]: false }))
+    .burst(RESPONSIBILITY, week, 3, { host: SERVER }).burst(RESPONSIBILITY, week, 4, { host: MAC }), NOW, [RESPONSIBILITY]);
+  row = macStale.rows.find((found) => found.kind === RESPONSIBILITY)!;
+  assert.deepEqual(row.coverage.hosts, [SERVER]);
+  assert.deepEqual(row.coverage.excluded, [MAC]);
+  assert.equal(row.coverage.complete, true);
+  assert.equal(row.this.count, 3);
+  assert.equal(row.all.count, 7);
+  // The local check unread: not complete although the Mac is covered.
+  const localStale = await analysis(new Log().runs(NOW - 40 * DAY, NOW, () => ({ ...macUnread, responsibility: false, [`responsibility@${MAC}`]: true }))
+    .burst(RESPONSIBILITY, week, 3, { host: SERVER }), NOW, [RESPONSIBILITY]);
+  row = localStale.rows.find((found) => found.kind === RESPONSIBILITY)!;
+  assert.deepEqual(row.coverage.hosts, [MAC]);
+  assert.equal(row.coverage.complete, false);
+});
+
 test("planner completion rows are non-attention: no counts, no recurring ticket, while auto is observed", async () => {
   const home = await temporary();
   try {

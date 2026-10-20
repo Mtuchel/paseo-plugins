@@ -3225,7 +3225,8 @@ comments are published to Linear. Bounded recovery and one-time actionable owner
 remain active; an unanswered escalation is not posted again.
 
 **Settings.** `steward.enabled` (default true; off stops every repair, the states are still computed
-and shown), `steward.queuedEscalateHours` (24: a ticket waiting in the queue longer is escalated),
+and shown; it also gates the responsibility check's repairs and its hold, see
+[Responsibility check](#responsibility-check)), `steward.queuedEscalateHours` (24: a ticket waiting in the queue longer is escalated),
 `steward.idleMinutes` (5; older longer values are clamped) and `steward.maxActionsPerPass` (5).
 
 **Responsibility and advancement.** Each observed ticket retains its responsible host and work
@@ -3254,6 +3255,117 @@ It is temporal association, not causal attribution. `advanced` records progress 
 `ask-owner` records a completed diagnostic owner-question outcome. No metric labels an escalation
 “unnecessary” without evidence; the counters support comparison, not that conclusion by themselves.
 
+## Responsibility check
+
+Every open ticket assigned to Paseo should have exactly one responsible next step (see
+[Statuses and labels](#statuses-and-labels)). The **responsibility check**
+(`server/responsibility.ts`, TUC-1290) finds the tickets that have none or more than one, repairs
+the one clear case — a plan review that was lost before the owner's decision was carried out — and
+reports everything else in the ops digest.
+
+**When it runs.** Inside the steward pass, under the steward's lease, at most every 10 minutes
+(`RESPONSIBILITY_CHECK_MS`), before the pass's ticket actions. It reuses the pass's Linear read,
+ownership fence, live roots and facts: no second Linear poll, no overlap with a steward start. It
+judges only this host's tickets, never on a queue-blocker pass. An exception is logged and the pass
+goes on; the next due pass retries.
+
+**Verdict.** The check gathers the ticket's steps and merges those that belong together: a parked
+plan, an open review in any host's inbox and a decision being applied for the same agent are one
+review step (with that agent live); a live owner wait, a Needs-you entry or a pending permission is
+one question step; each live root agent, and a queued thread or queue deferral, are steps of their
+own. An owner hold (hold, manual or do-not-merge label, watchdog Stop, peer host, focus) or an open
+blocker makes any status fine.
+
+| Status | The one step that fits | Kind when none fits (digest detail) |
+| -- | -- | -- |
+| Planning | one live root agent, or a queued thread | `planning-no-agent` — Planning without an agent |
+| Plan review | one review step | `review-missing` — Plan review without a review |
+| Plan approved | a queued thread, one live root agent, or a decision being applied | `approved-no-handoff` — Plan approved without a hand-off |
+| In Progress | one live root agent, or a queued thread or queue deferral | `in-progress-no-agent` — In Progress without an agent or queue entry |
+| Needs input | one question step | `needs-input-no-question` — Needs input without an open question |
+
+Two or more distinct steps are `two-steps` (More than one responsible step). A step that does not
+fit the status counts as none, and the report names what was found instead (`why`). Other statuses,
+and a ticket whose only signal is a stale running label, are not judged. A reported case needs two
+runs in a row (the steward fixes most agent gaps within 5 minutes). A ticket the steward acted on,
+or an agent started for, in the last 10 minutes is still settling. A review read that fails on a
+peer makes review-dependent verdicts `unknown` (listed, never reported as a violation); missing
+evidence never moves a ticket.
+
+**Repair: a lost plan review is parked again.** Only `review-missing` and `planning-no-agent`, and
+only when the ticket's latest local review has a plan revision and closed (or got its outcome)
+without the decision being carried out. Before writing, every guard must hold; a temporary failure
+retries on the next run, a permanent one marks the case report-only with its reason:
+
+- the review closed at least 10 minutes ago, and its opening is proven and within the journal's
+  60-day retention (otherwise its history may be incomplete: report-only);
+- no applied decision, no owner drop or choice for that review, no dropped late report for its
+  agent (report-only: ambiguous or deliberate);
+- no open, pending, unbound, conflicting or unreadable journal entry for the ticket or its agents;
+  an entry with no ticket blocks every repair (temporary; deliberately conservative);
+- no agent for the ticket (archived included) created, and no steward claim or action, in the last
+  10 minutes; every peer inbox read and none has an open review for the ticket (temporary);
+- the ticket is not paused for deletion and no deletion is recorded for the review's agent;
+- the review agent's transcript names a plan file, it reads, and its sha256 equals the reviewed
+  revision (report-only otherwise);
+- no earlier terminal repair for the same ticket and revision; `steward.enabled`.
+
+The effect: the check claims the case in its store (one `repairId` and `parkedAt`, kept across
+retries), reserves the ticket in the repair exclusion (below; refused → the claim is released for a
+later run), repeats every guard with fresh reads (owner on this host, Linear status, peer inboxes
+read now, journal, agents, transcript, steward record, parked plan), marks the lost review
+**superseded** in the decision journal, and writes the parked plan only if none exists ("Parked
+again: the review was lost before your decision was carried out", carrying
+`responsibilityRepairId`). The normal delivery then opens the central host's review, moves the
+ticket to Plan review and announces it once. A claim found after a crash is finished only when a
+parked plan or a journal review carries exactly that repair; otherwise the whole eligibility is
+checked again, at most twice. Each ticket and revision is repaired at most once.
+
+**Hold.** While a lost review is repairable and not settled, the steward treats the ticket like a
+parked plan and starts no fresh planner for it. Owner Stop, owner question, explicit hold, blocker
+and deletion pause take precedence. The hold ends when the repair is delivered, the case becomes
+report-only, or after 60 minutes (`REPAIR_HOLD_MS`, persisted across restarts; then `why: not
+repaired within an hour`); after that the steward's recovery applies as for any new stall.
+
+**Repair exclusion** (`server/repair-exclusion.ts`). One per plugin instance. Every effect path
+takes a token for its ticket before its first admission read: agent starts (sidebar included), the
+decision journal's producers, parked-plan writes and delivery, review deletions and the review
+inbox. A repair reserves a ticket only when no effect on it is active and never waits; an effect
+whose ticket is not yet known blocks every repair until it is bound. An effect refused by a repair
+is a transient wait everywhere: the sidebar shows "A plan review is being restored for this ticket.
+Try again shortly."; dispatch, sessions, the steward, projects and intake keep their pending work
+and retry on their next pass, never a `-failed` label. While a parked plan carries a repair ID,
+automatic starts for its ticket wait the same way. Admission stays closed at startup until the
+decision journal holds its lease and has loaded ("The plugin is restarting; try again in a few
+seconds."); shutdown stops the steward, closes admission, waits for every admitted effect and
+repair, and only then releases the journal's lease.
+
+**Supersession.** The journal keeps the marker under the lost review's ID, with the repair and its
+replacement review. A decision on the lost review is refused; a late report from its page is kept
+under Being applied for the owner but can never be carried out, not even onto the replacement, and
+dropping it approves nothing. The replacement takes its own decision. Markers live as long as the
+repair records; pruning cannot revive the old review.
+
+**Snapshot.** `~/.paseo/linear-tickets/responsibility.json`, written atomically by the steward's
+lease holder: `version`, `host`, `checkedAt`, `violations` (ticket, status, kind, detail, `since`,
+`seen`, `why`), `unknown`, `holds` (per ticket and revision, with `since`) and `repairs` (per
+ticket and revision: `claimed`, `released`, `done`, `report-only` or `failed`, with tries and
+reason; never pruned). Another host's snapshot reaches the digest through `--agents-json`
+(`ticketResponsibility`).
+
+**Digest.** The digest's **Tickets without one responsible next step** section (see
+[Ops digest and weekly ops review](#ops-digest-and-weekly-ops-review)) lists one attention item per
+ticket and kind, per host (unit `responsibility` / `responsibility@<host>`), plus the repairs of the
+last 24 hours under the same key, so the weekly review counts repaired cases too. These items are
+notified once ever (`once`). A check older than 30 minutes, or an unreadable snapshot, marks the
+unit failed and keeps its items stale.
+
+**Rollback.** Revert the checker, its hold and its digest integration in a new pull request, but
+**keep** the journal's supersession readers and enforcement, the replacement attribution and
+their tests: once a repair exists, a version without them would let the lost page's late decision
+be carried out. Repairs already made stay; correcting one is an investigated manual recovery
+(agents, decisions, parked plan, Linear status), not a delete-and-rewind.
+
 ## Statuses and labels
 
 Every open ticket assigned to Paseo has exactly one responsible next step — a live agent, a review
@@ -3262,7 +3374,7 @@ attributes next to the status. The plan stages are started states the team creat
 exact names (case and spacing aside); a team without them keeps the older behaviour described with
 each write. Todo with `plan-ready` is the one owner-held case: the approval comment or panel reply
 is your prompt to start it, so it counts as a question to you. Tickets that break the rule are
-found and repaired separately (TUC-1290).
+found and repaired separately ([Responsibility check](#responsibility-check), TUC-1290).
 
 | Status | Meaning | Who acts next |
 | -- | -- | -- |
@@ -3935,7 +4047,8 @@ The ops digest (`ops/paseo-ops-digest.py`, Python stdlib) is an hourly job on **
 that publishes the Linear document "Ops digest" (project Agent tooling): the merge queue,
 drops, pull requests open > 5 h, deploys, and the Paseo agents of this host and of every host
 in `~/.paseo/ops-digest/remotes` that are in error, wait on the owner, are silent for > 2 h or
-hold a ticket's running label without an agent. Inside Mon-Fri 08:00-19:00 Berlin it comments
+hold a ticket's running label without an agent, and, per host, the tickets without one responsible
+next step ([Responsibility check](#responsibility-check)). Inside Mon-Fri 08:00-19:00 Berlin it comments
 on the document as the Paseo app, mentioning the owner, with the problems not delivered yet (at
 most 25 items plus counts per kind, never more than `NOTIFY_MAX_CHARS`). Each scheduled run also
 starts tuchel-platform's *Flaky quarantine* workflow (`gh workflow run flaky-quarantine.yml
@@ -4186,8 +4299,8 @@ the script fresh. Other plugin changes in that pull keep their own reload steps.
 - `{"t", "event": "run", "host", "units": {unit: read?}, "hosts": [...], "items": n}`: every unit
   the run attempted (`repo`, the repository script's own units such as `queue`, `pulls/917`,
   `deploy:production/x`, `agents`, `silent`, `locks`, `planner_recovery`, `planning_sessions`,
-  `planning_smoke`, and `agents@<host>`/`silent@<host>`/`planner_recovery@<host>`/
-  `planning_sessions@<host>`/`planning_smoke@<host>` for each
+  `planning_smoke`, `responsibility`, and `agents@<host>`/`silent@<host>`/`planner_recovery@<host>`/
+  `planning_sessions@<host>`/`planning_smoke@<host>`/`responsibility@<host>` for each
   remote), read or not, and every host whose agents were read. It is the proof that a source was
   looked at, whether or not anything was found.
 - `{"t", "event": "opened" | "open" | "cleared", "key", "kind", "unit", "first", "attention",
@@ -4231,6 +4344,8 @@ most 10 % of their `pulls/<n>` or `deploy:<env>/<service>` sub-units failed; age
 `agents`/`agents@<host>` (and `silent`/`silent@<host>` for silent agents, `locks` for orphaned
 labels) read, judged per host. Planner kinds require their own `planner_recovery` or
 `planner_recovery@<host>` unit, independently of agent reads; missing units are unknown coverage.
+Responsibility kinds need `responsibility`/`responsibility@<host>` read, judged per host like agent
+kinds (a host counts once a run names its unit).
 Non-attention planner notes do not affect headline problem completeness. The review does not know
 the `planning_*` units yet: it judges the `planning` kinds like a repository section, by `repo`.
 An hour without a `run` line, a `gap` and backfilled hours are

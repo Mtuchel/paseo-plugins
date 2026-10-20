@@ -3,6 +3,7 @@ import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { z } from "zod";
 import { plannotatorPaths } from "./plannotator";
+import { type RepairExclusion, withEffect } from "./repair-exclusion";
 
 const Deletion = z.object({
   issueId: z.string().uuid(), identifier: z.string(), agentId: z.string(),
@@ -15,8 +16,15 @@ export type ReviewDeletion = z.infer<typeof Deletion>;
 export class ReviewDeletions {
   private loading: Promise<Record<string, ReviewDeletion>> | null = null;
   private queue: Promise<unknown> = Promise.resolve();
+  private exclusion: Pick<RepairExclusion, "admit"> | null = null;
 
   constructor(private readonly file = join(plannotatorPaths().directory, "deletions.json")) {}
+
+  // A deletion pause is an effect the responsibility check's repair excludes (repair-exclusion.ts):
+  // once `put` returns, a repair of the ticket sees the pause.
+  useExclusion(exclusion: Pick<RepairExclusion, "admit">): void {
+    this.exclusion = exclusion;
+  }
 
   private load(): Promise<Record<string, ReviewDeletion>> {
     return this.loading ??= readFile(this.file, "utf8").then(
@@ -36,7 +44,7 @@ export class ReviewDeletions {
   async blocked(issueId: string): Promise<boolean> { return Boolean(await this.get(issueId)); }
 
   put(entry: ReviewDeletion): Promise<void> {
-    return this.change((entries) => { entries[entry.issueId] = entry; });
+    return withEffect(this.exclusion, entry.issueId, () => this.change((entries) => { entries[entry.issueId] = entry; }));
   }
 
   remove(issueId: string): Promise<void> {

@@ -8,6 +8,7 @@ import { PermissionReplies, type DeliveryOrigin, type DeliveryResult } from "./p
 import { LIVE_AGENT } from "./process-liveness";
 import { deliverToAgent } from "./relay";
 import { ResumeUnavailableError, type TicketStarter, type Started } from "./starter";
+import { RepairBusyError } from "./repair-exclusion";
 import type { Settings } from "./settings";
 import type { SessionRouter } from "./sessions";
 import { parseHistory, WATCHDOG_LABEL, type WatchdogStore } from "./watchdog";
@@ -652,7 +653,12 @@ export class ActivationIntake implements ActivationSink {
       }
       await this.settle(envelope.id, "done", `Started ${started.agentId.slice(0, 8)} in ${started.target}${started.resumed ? " (resumed)" : ""}.`);
     } catch (error) {
-      if (error instanceof ResumeUnavailableError) {
+      if (error instanceof RepairBusyError) {
+        // The repair holds the ticket only briefly and nothing was started: the envelope keeps its
+        // retry pass, never a handoff for the owner.
+        await this.settle(envelope.id, "pending", error.message, this.minutesToWait(entry.attempts));
+        this.log(`activation routing: ${envelope.identifier} waits for the repair (kept, retried): ${error.message}`);
+      } else if (error instanceof ResumeUnavailableError) {
         await this.reportHandoff(envelope, error.message, entry);
         await this.settle(envelope.id, "handoff", `${error.message} Queued for the owner to make the branch available here.`, this.minutesToWait(entry.attempts + 2));
       } else {

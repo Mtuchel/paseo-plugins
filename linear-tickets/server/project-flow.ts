@@ -14,6 +14,7 @@ import { classifyRunAgents, classifyTicketAgents, type TicketAgents } from "./st
 import type { Focus } from "./focus";
 import { type ProcessInspector } from "./process-liveness";
 import { SetupError, type PlannerStart } from "./launch";
+import { RepairBusyError } from "./repair-exclusion";
 import { withPriority } from "./rate-budget";
 import type { PluginSettings, Settings } from "./settings";
 import { paseoHome } from "./ticket-mcp";
@@ -714,6 +715,14 @@ export class ProjectFlow {
     try {
       ({ agentId } = await this.deps.startPlanner({ runId: run.id, linearProjectId: project.id, projectName: project.name, teamId: this.busiestTeam(read.work), requestId, brief }, paseo, settings));
     } catch (error) {
+      if (error instanceof RepairBusyError) {
+        // The repair holds the ticket briefly and nothing was created: undo the claim so the
+        // pending limit recovery stays and the next pass retries it.
+        await this.store.update(project.id, (current) => current?.planner?.id === run.id && current.planner.recovery?.claim?.requestId === requestId
+          ? { ...current, planner: { ...current.planner, startedAt: run.startedAt, recovery } } : null);
+        console.log(`[linear-tickets] project ${project.name}: the planner start waits for a repair; the next pass retries`);
+        return this.runStatus(project.id, read.status);
+      }
       const current = (await this.store.all())[project.id].planner!;
       if (error instanceof SetupError) await this.askOwner(project, current, message(error));
       else if (limitError(message(error))) {
@@ -770,6 +779,14 @@ export class ProjectFlow {
     try {
       agentId = (await this.deps.startPlanner({ runId: run.id, linearProjectId: project.id, projectName: project.name, teamId: this.busiestTeam(read.work), requestId, brief }, paseo, settings)).agentId;
     } catch (error) {
+      if (error instanceof RepairBusyError) {
+        // Nothing was created: undo this attempt's restart count and grace start so the next pass
+        // tries again instead of spending the restart budget the owner is asked about.
+        await this.store.update(project.id, (current) => current?.planner?.id === run.id && current.planner.startedAt === attemptAt
+          ? { ...current, planner: { ...current.planner, restarts: run.restarts, startedAt: run.startedAt } } : null);
+        console.log(`[linear-tickets] project ${project.name}: the planner start waits for a repair; the next pass retries`);
+        return this.runStatus(project.id, read.status);
+      }
       if (error instanceof SetupError) {
         await this.askOwner(project, { ...run, restarts: counted }, message(error));
         return this.runStatus(project.id, read.status);

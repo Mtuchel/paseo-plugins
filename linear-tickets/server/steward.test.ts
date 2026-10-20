@@ -4,8 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
 import {
-  calendarDate, classifyTicket, DoneTickets, isDefect, parseVerdict, Steward, StewardStateError, StewardStore, STEWARD_ACTION, STEWARD_SITUATIONS, STEWARD_STATES,
-  RESTART_CAP, type StewardFacts, type StewardSituation,
+  calendarDate, classifyTicket, DEFECT_GRACE_MS, DoneTickets, isDefect, parseVerdict, Steward, StewardStateError, StewardStore, STEWARD_ACTION, STEWARD_SITUATIONS, STEWARD_STATES,
+  RESTART_CAP, type StewardDeps, type StewardFacts, type StewardSituation,
 } from "./steward";
 import type { ParentProgress } from "./parents";
 import { ManualTasks, type ManualTask } from "./manual-tasks";
@@ -337,11 +337,12 @@ async function passFixture(t: any, over: {
   watchdog?: WatchdogFile;
   continuation?: (input: { issueId: string; agentId: string; operationId: string; text: string }) => Promise<{ status: "queued" | "sent" | "started" | "unknown" | "cancelled"; reason?: string }>;
   recoveryWait?: () => Promise<string | null>;
-  owner?: HostOwnership;
+  owner?: HostOwnership | ((issueId: string) => HostOwnership);
   gateReadError?: "watchdog" | "planned" | "thread" | "queue" | "handed";
   parentResume?: SessionRouter["resumeVerifiedParent"];
   manualInventory?: () => Promise<ManualTask[]>;
   ownerInventory?: () => Promise<{ id: string; parentId: string; identifier: string }[]>;
+  responsibility?: StewardDeps["responsibility"];
 } = {}) {
   t.mock.method(console, "error", () => {});
   t.mock.method(console, "log", () => {});
@@ -454,7 +455,7 @@ async function passFixture(t: any, over: {
     needsYou: { all: async () => over.needsYou ?? [], allStrict: over.ownerInventory ?? (async () => over.needsYou ?? []) } as any,
     settings: { read: async () => stewardSettings(over.cap) } as any,
     planned: { has: async () => { if (over.gateReadError === "planned") throw new Error("parked plan store unreadable"); return over.planned ?? false; } },
-    owner: async () => over.owner ?? "here",
+    owner: async (issueId: string) => (typeof over.owner === "function" ? over.owner(issueId) : over.owner ?? "here"),
     pulls: async () => over.pullStates ?? new Map(),
     completionPulls: async (issueId: string, _identifier: string, urls: string[]) => { calls.completionUrls.push(urls); return typeof over.completionPulls === "function" ? over.completionPulls(issueId) : over.completionPulls ?? "settled"; },
     recoveryWait: over.recoveryWait ?? (async () => null),
@@ -463,6 +464,7 @@ async function passFixture(t: any, over: {
     labels: { all: async () => [], add: async () => {}, remove: async () => {} } as any,
     now: () => clock.now,
     verdicts: over.verdicts,
+    responsibility: over.responsibility,
   } as any);
   const seed = async (issueId: string, identifier: string, patch: Record<string, unknown> = {}) => {
     await store.update((file: any) => {
@@ -502,6 +504,108 @@ test("a claim written before the effect is not repeated after a reload, and is r
   f.clock.now = T0 + 20 * 60_000; // past the claim grace
   await f.pass();
   assert.deepEqual(f.calls.restarts, ["i1"], "after the grace the restart is claimed and tried once");
+});
+
+// --- the responsibility check's place in the pass (README, "Responsibility check") ---------------
+// The check itself (judging, guards, the repair) is responsibility.test.ts's; these drive the real
+// Steward with a recording check: the lost-review hold, the evidence it is given, its fence and
+// when it runs.
+
+type CheckRun = Parameters<NonNullable<StewardDeps["responsibility"]>["run"]>[0];
+function recordingCheck(state: { holds: boolean; due: boolean }, during?: (input: CheckRun) => void) {
+  const runs: CheckRun[] = [];
+  const asked: string[] = [];
+  const check: NonNullable<StewardDeps["responsibility"]> = {
+    due: () => state.due,
+    holds: async (issue) => { asked.push(issue.identifier); return state.holds; },
+    run: async (input) => { during?.(input); runs.push(input); },
+  };
+  return { check, runs, asked };
+}
+
+test("a lost review holds the agentless planner: no restart while the check restores it, its fence clears, recovery resumes after the hold", async (t) => {
+  const state = { holds: true, due: true };
+  const rec = recordingCheck(state);
+  const f = await passFixture(t, { issues: [ticketIssue({ status: "Planning" })], records: [recordFor("i1", "ENG-1")], responsibility: rec.check });
+  await f.seed("i1", "ENG-1", { situation: "stalled", since: at(120) });
+  await f.pass();
+  assert.deepEqual(rec.asked, ["ENG-1"]);
+  assert.deepEqual([f.calls.restarts, f.calls.starts, f.calls.successions], [[], [], []], "a held planner is a plan under review, not stalled work");
+  const [first] = rec.runs;
+  assert.deepEqual({ ...first.tickets[0], stewardAt: null }, { issue: { id: "i1", identifier: "ENG-1", status: "Planning", statusType: "started" }, ownerHold: false, question: null, liveRoots: [], queued: false, reviewThread: null, stewardAt: null });
+  assert.equal(first.enabled, true);
+  assert.equal(await first.fence("i1", "ENG-1"), null, "nothing of the steward's stands in the way");
+  // The hold ended (expired, or the plan file does not match): existing recovery takes over, after
+  // the defect grace like any newly stalled ticket.
+  state.holds = false;
+  f.clock.now += 31 * 60_000;
+  await f.pass();
+  assert.deepEqual(f.calls.restarts, [], "the stall is new");
+  f.clock.now += DEFECT_GRACE_MS;
+  await f.pass();
+  assert.deepEqual(f.calls.restarts, ["i1"]);
+  assert.match(await first.fence("i1", "ENG-1") ?? "", /the steward acted on ENG-1 within the last ten minutes/, "a fresh steward action fences the repair");
+});
+
+test("the hold is never asked under an owner gate, a blocker, a live root or a disabled steward, and the evidence carries them", async (t) => {
+  const planning = { status: "Planning" };
+  const cases: { name: string; issue: Record<string, unknown>; over?: Record<string, unknown>; enabled?: boolean; ownerHold: boolean; liveRoots?: string[] }[] = [
+    { name: "hold label", issue: { ...planning, labels: [{ id: "l1", name: "paseo" }, { id: "l2", name: "paseo-hold" }] }, ownerHold: true },
+    { name: "blocker", issue: { ...planning, blockers: [{ id: "i5", identifier: "ENG-5", status: "In Progress", statusType: "started", merged: false }] }, ownerHold: true },
+    { name: "owner Stop", issue: planning, over: { watchdog: { tickets: {}, holds: { i1: { at: at(5) } } } }, ownerHold: true },
+    { name: "live root", issue: planning, over: { roots: new Map([["i1", { roots: [{ id: "a1", status: "running", updatedAt: at(1), createdAt: at(60), labels: {} }], ghosts: new Set<string>() }]]) }, ownerHold: false, liveRoots: ["a1"] },
+    { name: "disabled", issue: planning, enabled: false, ownerHold: false },
+  ];
+  for (const entry of cases) {
+    const rec = recordingCheck({ holds: true, due: true });
+    const f = await passFixture(t, { issues: [ticketIssue(entry.issue)], records: [recordFor("i1", "ENG-1")], responsibility: rec.check, ...entry.over });
+    const settings = stewardSettings();
+    await f.build().tick(f.paseo, entry.enabled === false ? { ...settings, steward: { ...settings.steward, enabled: false } } : settings);
+    assert.deepEqual(rec.asked, [], `${entry.name}: the owner, the blocker or the agent is responsible, not a lost review`);
+    assert.equal(rec.runs[0]?.tickets[0]?.ownerHold, entry.ownerHold, entry.name);
+    assert.deepEqual(rec.runs[0]?.tickets[0]?.liveRoots, entry.liveRoots ?? [], entry.name);
+    assert.equal(rec.runs[0]?.enabled, entry.enabled ?? true, entry.name);
+  }
+});
+
+test("the repair fence refuses what the steward's own gates refuse, read fresh", async (t) => {
+  const issues = [ticketIssue({ status: "Planning" })];
+  const rec = recordingCheck({ holds: false, due: true });
+  const thread: { value: unknown } = { value: null };
+  const f = await passFixture(t, { issues, records: [recordFor("i1", "ENG-1")], responsibility: rec.check, owner: () => owner.value, get thread() { return thread.value; } });
+  const owner: { value: HostOwnership } = { value: "here" };
+  await f.pass();
+  const fence = () => rec.runs[0].fence("i1", "ENG-1");
+  issues[0] = ticketIssue({ status: "Todo", statusType: "unstarted" });
+  assert.equal(await fence(), "the ticket moved to Todo");
+  issues[0] = ticketIssue({ status: "Plan review" });
+  assert.equal(await fence(), null, "Plan review without a review is repairable");
+  issues[0] = ticketIssue({ status: "Planning", labels: [{ id: "l1", name: "paseo" }, { id: "l2", name: "do-not-merge" }] });
+  assert.equal(await fence(), "the ticket is marked do-not-merge");
+  issues[0] = ticketIssue({ status: "Planning" });
+  thread.value = { review: { agentId: "a1" }, offer: null };
+  assert.equal(await fence(), "the live ticket thread waits for a plan decision");
+  thread.value = null;
+  owner.value = "elsewhere";
+  assert.equal(await fence(), "another host owns the ticket (elsewhere)");
+});
+
+test("the check runs only when due, before the pass's actions, never on a queue-blocker pass, and only on this host's tickets", async (t) => {
+  const state = { holds: false, due: true };
+  let restartsAtRun: string[] | null = null;
+  const issues = [ticketIssue(), ticketIssue({ id: "i2", identifier: "ENG-2", labels: [{ id: "l1", name: "paseo" }, { id: "l3", name: "paseo-failed" }] })];
+  const rec = recordingCheck(state, () => { restartsAtRun = [...f.calls.restarts]; });
+  const f = await passFixture(t, { issues, records: [recordFor("i1", "ENG-1"), recordFor("i2", "ENG-2")], responsibility: rec.check, owner: (issueId) => (issueId === "i1" ? "here" : "elsewhere") });
+  await f.seed("i1", "ENG-1", { situation: "stalled", since: at(120) });
+  await f.pass();
+  assert.deepEqual(rec.runs.map((run) => run.tickets.map((ticket) => ticket.issue.id)), [["i1"]], "the peer's ticket is the peer's check");
+  assert.deepEqual([restartsAtRun, f.calls.restarts], [[], ["i1"]], "before the pass's actions");
+  state.due = false;
+  await f.pass();
+  assert.equal(rec.runs.length, 1, "not due: not run");
+  state.due = true;
+  await f.build().tickQueueBlockers(f.paseo, stewardSettings());
+  assert.equal(rec.runs.length, 1, "a queue-blocker pass never runs it");
 });
 
 test("an exhausted restart budget launches a bounded diagnosis instead of asking the owner", async (t) => {

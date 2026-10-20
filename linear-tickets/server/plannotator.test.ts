@@ -20,6 +20,7 @@ import { ReviewDeletions } from "./review-deletions";
 import { AgentApi } from "./agent-app";
 import { Credentials } from "./credentials";
 import { LinearService, postGraphQL } from "./linear";
+import { DecisionJournal } from "./decision-journal";
 import { RateBudget, RateLimitedError, withPriority } from "./rate-budget";
 
 const exec = promisify(execFile);
@@ -539,6 +540,51 @@ test("a plan that needs the owner is parked and its agent retired; the central h
   await run([{ type: "decided", agentId: "agent-1", approved: true, parked: true, planContent: RISKY(2), at: "2026-01-01T12:00:00Z" }]);
   assert.deepEqual(calls, ["document issue-1 Plan: TUC-25", "+plan-ready issue-1", "-plan-rework issue-1", "ready issue-1", "comment issue-1: ✅ **Plan approved** in Plannotator ([plan](https://linear.app/doc/1))\n\nAssign Paseo again to implement it."], "decision 1: without an agent thread, Todo and the owner starts it");
   assert.equal(plans.size, 0);
+});
+
+// The responsibility check parked a lost review's plan again (README, "Responsibility check"): the
+// central host's review of it is that repair's replacement, and the lost page's late report does
+// not decide it.
+test("a repaired plan's review is the attributed replacement, announced and staged once; the lost page's late report cannot consume it", async (t) => {
+  t.mock.method(console, "error", () => {});
+  const { calls, linear, paseo } = setup({ "linear.issueId": "issue-1", "linear.identifier": "TUC-25" });
+  const { plans, parking } = parkingFake(calls);
+  const root = await mkdtemp(join(tmpdir(), "paseo-plannotator-"));
+  const events = join(root, "events");
+  const tabs: string[] = [];
+  const parkedAt = "2026-01-01T10:00:00Z";
+  try {
+    await mkdir(events);
+    const seeded = new DecisionJournal(join(root, "decisions"));
+    assert.equal(await seeded.acquire(), true);
+    const lost = await seeded.ensureReview({ agentId: "agent-1", localUrl: "http://localhost:4000/", openedAt: "2026-01-01T09:00:00Z", planHash: planHash(RISKY(2)), parked: true });
+    await seeded.supersede({ review: lost, issueId: "issue-1", repairId: "repair-1", parkedAt });
+    await seeded.stop();
+    plans.set("issue-1", { issueId: "issue-1", identifier: "TUC-25", agentId: "agent-1", plan: RISKY(2), line: "Parked again: the review was lost before your decision was carried out", reasons: ["review lost; parked again by the responsibility check"], model: null, parkedAt, announced: false, responsibilityRepairId: "repair-1" });
+    let bridge!: PlannotatorBridge;
+    const run = async (name: string, event: object) => {
+      await writeFile(join(events, name), JSON.stringify(event));
+      bridge = new PlannotatorBridge(linear, { read: async () => settings }, events, undefined, async () => RISKY(2), undefined, undefined, undefined, async () => {}, (url) => tabs.push(url), parking);
+      bridge.attach(paseo);
+      await bridge.drain();
+      await bridge.stop();
+    };
+    const hosted = { type: "opened", agentId: "agent-1", localUrl: "http://localhost:5000/", remoteUrl: "https://host.ts.net:5000/", at: "2026-01-01T10:01:00Z" };
+    await run("0.json", hosted);
+    await run("1.json", hosted);
+    const replacement = bridge.decisionJournal.replacement("repair-1");
+    assert.equal(replacement?.localUrl, "http://localhost:5000/", "the served review is the repair's replacement");
+    assert.deepEqual(tabs, ["http://localhost:5000/"]);
+    assert.equal(calls.filter((call) => call.startsWith("comment issue-1: 📋 **Plan waiting for your review in Plannotator**")).length, 1, "announced once");
+    assert.deepEqual(calls.filter((call) => /^(stage|state)/.test(call)), ["stage issue-1 Plan review"], "staged once");
+    calls.length = 0;
+    // The lost page's report, written before the plan was parked again.
+    await run("2.json", { type: "decided", agentId: "agent-1", approved: true, parked: true, planContent: RISKY(2), at: "2026-01-01T09:30:00Z" });
+    assert.deepEqual(bridge.decisionJournal.attempts(replacement!.id), [], "the replacement is not consumed");
+    assert.equal(bridge.decisionJournal.applying().find((entry) => entry.kind === "unbound")?.entry.supersededReviewId, lost.id, "kept for the owner under Being applied");
+    assert.deepEqual(calls, [], "nothing is carried out");
+    assert.equal(plans.get("issue-1")?.responsibilityRepairId, "repair-1", "the restored plan still waits for the owner");
+  } finally { await rm(root, { recursive: true, force: true }); }
 });
 
 test("a parked plan sent back keeps no plan-ready and asks for a new plan; the retired agent's own report is ignored", async () => {

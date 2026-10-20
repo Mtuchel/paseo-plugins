@@ -10,6 +10,7 @@ import json
 import io
 import os
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -86,6 +87,7 @@ class FakeIO:
         self.planner_recovery_sources = {"": {"version": 1, "pending": [], "completed": []}}
         self.planning_sources_data = {digest.HOST_NAME: {"planning_sessions": {"ok": True, "sessions": []},
                                                          "planning_smoke": {"ok": True, "smoke": None}}}
+        self.responsibility_sources_data = {digest.HOST_NAME: {"ok": True, "check": None}}
 
     def dispatch_quarantine(self):
         self.dispatches += 1
@@ -122,6 +124,9 @@ class FakeIO:
 
     def planning_sources(self, now):
         return {host: dict(sources) for host, sources in self.planning_sources_data.items()}
+
+    def responsibility_sources(self, now):
+        return dict(self.responsibility_sources_data)
 
     def permissions(self):
         return self.perms
@@ -2297,6 +2302,297 @@ class PlanningRunTest(RunCase):
         self.assertIn("- planning_smoke@down@x: timeout (previous items kept)", doc)
         self.assertNotIn("secret`", doc)
 
+
+# ---------------------------------------------------------------------------- ticket responsibility (TUC-1290)
+
+RESPONSIBILITY_HOME = "https://linear.app/tuchel/issue/{}"
+RESPONSIBILITY_RECUR = at("2026-09-30T10:05:00Z")
+RESPONSIBILITY_LATER = at("2026-09-30T11:05:00Z")
+
+
+def responsibility_file(*, checked="2026-09-30T07:55:00Z", host=None, violations=(), unknown=(), repairs=None):
+    return {"version": 1, "host": host or digest.HOST_NAME, "checkedAt": checked,
+            "violations": list(violations), "unknown": list(unknown), "holds": {}, "repairs": repairs or {}}
+
+
+def responsibility_violation(identifier, kind="review-missing", *, status="Plan review", why=None):
+    row = {"issueId": f"issue-{identifier}", "identifier": identifier, "url": RESPONSIBILITY_HOME.format(identifier),
+           "status": status, "kind": kind, "detail": digest.RESPONSIBILITY_KINDS[kind],
+           "since": "2026-09-29T08:00:00Z", "seen": 2}
+    if why:
+        row["why"] = why
+    return row
+
+
+def responsibility_repair(identifier, kind="planning-no-agent", *, state="done", at="2026-09-30T07:50:00Z",
+                          parked="2026-09-30T07:50:00Z", previous="Planning", why=None):
+    row = {"issueId": f"issue-{identifier}", "identifier": identifier, "url": RESPONSIBILITY_HOME.format(identifier),
+           "kind": kind, "detail": digest.RESPONSIBILITY_KINDS[kind], "revision": "a" * 40, "reviewId": "review-1",
+           "agentId": "agent-1", "repairId": "repair-1", "previousStatus": previous, "parkedAt": parked,
+           "state": state, "tries": 1, "at": at}
+    if why:
+        row["why"] = why
+    return row
+
+
+class ResponsibilityParseTest(unittest.TestCase):
+    def test_the_check_is_reduced_to_what_the_document_renders(self):
+        data = responsibility_file(host="mirko@mac",
+                                   violations=[responsibility_violation("TUC-1", why="**needs** `a human`")],
+                                   unknown=[{"issueId": "i2", "identifier": "TUC-2", "why": "no comments"}],
+                                   repairs={"repair-1": responsibility_repair("TUC-3")})
+        data["violations"][0]["secret"] = "must not leave the host"
+        parsed = digest.parse_responsibility(data)
+        self.assertEqual(parsed["checkedAt"], "2026-09-30T07:55:00Z")
+        self.assertEqual(parsed["violations"], [{
+            "identifier": "TUC-1", "url": RESPONSIBILITY_HOME.format("TUC-1"), "kind": "review-missing",
+            "detail": "Plan review without a review", "status": "Plan review", "since": "2026-09-29T08:00:00Z",
+            "seen": 2, "why": "needs a human"}])
+        self.assertEqual(parsed["unknown"], [{"identifier": "TUC-2", "why": "no comments"}])
+        self.assertEqual(parsed["repairs"]["repair-1"]["previousStatus"], "Planning")
+        self.assertNotIn("must not leave", json.dumps(parsed))
+        self.assertNotIn("issue-TUC-1", json.dumps(parsed))
+
+    def test_a_record_outside_the_version_1_contract_is_rejected(self):
+        good = responsibility_file()
+        for broken in ({**good, "version": 2}, {**good, "host": ""}, {**good, "checkedAt": "yesterday"},
+                       {**good, "violations": None},
+                       {**good, "violations": [{"identifier": "TUC-1"}]},
+                       {**good, "violations": [dict(responsibility_violation("TUC-1"), kind="unknown")]},
+                       {**good, "violations": [dict(responsibility_violation("TUC-1"), url="javascript:alert(1)")]},
+                       {**good, "violations": [dict(responsibility_violation("TUC-1"), seen=True)]},
+                       {**good, "unknown": [{"identifier": "not a ticket", "why": "x"}]},
+                       {**good, "repairs": {"r": dict(responsibility_repair("TUC-3"), state="maybe")}}):
+            with self.subTest(broken=broken):
+                with self.assertRaises(ValueError):
+                    digest.parse_responsibility(broken)
+
+
+class ResponsibilityRunTest(RunCase):
+    def check(self, now, *, source=None, **kwargs):
+        kwargs.setdefault("checked", iso(now - 300))
+        self.io.responsibility_sources_data[source or digest.HOST_NAME] = {
+            "ok": True, "check": responsibility_file(**kwargs)}
+
+    def test_the_section_lists_kind_counts_ticket_links_and_unjuried_rows(self):
+        self.check(WED_10_05, violations=[responsibility_violation("TUC-1"), responsibility_violation("TUC-2"),
+                                          responsibility_violation("TUC-3", "planning-no-agent", status="Planning")],
+                   unknown=[{"issueId": "i4", "identifier": "TUC-4", "why": "no comments"}])
+        self.run_at(WED_10_05)
+        doc = self.io.published[-1]
+        section = doc.split("## Tickets without one responsible next step (3)", 1)[1].split("\n## ", 1)[0]
+        self.assertIn("- Plan review without a review: 2", section)
+        self.assertIn("- Planning without an agent: 1", section)
+        self.assertLess(section.index("Plan review without a review: 2"), section.index("Planning without an agent: 1"))
+        self.assertIn(f"- **new** [TUC-1]({RESPONSIBILITY_HOME.format('TUC-1')}) — Plan review TUC-1:"
+                      " Plan review without a review", section)
+        self.assertIn(f"[TUC-3]({RESPONSIBILITY_HOME.format('TUC-3')}) — Planning", section)
+        self.assertIn("- Not judged (evidence missing): 1", section)
+        self.assertNotIn("- nothing", section)
+        attention = doc.split("## Needs attention (3)", 1)[1].split("\n## ", 1)[0]
+        self.assertIn("[TUC-1]", attention)
+        self.assertIn("[TUC-2]", attention)
+        # One notification listing the problems; `once` items still notify the first time.
+        self.assertEqual(len(self.io.comments), 1)
+        self.assertIn("[TUC-1]", self.io.comments[0][2])
+
+    def test_a_repair_of_the_last_day_is_one_item_and_a_persisting_violation_wins(self):
+        self.check(WED_10_05, violations=[responsibility_violation("TUC-1")],
+                   repairs={"r1": responsibility_repair("TUC-2"),
+                            "r2": responsibility_repair("TUC-1", kind="review-missing", previous="Plan review"),
+                            "r3": responsibility_repair("TUC-3", at=iso(WED_10_05 - digest.RESPONSIBILITY_REPAIR_S - 60)),
+                            "r4": responsibility_repair("TUC-4", state="report-only")})
+        self.run_at(WED_10_05)
+        items = self.saved()["items"]
+        self.assertEqual(set(items), {"responsibility:TUC-1:review-missing",
+                                      "responsibility:TUC-2:planning-no-agent"})
+        self.assertEqual(items["responsibility:TUC-1:review-missing"]["payload"]["title"],
+                         f"[TUC-1]({RESPONSIBILITY_HOME.format('TUC-1')}) — Plan review")
+        self.assertEqual(items["responsibility:TUC-2:planning-no-agent"]["payload"]["title"],
+                         f"[TUC-2]({RESPONSIBILITY_HOME.format('TUC-2')}) — Planning · parked again 09:50")
+        self.assertEqual(items["responsibility:TUC-2:planning-no-agent"]["payload"]["detail"],
+                         "Planning without an agent")
+        self.assertEqual(digest.item_kind(items["responsibility:TUC-2:planning-no-agent"]["payload"]),
+                         "responsibility: Planning without an agent")
+
+    def test_a_remote_check_merges_as_its_own_unit_and_an_older_remote_is_not_read(self):
+        self.io.responsibility_sources_data[digest.HOST_NAME] = {"ok": True, "check": None}
+        self.check(WED_10_05, source="mirko@mac", host="mac", violations=[responsibility_violation("TUC-7")])
+        self.io.responsibility_sources_data["old@mini"] = None
+        self.run_at(WED_10_05)
+        item = self.saved()["items"]["responsibility:TUC-7:review-missing"]
+        self.assertEqual(item["payload"]["unit"], "responsibility@mirko@mac")
+        self.assertTrue(item["payload"]["attention"])
+        self.assertTrue(item["payload"]["once"])
+        doc = self.io.published[-1]
+        self.assertIn("## Tickets without one responsible next step (1)", doc)
+        self.assertIn(f"[TUC-7]({RESPONSIBILITY_HOME.format('TUC-7')}) — Plan review", doc)
+        self.assertIn("- responsibility@old@mini: not in host snapshot (previous items kept)", doc)
+        lines = read_lines(os.path.join(self.history, "history.jsonl"))
+        opened = [line for line in lines if line["event"] == "opened"]
+        self.assertEqual([(line["key"], line["kind"], line["unit"], line["host"], line["attention"]) for line in opened],
+                         [("responsibility:TUC-7:review-missing", "responsibility: Plan review without a review",
+                           "responsibility@mirko@mac", "mirko@mac", True)])
+        self.assertEqual({unit: ok for unit, ok in lines[0]["units"].items() if unit.startswith("responsibility")},
+                         {"responsibility": True, "responsibility@mirko@mac": True, "responsibility@old@mini": False})
+
+    def test_a_once_item_is_announced_once_across_clear_and_recurrence(self):
+        self.check(WED_10_05, violations=[responsibility_violation("TUC-1")])
+        self.run_at(WED_10_05)
+        self.assertEqual(len(self.io.comments), 1)
+        self.assertEqual(list(self.saved()["notifiedOnce"]), ["responsibility:TUC-1:review-missing"])
+        self.check(WED_11_05)
+        self.run_at(WED_11_05)  # solved: cleared
+        self.assertEqual(self.saved()["items"], {})
+        self.check(RESPONSIBILITY_RECUR, violations=[responsibility_violation("TUC-1")])
+        self.run_at(RESPONSIBILITY_RECUR)  # back, a new occurrence
+        state = self.saved()
+        self.assertTrue(state["items"]["responsibility:TUC-1:review-missing"]["payload"]["attention"])
+        self.assertEqual(state["pending"], {})
+        self.assertEqual(len(self.io.comments), 1)
+        self.assertIn("## Tickets without one responsible next step (1)", self.io.published[-1])
+        opened = [line for line in read_lines(os.path.join(self.history, "history.jsonl")) if line["event"] == "opened"]
+        self.assertEqual(len(opened), 2)
+        self.assertTrue(all(line["attention"] and line["host"] == digest.HOST_NAME for line in opened))
+
+    def test_a_failed_send_keeps_the_key_pending_then_announces_it_once(self):
+        self.check(WED_10_05, violations=[responsibility_violation("TUC-1")])
+        self.io.comment_error = digest.LinearError("down")
+        self.run_at(WED_10_05)
+        self.assertEqual(list(self.saved()["pending"]), ["responsibility:TUC-1:review-missing"])
+        self.assertEqual(self.saved()["notifiedOnce"], {})
+        self.io.comment_error = None
+        self.check(WED_11_05, violations=[responsibility_violation("TUC-1")])
+        self.run_at(WED_11_05)
+        self.assertEqual(len(self.io.comments), 1)
+        self.assertIn("[TUC-1]", self.io.comments[0][2])
+        self.assertEqual(list(self.saved()["notifiedOnce"]), ["responsibility:TUC-1:review-missing"])
+        self.assertEqual(self.saved()["pending"], {})
+        self.check(RESPONSIBILITY_RECUR)
+        self.run_at(RESPONSIBILITY_RECUR)
+        self.check(RESPONSIBILITY_LATER, violations=[responsibility_violation("TUC-1")])
+        self.run_at(RESPONSIBILITY_LATER)
+        self.assertEqual(len(self.io.comments), 1)
+        self.assertEqual(self.saved()["pending"], {})
+        self.assertIn("responsibility:TUC-1:review-missing", self.saved()["items"])
+
+    def test_a_stale_or_malformed_check_keeps_previous_items_stale(self):
+        self.check(WED_10_05, violations=[responsibility_violation("TUC-1")])
+        self.run_at(WED_10_05)
+        self.check(WED_11_05, checked=iso(WED_11_05 - digest.RESPONSIBILITY_STALE_S - 60))
+        self.run_at(WED_11_05)
+        self.assertTrue(self.saved()["items"]["responsibility:TUC-1:review-missing"]["stale"])
+        self.assertIn("- responsibility: stale check (previous items kept)", self.io.published[-1])
+        self.assertIn("_(not refreshed since 10:05)_", self.io.published[-1])
+        self.io.responsibility_sources_data[digest.HOST_NAME] = {"ok": False, "category": "unreadable response"}
+        self.run_at(RESPONSIBILITY_RECUR)
+        self.assertTrue(self.saved()["items"]["responsibility:TUC-1:review-missing"]["stale"])
+        self.assertIn("- responsibility: unreadable response (previous items kept)", self.io.published[-1])
+        self.io.responsibility_sources_data[digest.HOST_NAME] = {
+            "ok": True, "check": responsibility_file(checked=None, violations=[])}
+        self.run_at(RESPONSIBILITY_LATER)
+        self.assertTrue(self.saved()["items"]["responsibility:TUC-1:review-missing"]["stale"])
+        self.assertIn("- responsibility: stale check (previous items kept)", self.io.published[-1])
+
+    def test_a_host_without_a_check_yet_is_read_and_clears_its_items(self):
+        self.check(WED_10_05, violations=[responsibility_violation("TUC-1")])
+        self.run_at(WED_10_05)
+        self.io.responsibility_sources_data[digest.HOST_NAME] = {"ok": True, "check": None}
+        self.run_at(WED_11_05)
+        self.assertEqual(self.saved()["items"], {})
+        doc = self.io.published[-1]
+        section = doc.split("## Tickets without one responsible next step (0)", 1)[1].split("\n## ", 1)[0]
+        self.assertIn("- nothing", section)
+        self.assertNotIn("Not judged", section)
+        self.assertNotIn("- responsibility:", doc)
+        self.assertEqual(len(self.io.comments), 1)
+
+    def test_a_state_file_from_before_the_field_still_loads_and_notifies(self):
+        with open(self.state, "w") as f:
+            json.dump({"items": {}, "pending": {}, "cleared": []}, f)
+        self.check(WED_10_05, violations=[responsibility_violation("TUC-1")])
+        self.run_at(WED_10_05)
+        self.assertEqual(len(self.io.comments), 1)
+        self.assertEqual(list(self.saved()["notifiedOnce"]), ["responsibility:TUC-1:review-missing"])
+
+    def test_a_check_that_cannot_be_read_is_listed_and_the_others_still_render(self):
+        self.io.responsibility_sources_data[digest.HOST_NAME] = {"ok": False, "category": "timeout"}
+        self.io.responsibility_sources_data["mac"] = {"ok": True, "check": responsibility_file(
+            checked=iso(WED_10_05 - 60), violations=[responsibility_violation("TUC-5")])}
+        self.run_at(WED_10_05)
+        doc = self.io.published[-1]
+        section = doc.split("## Tickets without one responsible next step (1)", 1)[1].split("\n## ", 1)[0]
+        self.assertIn("[TUC-5]", section)
+        self.assertNotIn("- nothing", section)
+        self.assertIn("- responsibility: timeout (previous items kept)", doc)
+
+
+class ResponsibilitySnapshotTest(unittest.TestCase):
+    def patches(self, directory):
+        return [
+            mock.patch.object(digest, "RESPONSIBILITY", os.path.join(directory, "responsibility.json")),
+            mock.patch.object(digest, "PROJECTS", os.path.join(directory, "projects.json")),
+            mock.patch.object(digest, "OMP_SESSIONS", os.path.join(directory, "sessions")),
+            mock.patch.object(digest, "PLANNING_SMOKE", os.path.join(directory, "planning-smoke.json")),
+            mock.patch.object(digest, "LIMIT_RESUMES", os.path.join(directory, "limit-resumes.json")),
+            mock.patch.object(digest.HostIO, "agents", return_value=([], {})),
+            mock.patch.object(digest.HostIO, "permissions", return_value={}),
+            mock.patch.object(digest.HostIO, "open_reviews", return_value={}),
+        ]
+
+    def test_a_remote_snapshot_becomes_a_source_and_an_older_remote_is_not_read(self):
+        bare = responsibility_file(host="mac", violations=[responsibility_violation("TUC-1")])
+        self.assertIsNone(digest.responsibility_remote(None))
+        self.assertEqual(digest.responsibility_remote({"ok": False, "category": "timeout"}),
+                         {"ok": False, "category": "timeout"})
+        receiver = digest.HostIO(sync_repo=False)
+        receiver._targets = ["mirko@mac", "old@mini", "down@x"]
+        receiver._remotes = [{"_host": "mirko@mac", "ticketResponsibility": digest.responsibility_remote(bare)},
+                             {"_host": "old@mini"}]
+        receiver._unreachable = {"down@x": "timeout"}
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(digest, "RESPONSIBILITY", os.path.join(tmp, "none")):
+            sources = receiver.responsibility_sources(time.time())
+        self.assertEqual(sources[digest.HOST_NAME], {"ok": True, "check": None})
+        self.assertEqual(sources["mirko@mac"], {"ok": True, "check": bare})
+        self.assertIsNone(sources["old@mini"])
+        self.assertEqual(sources["down@x"], {"ok": False, "category": "timeout"})
+
+    def test_the_agents_json_snapshot_carries_the_sanitized_check(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "responsibility.json"), "w") as f:
+                json.dump(responsibility_file(violations=[responsibility_violation("TUC-1", why="`secret`")]), f)
+            with contextlib.ExitStack() as stack:
+                for patch in self.patches(tmp):
+                    stack.enter_context(patch)
+                snapshot = json.loads(json.dumps(digest.HostIO(sync_repo=False, remotes=False).snapshot()))
+        self.assertEqual(snapshot["ticketResponsibility"]["ok"], True)
+        check = snapshot["ticketResponsibility"]["check"]
+        self.assertEqual([row["identifier"] for row in check["violations"]], ["TUC-1"])
+        self.assertEqual(check["violations"][0]["why"], "secret")
+        self.assertNotIn("issue-TUC-1", json.dumps(snapshot))
+
+    def test_the_agents_json_flag_prints_the_check_without_agents_or_network(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = os.path.join(tmp, ".paseo")
+            os.makedirs(os.path.join(home, "linear-tickets"))
+            with open(os.path.join(home, "linear-tickets", "responsibility.json"), "w") as f:
+                json.dump(responsibility_file(host="server087", violations=[responsibility_violation("TUC-1")]), f)
+            done = subprocess.run([sys.executable, digest.__file__, "--agents-json"], capture_output=True, text=True,
+                                  env={**os.environ, "HOME": tmp}, timeout=60)
+            self.assertEqual(done.returncode, 0, done.stderr)
+            snapshot = json.loads(done.stdout)
+            self.assertEqual([row["identifier"] for row in snapshot["ticketResponsibility"]["check"]["violations"]],
+                             ["TUC-1"])
+
+    def test_a_malformed_file_leaves_the_snapshot_unread_not_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "responsibility.json"), "w") as f:
+                f.write(json.dumps({"version": 1, "host": "x"}))
+            with contextlib.ExitStack() as stack:
+                for patch in self.patches(tmp):
+                    stack.enter_context(patch)
+                snapshot = digest.HostIO(sync_repo=False, remotes=False).snapshot()
+        self.assertEqual(snapshot["ticketResponsibility"], {"ok": False, "category": "unreadable response"})
 
 
 if __name__ == "__main__":

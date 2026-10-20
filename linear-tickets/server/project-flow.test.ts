@@ -8,6 +8,7 @@ import type { PaseoApi } from "@getpaseo/client";
 import { LinearApiError, LinearRefusedError, type ProjectIssue, type TeamIssue, type TicketRef } from "./linear";
 import { Capacity } from "./capacity";
 import { SetupError, type PlannerStart } from "./launch";
+import { REPAIR_BUSY_MESSAGE, RepairBusyError } from "./repair-exclusion";
 import type { ProcessInspector } from "./process-liveness";
 import { orderProblems, parseOrder, plannerBrief, ProjectFlow, ProjectStore, type PlannerRecord, type ProjectRecord } from "./project-flow";
 import { Scheduler } from "./scheduler";
@@ -56,7 +57,7 @@ async function room(t: TestContext, issues: ProjectIssue[], running: string[] = 
   // Linear writes that fail (`update`: the next n project updates; one relation refused or never
   // reaching Linear); `start`: how a planner start fails (`setup`: a SetupError, `always`: a
   // timeout); `restart`: every stalled-ticket restart. `starts`: every planner start, in order.
-  const fail: { read?: boolean; update?: number; relation?: string; unreached?: string; restart?: boolean; retire?: boolean; start?: "setup" | "always"; startError?: string } = {};
+  const fail: { read?: boolean; update?: number; relation?: string; unreached?: string; restart?: boolean; retire?: boolean; start?: "setup" | "always"; startError?: string; busy?: number } = {};
   const starts: PlannerStart[] = [];
   const comments: string[] = [];
   const updates: string[] = [];
@@ -124,6 +125,7 @@ async function room(t: TestContext, issues: ProjectIssue[], running: string[] = 
       launchedSelectors.push(current.launchPreferences[current.lastProvider!].model);
       starts.push(input);
       calls.push("start run");
+      if (fail.busy) { fail.busy -= 1; throw new RepairBusyError(); }
       if (fail.start === "setup") throw new SetupError("No Paseo project is mapped to ERP or its team. Open the Paseo plugin settings and map one.");
       starting = true;
       await gate;
@@ -605,6 +607,48 @@ test("a start that keeps failing counts like a restart and reaches the owner the
   assert.equal(r.starts.length, 3, "three starts: the cap");
   assert.deepEqual(await poll(60), []);
   assert.equal((await r.store.all()).erp.planner?.ownerAsked, true);
+});
+
+test("a planner restart refused while a repair holds the ticket is retried without spending the restart budget", async (t) => {
+  const r = await room(t, [issue(1, { delegateId: APP, statusType: "started", status: "In Progress" })]);
+  await r.seed({ planned: [], planner: runRecord({ startedAt: "2026-01-01T23:50:00Z", restarts: 2 }) });
+  r.fail.busy = 1;
+  const none = paseoWith(() => []);
+  const poll = async (minutes: number) => { r.calls.length = 0; r.advance(minutes * MINUTE); await r.flow.tick(none, settings); return r.calls; };
+  assert.deepEqual(await poll(0), ["start run"]);
+  const afterBusy = (await r.store.all()).erp.planner!;
+  assert.equal(afterBusy.restarts, 2, "a transient refusal spends no restart");
+  assert.equal(afterBusy.startedAt, "2026-01-01T23:50:00Z", "and moves no grace window");
+  assert.equal(afterBusy.ownerAsked, undefined, "the owner is not asked");
+
+  assert.deepEqual(await poll(2), ["start run"], "the next read tries again");
+  assert.equal(r.starts.length, 2, "one refused attempt and one start, never a fallback");
+  assert.equal((await r.store.all()).erp.planner?.agentId, "run-agent-1");
+  assert.equal((await r.store.all()).erp.planner?.restarts, 3, "the successful retry is the one restart");
+});
+
+test("a planner limit restart refused while a repair holds the ticket keeps its pending recovery and its claim", async (t) => {
+  const r = await room(t, [issue(1, { delegateId: APP, statusType: "started", status: "In Progress" })]);
+  const pending = {
+    identity: "planner-run-1", error: "usage limit retry-after: 60 model=anthropic/claude-opus-5-5", model: "anthropic/claude-opus-5-5",
+    failedAt: "2026-01-01T22:50:00Z", resumeAt: "2026-01-01T23:10:00.000Z", fallbackAt: "2026-01-01T23:00:00Z", jitterMs: 60_000,
+    basis: "retry-after" as const, selector: "anthropic/claude-opus-5-5",
+  };
+  await r.seed({ planned: [], planner: runRecord({ startedAt: "2026-01-01T23:00:00Z", restarts: 1, recovery: { attempt: 1, claims: ["2026-01-01T22:00:00Z"], pending } }) });
+  r.fail.busy = 1;
+  const none = paseoWith(() => []);
+  const poll = async (minutes: number) => { r.calls.length = 0; r.advance(minutes * MINUTE); await r.flow.tick(none, settings); return r.calls; };
+  assert.deepEqual(await poll(0), ["start run"]);
+  const held = (await r.store.all()).erp.planner!;
+  assert.deepEqual(held.recovery?.pending, pending, "the pending usage-limit restart is kept");
+  assert.equal(held.recovery?.claims.length, 1, "the refused attempt spends no claim");
+  assert.equal(held.recovery?.claim, undefined);
+  assert.equal(held.ownerAsked, undefined);
+
+  assert.deepEqual(await poll(2), ["start run"], "the next pass retries the limit restart");
+  assert.equal(r.starts.length, 2);
+  assert.equal(r.starts[1].requestId, "planner-run-1-limit-2");
+  assert.equal((await r.store.all()).erp.planner?.recovery?.pending, undefined, "the start that came up clears the pending restart");
 });
 
 test("a planner startup usage limit waits through the reset window without ordinary retries", async (t) => {

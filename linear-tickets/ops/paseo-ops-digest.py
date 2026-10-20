@@ -18,7 +18,10 @@ on the Mac). Each run:
      "Linear budget" section, where an hour that hit a limit in the last 24 h is a
      non-attention item (never notified) and the section lists the last 7 days; and, per host,
      ticket-planning omp sessions of the last 24 h that started without Plannotator's planning
-     instructions and a failed planning smoke check (`linear-tickets/planning-smoke.json`);
+     instructions and a failed planning smoke check (`linear-tickets/planning-smoke.json`); and,
+     per host, the tickets its responsibility check found without one responsible next step
+     (TUC-1290, `~/.paseo/linear-tickets/responsibility.json`; one attention item per ticket and
+     kind, notified once ever, plus the repairs of the last 24 h);
   3. merges both into the state in ~/.paseo/ops-digest/state.json and saves it BEFORE
      publishing, so a failed publish never loses an observed problem. The same save holds this
      run's history lines in the state's outbox (`historyOutbox`): one `run` line with every unit
@@ -36,8 +39,10 @@ on the Mac). Each run:
   5. inside the notification window (Mon-Fri 08:00-19:00 Europe/Berlin) posts one comment on
      the document as the Paseo app, mentioning the owner, listing the problems not delivered
      yet (also those that came and went overnight). Pending items are acknowledged only after
-     that comment succeeded (at-least-once). When the app cannot post, a desktop notification
-     says so once and the items stay pending.
+     that comment succeeded (at-least-once); an item marked `once` (the responsibility check's)
+     is remembered in the state's `notifiedOnce` even when it cleared, so it is never announced
+     a second time. When the app cannot post, a desktop notification says so once and the items
+     stay pending.
   6. (first, scheduled runs only) starts tuchel-platform's "Flaky quarantine" workflow on main
      (TUC-614: GitHub starts that repository's schedules only about every 5 hours). A failed
      start is logged and never stops the digest.
@@ -97,6 +102,7 @@ CRASHES = f"{HOME}/linear-tickets/crash-recovery.json"
 LIMIT_RESUMES = f"{HOME}/linear-tickets/limit-resumes.json"
 PROJECTS = f"{HOME}/linear-tickets/projects.json"
 LINEAR_USAGE = f"{HOME}/linear-tickets/linear-usage.json"  # the plugin's own Linear API usage per UTC hour
+RESPONSIBILITY = f"{HOME}/linear-tickets/responsibility.json"  # tickets without one responsible next step (TUC-1290)
 PROJECTS = f"{HOME}/linear-tickets/projects.json"
 PULL_URL = "https://github.com/tuchel-sohn/tuchel-platform/pull/{}"
 HISTORY = "history.jsonl"
@@ -917,12 +923,190 @@ def budget_items(usage, now):
     return items
 
 
+# ---------------------------------------------------------------------------- ticket responsibility (pure)
+
+# responsibility.json (TUC-1290), written by the linear-tickets plugin's per-host check: tickets
+# whose Linear state implies a next actor but that have none. The digest only reads it; the fixed
+# kind text is what it renders (the file's `detail` is the same text, but a changed file wording
+# must not garble the document).
+RESPONSIBILITY_STALE_S = 30 * 60  # a check older than this (or never completed) is not read
+RESPONSIBILITY_REPAIR_S = 24 * 3600  # repairs of the last day are reported
+RESPONSIBILITY_KINDS = {
+    "planning-no-agent": "Planning without an agent",
+    "review-missing": "Plan review without a review",
+    "approved-no-handoff": "Plan approved without a hand-off",
+    "in-progress-no-agent": "In Progress without an agent or queue entry",
+    "needs-input-no-question": "Needs input without an open question",
+    "two-steps": "More than one responsible step",
+}
+RESPONSIBILITY_REPAIR_STATES = ("claimed", "released", "done", "report-only", "failed")
+RESPONSIBILITY_STATUS_MAX = 40  # a Linear state name, never a paragraph
+RESPONSIBILITY_WHY_MAX = 120
+RESPONSIBILITY_HOST = re.compile(r"[A-Za-z0-9_.@-]{1,64}")
+
+
+class ResponsibilityUnreadable(Exception):
+    """The responsibility check finished too long ago (or never): no current evidence, so the
+    unit counts as not read and its previous items stay stale."""
+
+
+def responsibility_text(value, limit):
+    """A check's status or why as one short plain line: markup, links and commands are dropped,
+    never quoted into the document."""
+    text = re.sub(r"\s+", " ", re.sub(r"[^A-Za-z0-9 _.,:/'-]+", " ", value)).strip()
+    return text[:limit]
+
+
+def responsibility_time(value):
+    """An ISO time this digest can compare; anything but a usable string raises."""
+    parsed = parse_iso(value) if isinstance(value, str) else None
+    if parsed is None or not math.isfinite(parsed):
+        raise ValueError("responsibility time")
+    return value
+
+
+def responsibility_url(value):
+    if not isinstance(value, str) or not value.startswith("https://") or len(value) > 512:
+        raise ValueError("responsibility url")
+    return value
+
+
+def responsibility_ticket(value):
+    if not isinstance(value, str) or not TICKET.fullmatch(value):
+        raise ValueError("responsibility identifier")
+    return value
+
+
+def responsibility_kind(value):
+    if value not in RESPONSIBILITY_KINDS:
+        raise ValueError("responsibility kind")
+    return value
+
+
+def parse_responsibility(data):
+    """responsibility.json (version 1) reduced to the check time, its violations, the rows it could
+    not judge and its repairs. Only the fields the digest renders and re-ships in a host snapshot
+    survive; a record it cannot trust raises ValueError (the unit is then not read)."""
+    if not isinstance(data, dict) or type(data.get("version")) is not int or data["version"] != 1:
+        raise ValueError("responsibility version")
+    host = data.get("host")
+    if not isinstance(host, str) or not RESPONSIBILITY_HOST.fullmatch(host):
+        raise ValueError("responsibility host")
+    checked = data.get("checkedAt")
+    if checked is not None:
+        checked = responsibility_time(checked)
+    raw = data.get("violations")
+    if not isinstance(raw, list):
+        raise ValueError("responsibility violations")
+    violations = []
+    for row in raw:
+        if not isinstance(row, dict) or not isinstance(row.get("detail"), str) or not isinstance(row.get("status"), str):
+            raise ValueError("responsibility violation")
+        seen = row.get("seen")
+        if type(seen) is not int or seen < 0:
+            raise ValueError("responsibility seen")
+        why = row.get("why")
+        if why is not None and not isinstance(why, str):
+            raise ValueError("responsibility why")
+        kind = responsibility_kind(row.get("kind"))
+        violations.append({"identifier": responsibility_ticket(row.get("identifier")),
+                           "url": responsibility_url(row.get("url")), "kind": kind,
+                           "detail": RESPONSIBILITY_KINDS[kind],
+                           "status": responsibility_text(row["status"], RESPONSIBILITY_STATUS_MAX) or "status unknown",
+                           "since": responsibility_time(row.get("since")), "seen": seen,
+                           **({"why": responsibility_text(why, RESPONSIBILITY_WHY_MAX)} if why else {})})
+    raw = data.get("unknown", [])
+    if not isinstance(raw, list):
+        raise ValueError("responsibility unknown")
+    unknown = []
+    for row in raw:
+        if not isinstance(row, dict) or not isinstance(row.get("why"), str):
+            raise ValueError("responsibility unknown row")
+        unknown.append({"identifier": responsibility_ticket(row.get("identifier")),
+                        "why": responsibility_text(row["why"], RESPONSIBILITY_WHY_MAX)})
+    raw = data.get("repairs", {})
+    if not isinstance(raw, dict):
+        raise ValueError("responsibility repairs")
+    repairs = {}
+    for name, row in raw.items():
+        if not isinstance(row, dict) or not isinstance(row.get("previousStatus"), str):
+            raise ValueError("responsibility repair")
+        state, tries = row.get("state"), row.get("tries")
+        if state not in RESPONSIBILITY_REPAIR_STATES or type(tries) is not int or tries < 0:
+            raise ValueError("responsibility repair state")
+        why = row.get("why")
+        if why is not None and not isinstance(why, str):
+            raise ValueError("responsibility why")
+        kind = responsibility_kind(row.get("kind"))
+        identifier = responsibility_ticket(row.get("identifier"))
+        repaired = {"identifier": identifier, "url": responsibility_url(row.get("url")), "kind": kind,
+                    "detail": RESPONSIBILITY_KINDS[kind], "state": state, "tries": tries,
+                    "previousStatus": responsibility_text(row["previousStatus"], RESPONSIBILITY_STATUS_MAX)
+                                      or "status unknown",
+                    "parkedAt": responsibility_time(row.get("parkedAt")), "at": responsibility_time(row.get("at")),
+                    **({"why": responsibility_text(why, RESPONSIBILITY_WHY_MAX)} if why else {})}
+        repairs[name or f"{identifier}:{kind}"] = repaired
+    return {"version": 1, "host": host, "checkedAt": checked, "violations": violations,
+            "unknown": unknown, "repairs": repairs}
+
+
+def responsibility_remote(value):
+    """A remote's `ticketResponsibility` snapshot field as a source outcome. None: an older host
+    that never sent it (not read, like a missing planning source); a raw sanitized check is
+    wrapped so both shapes are accepted."""
+    if value is None:
+        return None
+    if isinstance(value, dict) and isinstance(value.get("ok"), bool):
+        return value
+    return {"ok": True, "check": value}
+
+
+def responsibility_check(source, host, now, *, stale_s=RESPONSIBILITY_STALE_S):
+    """(items, unknown count) of one host's check. Raises TypeError for an unknown source (an older
+    host's snapshot), ResponsibilityUnreadable when no check completed within `stale_s`, and
+    ValueError for a malformed file, so only that host's previous items stay (stale)."""
+    if not isinstance(source, dict) or source.get("ok") is not True or "check" not in source:
+        raise TypeError("unknown responsibility check")
+    check = source["check"]
+    if check is None:
+        return [], 0  # the check has not run on this host yet: nothing found, unit read
+    check = parse_responsibility(check)
+    finished = parse_iso(check["checkedAt"])
+    if finished is None or now - finished > stale_s:
+        raise ResponsibilityUnreadable("no fresh check")
+    unit = "responsibility" if host == HOST_NAME else f"responsibility@{host}"
+    items = []
+    for row in check["violations"]:
+        items.append({"key": f"responsibility:{row['identifier']}:{row['kind']}", "unit": unit,
+                      "section": "responsibility", "attention": True, "once": True, "ticket": row["identifier"],
+                      "title": f"[{row['identifier']}]({row['url']}) — {row['status']}"
+                               + (f" · {row['why']}" if row.get("why") else ""),
+                      "detail": row["detail"]})
+    seen = {item["key"] for item in items}
+    for row in check["repairs"].values():
+        if row["state"] != "done":
+            continue
+        at = parse_iso(row["at"])
+        if at is None or not 0 <= now - at <= RESPONSIBILITY_REPAIR_S:
+            continue
+        key = f"responsibility:{row['identifier']}:{row['kind']}"
+        if key in seen:
+            continue  # one item per ticket and kind: a persisting violation wins, without the repair note
+        items.append({"key": key, "unit": unit, "section": "responsibility", "attention": True, "once": True,
+                      "ticket": row["identifier"],
+                      "title": f"[{row['identifier']}]({row['url']}) — {row['previousStatus']}"
+                               f" · parked again {local(parse_iso(row['parkedAt']))}"
+                               + (f" · {row['why']}" if row.get("why") else ""),
+                      "detail": row["detail"]})
+    return items, len(check["unknown"])
+
+
 # ---------------------------------------------------------------------------- state (pure)
 
 def empty_state():
     return {"items": {}, "pending": {}, "cleared": [], "desktopNotified": None, "document": None,
             "publishedAt": None, "notifyFailedAt": None, "ownerUrl": None, "decisionCandidates": None,
-            "historyOutbox": []}
+            "historyOutbox": [], "notifiedOnce": {}}
 
 
 def merge_decisions(state, decisions, now):
@@ -940,7 +1124,7 @@ def unit_failed(unit, failed_units):
     `pulls/917`), or the whole repository script — which covers every item of the repository
     part, but none of this host's own units, the plugin's `linear_budget` included."""
     unit = unit or ""
-    if unit.split("@", 1)[0] in ("planners",) + PLANNING_UNITS:
+    if unit.split("@", 1)[0] in ("planners", "responsibility") + PLANNING_UNITS:
         return unit in failed_units  # each host's store or files are independent, including the local ones
     if "repo" in failed_units and unit.split("@")[0] not in HOST_UNITS + ("linear_budget",):
         return True
@@ -952,9 +1136,12 @@ def unit_failed(unit, failed_units):
 def merge_run(state, collected, failed_units, now):
     """Fold one run's items into the state. Items of failed units are kept with their last
     payload (marked stale); cleared items are reported once; new attention items join
-    `pending` and stay there, with their payload, until a notification succeeds."""
+    `pending` and stay there, with their payload, until a notification succeeds. An item marked
+    `once` that a notification already carried never joins `pending` again: it stays an item
+    (document and history) without a second announcement."""
     state = json.loads(json.dumps(state))
     previous = state["items"]
+    notified = state.setdefault("notifiedOnce", {})
     items = {}
     for item in collected:
         prior = previous.get(item["key"])
@@ -976,6 +1163,8 @@ def merge_run(state, collected, failed_units, now):
                 state["pending"][key]["clearedAt"] = now
     new_keys = [k for k, e in items.items() if k not in previous and e["payload"].get("attention")]
     for key in new_keys:
+        if items[key]["payload"].get("once") and key in notified:
+            continue
         state["pending"][key] = {"payload": items[key]["payload"], "firstSeen": now, "clearedAt": None}
     state["items"] = items
     state["cleared"] = cleared
@@ -1140,7 +1329,8 @@ def budget_lines(usage, now):
     return out
 
 
-def render(state, units, now, *, new_keys=(), agent_notes=None, notify_failed=False, trend=None, budget=None):
+def render(state, units, now, *, new_keys=(), agent_notes=None, notify_failed=False, trend=None, budget=None,
+           responsibility=None):
     agent_notes = agent_notes or {}
     entries = state["items"]
 
@@ -1192,6 +1382,23 @@ def render(state, units, now, *, new_keys=(), agent_notes=None, notify_failed=Fa
             body = [fmt(k) for k in keys(lambda p, s=section: p.get("section") == s)]
         out += body or ["- none"]
         out.append("")
+    # Its own section with the kind counts the weekly review ranks; these items also stay under
+    # "Needs attention" (they are problems, not a separate list).
+    responsibility_keys = keys(lambda p: p.get("section") == "responsibility")
+    unknown = sum((responsibility or {}).values())
+    out += [f"## Tickets without one responsible next step ({len(responsibility_keys)})", ""]
+    counts = {}
+    for key in responsibility_keys:
+        detail = str(entries[key]["payload"].get("detail") or "")
+        counts[detail] = counts.get(detail, 0) + 1
+    out += [f"- {detail}: {n}" for detail, n in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))]
+    out += [fmt(k) for k in responsibility_keys]
+    read = [u for u in units if u["unit"].split("@", 1)[0] == "responsibility"]
+    if not responsibility_keys and read and all(u.get("ok") for u in read):
+        out.append("- nothing")
+    if unknown:
+        out.append(f"- Not judged (evidence missing): {unknown}")
+    out.append("")
     out += ["## Decision candidates", ""]
     decisions = state.get("decisionCandidates")
     if decisions:
@@ -1294,11 +1501,12 @@ AGENT_KEY = re.compile(r"agent-(?:error|silent|waiting):([^:]+)")
 
 def item_host(payload, host):
     """The host an item belongs to: the part of its unit after the first `@` (another host's
-    agents or planning sessions), `host` (this one) for its own, None for repository items."""
+    agents, planning sessions or responsibility check), `host` (this one) for its own, None for
+    repository items."""
     unit = str(payload.get("unit") or "")
     if "@" in unit:
         return unit.split("@", 1)[1]
-    return host if payload.get("section") in ("agents", "planning") else None
+    return host if payload.get("section") in ("agents", "planning", "responsibility") else None
 
 
 def item_evidence(key, payload, at, host, evidence):
@@ -1636,6 +1844,33 @@ class HostIO:
             sources.setdefault(target, {unit: down for unit in PLANNING_UNITS})
         return sources
 
+    def responsibility(self, now):
+        """This host's responsibility check (TUC-1290) as a source outcome: a missing file is
+        "not checked here yet" (no items, unit read), a malformed one is UNKNOWN. The check is
+        reduced to the fields the digest renders before it can leave the host in a snapshot."""
+        try:
+            with open(RESPONSIBILITY) as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            return {"ok": True, "check": None}
+        except (OSError, ValueError):
+            return {"ok": False, "category": "unreadable response"}
+        try:
+            return {"ok": True, "check": parse_responsibility(data)}
+        except (ValueError, TypeError):
+            return {"ok": False, "category": "unreadable response"}
+
+    def responsibility_sources(self, now):
+        """{host: source} for the responsibility check of this host and every remote. An older
+        remote without the snapshot field gives None (not read); an unreachable one its category.
+        Freshness is judged where the check is read, against that run's clock."""
+        sources = {HOST_NAME: self.responsibility(now)}
+        for snapshot in self.remotes():
+            sources[snapshot["_host"]] = responsibility_remote(snapshot.get("ticketResponsibility"))
+        for target in self.remote_targets():
+            sources.setdefault(target, {"ok": False, "category": self._unreachable.get(target, "unreadable response")})
+        return sources
+
     def evidence(self):
         """The pull request watch, crash recovery and limit-resume records of the linear-tickets
         plugin, as they are now (each None when unreadable); history lines keep only owner/auto
@@ -1674,9 +1909,11 @@ class HostIO:
 
 
     def snapshot(self):
-        """Independent planner evidence survives failed agent/permission RPCs on this host."""
+        """Independent planner and responsibility evidence survives failed agent/permission RPCs
+        on this host."""
         snapshot = {"projectPlanners": self.project_planners(),
                     "planningSessions": self.planning_sessions(time.time()), "planningSmoke": self.planning_smoke(),
+                    "ticketResponsibility": self.responsibility(time.time()),
                     "agents": [], "metas": {}, "permissions": {}, "reviews": {},
                     "errorLines": {}, "limitResumes": None}
         try:
@@ -2071,8 +2308,8 @@ def backfill_history(state_path, history_dir, lock_path, now):
 
 def collect(io, now, started):
     """All items and unit outcomes of one run. Every unit attempted is listed, read or not (the
-    history's run line counts on it). Also the decisions and the linear usage of this run, for
-    the sections that render from them."""
+    history's run line counts on it). Also the decisions, the linear usage and the responsibility
+    checks of this run (the latter only for the sections that render from them)."""
     items, units = [], []
     try:
         digest = io.repo_digest()
@@ -2171,6 +2408,19 @@ def collect(io, now, started):
     except Exception as exc:
         units.append({"unit": "linear_budget", "ok": False, "category": error_category(exc)})
     items += budget_items(usage, now)
+    responsibility = {}
+    for host, source in io.responsibility_sources(now).items():
+        unit = "responsibility" if host == HOST_NAME else f"responsibility@{host}"
+        try:
+            found, unknown = responsibility_check(source, host, now)
+            items += found
+            responsibility[host] = unknown
+            units.append({"unit": unit, "ok": True})
+        except Exception as exc:
+            units.append({"unit": unit, "ok": False,
+                          "category": "not in host snapshot" if source is None
+                          else "stale check" if isinstance(exc, ResponsibilityUnreadable)
+                          else source_category(source, exc)})
     if time.monotonic() - started > RUN_BUDGET_S:
         raise TimeoutError("run budget exceeded")
     # Repository items name their ticket; the note says which agent works on it.
@@ -2183,7 +2433,7 @@ def collect(io, now, started):
         for ticket in sorted(tickets_of(agent, meta, teams or {"TUC"})):
             note = f"agent {agent['id'][:7]} {agent.get('status')}" + (f", active {age_text(now - last)} ago" if last else "")
             agent_notes.setdefault(ticket, note)
-    return items, units, agent_notes, decisions, usage
+    return items, units, agent_notes, decisions, usage, responsibility
 
 
 def dispatch_quarantine(io):
@@ -2214,13 +2464,13 @@ def run(io, *, now, mode="publish", state_path=STATE, lock_path=LOCK, started=No
         state = load_state(state_path)
         if mode == "publish":
             dispatch_quarantine(io)
-        items, units, agent_notes, decisions, usage = collect(io, now, started)
+        items, units, agent_notes, decisions, usage, responsibility = collect(io, now, started)
         failed = {u["unit"] for u in units if not u.get("ok")}
         merged, new_keys = merge_run(state, items, failed, now)
         merged = merge_decisions(merged, decisions, now)
         content = render(merged, units, now, new_keys=new_keys, agent_notes=agent_notes,
                          notify_failed=bool(merged.get("notifyFailedAt")), trend=load_trend(trend_path),
-                         budget=usage)
+                         budget=usage, responsibility=responsibility)
         if mode == "print":
             print(content)
             return 0
@@ -2262,6 +2512,12 @@ def deliver(io, state, now, state_path):
         if not state.get("ownerUrl"):
             state["ownerUrl"] = io.owner_url()
         io.comment(auth, state["document"], notification_body(state, state["ownerUrl"], state["document"].get("url"), now))
+        # A sent item marked `once` is remembered even after it clears, so a recurrence is never
+        # announced again (only a comment that went out counts; a failed one leaves it pending).
+        notified = state.setdefault("notifiedOnce", {})
+        for key, entry in state["pending"].items():
+            if entry["payload"].get("once") and key not in notified:
+                notified[key] = now
         state["pending"] = {}
         state["desktopNotified"] = None
         state["notifyFailedAt"] = None

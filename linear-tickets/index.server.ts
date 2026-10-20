@@ -31,6 +31,8 @@ import { AgentWebhookServer, WEBHOOK_PORT } from "./server/agent-webhook";
 import { WebhookCoverage } from "./server/webhook-coverage";
 import { ensureFunnel, type FunnelStatus } from "./server/funnel";
 import { ReviewLinks } from "./server/review-links";
+import { RepairExclusion } from "./server/repair-exclusion";
+import { ResponsibilityCheck, ResponsibilityStore } from "./server/responsibility";
 import { ensureBackendSecret } from "./server/inbox-transport";
 import { tailnetOrigin } from "./server/tailscale";
 import { BrowserDecisionInbox } from "./server/decision-inbox";
@@ -106,6 +108,11 @@ export default function contribute(server: PluginServerContext) {
   const agentApi = new AgentApi(auth);
   const linear = new LinearService(credentials, undefined, agentApi);
   const deletions = new ReviewDeletions();
+  // Keeps the responsibility check's repair apart from every other effect on the same ticket
+  // (repair-exclusion.ts, README "Responsibility check"): closed until the decision journal is
+  // owned and loaded, closed again and drained at shutdown before the journal's lease moves on.
+  const exclusion = new RepairExclusion({ open: false });
+  deletions.useExclusion(exclusion);
   const issueInfos = new ReviewIssueInfos(linear);
   linear.onOwnerComment = (commentId, issueId) => recordPluginComment(join(paseoHome(), "linear-tickets"), commentId, issueId);
   // Each ticket agent's launch environment, given back to its resumed sessions (agent-env.ts).
@@ -127,6 +134,7 @@ export default function contribute(server: PluginServerContext) {
   const shards = new ShardAssignor({ settings: () => settings.read(), handover });
   const launcher = new Launcher(linear, undefined, undefined, (url) => linear.downloadUpload(url), undefined, undefined, agentEnvs, (issueId) => activationGuard(issueId), shards);
   launcher.useDeletions(deletions);
+  launcher.useExclusion(exclusion);
   // Present or away (README, "Present and away"): every start path asks the starter's scheduler.
   const presence = new Presence();
   // Model tiers (README, "Model tiers"): the tier each ticket implements on.
@@ -157,10 +165,12 @@ export default function contribute(server: PluginServerContext) {
   // plugin writes, so a ticket Paseo reopens counts its agent again at once.
   const doneTickets = new DoneTickets();
   linear.onStateWritten((issueId, state) => doneTickets.written(issueId, state.type, Date.now()));
-  const starter = new TicketStarter({ linear, launcher, handover, presence, tiers, acceptanceTests, routes: smallRoutes, deletions, shards, focus, parked: waitingPlans, doneTickets });
+  const starter = new TicketStarter({ linear, launcher, handover, presence, tiers, acceptanceTests, routes: smallRoutes, deletions, shards, focus, parked: waitingPlans, doneTickets,
+    repairs: { exclusion, parked: { get: (issueId) => parking.plans.get(issueId) } } });
   // The decision journal (README, "Decision journal"): every owner decision on a plan is written
   // here first and carried out by the bridge's worker; the inbox lists what is being applied.
   const decisionJournal = new DecisionJournal();
+  decisionJournal.useExclusion(exclusion);
   // Every approval path files the approved plan's follow-ups (README, "Plan follow-ups").
   const followUps = new PlanFollowUps(linear);
   // Waits on tickets already closed live in "Needs you" sub-issues; replies there (a relayed
@@ -264,6 +274,8 @@ export default function contribute(server: PluginServerContext) {
     completionPulls: (issueId, identifier, urls) => pullRequests.completionPulls(issueId, identifier, urls),
     recoveryWait: (issueId, identifier, urls) => pullRequests.recoveryWait(issueId, identifier, urls),
     intake, doneTickets, labels: new RetiredLabels(), deletions, focus, planned: waitingPlans,
+    // The responsibility check (README, "Responsibility check"), built below with the review stores.
+    responsibility: { due: (now) => responsibility.due(now), holds: (issue) => responsibility.holds(issue), run: (input) => responsibility.run(input) },
   });
   const relay = new CommentRelay(linear, undefined, needsYou, route, replies, { covered: () => coverage.covers("Comment") });
   const dispatcher = new Dispatcher({ linear, starter, launcher, settings, route, relay, afterLaunch: openSession, handOff: (issueId, openChildren) => sessions.handOffGroup(issueId, openChildren), projects, steward, focus, parked: waitingPlans });
@@ -409,6 +421,7 @@ export default function contribute(server: PluginServerContext) {
       await sessions.deleteTicket(issueId, agentId);
     },
   });
+  reviewLinks.useExclusion(exclusion);
   // Plans that need the owner are parked and served by one central Plannotator host, so their
   // agents are retired instead of holding a slot until the owner decides (README, "Parked plans").
   const plannotatorHost = new PlannotatorHost();
@@ -421,8 +434,15 @@ export default function contribute(server: PluginServerContext) {
       await api.agents.ref(agentId).archive().catch(() => {});
     },
   };
+  parking.plans.useExclusion(exclusion);
   const plannotator = new PlannotatorBridge(linear, settings, undefined, sessions, undefined, handover, undefined, reviewLinks, undefined, undefined, parking);
   plannotator.useJournal(decisionJournal);
+  // Every ticket, every ten minutes, in the steward's pass: who is responsible for its next step,
+  // and the one repair it makes, restoring a lost plan review (README, "Responsibility check").
+  const responsibility = new ResponsibilityCheck({
+    store: new ResponsibilityStore(hostName), reviews: reviewLinks, journal: decisionJournal, parked: parking.plans, deletions, exclusion,
+    workspaceUrl: () => linear.workspaceUrl(),
+  });
   plannotator.useDeletions(deletions);
   plannotator.observeDeliveryFailures((event, error, attempts) => pipeline.recordDeliveryError(event, error, attempts));
   plannotator.onProjectPlan(projects);
@@ -842,12 +862,16 @@ export default function contribute(server: PluginServerContext) {
     clearInterval(controlTimer);
     watchdog.stop();
     steward?.stop();
+    // No new effect or repair is admitted from here on; the admitted ones finish before the
+    // bridge releases the decision journal's lease (below).
+    exclusion.closeAdmission();
     // The checked inbox backend stops admitting before anything it uses closes: a mutation the
     // frontdoor forwards from here on is refused, never rebound to the replacement plugin.
     reviewLinks.seam?.draining();
     browserDecisions.stop();
     // The bridge stops admitting decisions and lets every admitted one finish (each call is
     // bounded) before anything it uses closes; only then does the journal's lease move on.
+    await exclusion.drain();
     await plannotator.stop();
     await replies.stop();
     clearTimeout(startSoon);

@@ -6,9 +6,10 @@ import { join } from "node:path";
 import test from "node:test";
 import { setImmediate as immediate } from "node:timers/promises";
 import {
-  DecisionJournal, DecisionPendingError, FencedError, HaltedError, StaleResolutionError, retryDelay, reviewEntryId,
-  type AttemptInput, type DecisionConflict, type ReportInput, type ReviewGeneration, type RouteSnapshot, type UnboundReport,
+  DecisionJournal, DecisionPendingError, FencedError, HaltedError, StaleResolutionError, SupersededReviewError, retryDelay, reviewEntryId,
+  type AttemptInput, type DecisionConflict, type ReportInput, type ReviewGeneration, type ReviewSupersession, type RouteSnapshot, type UnboundReport,
 } from "./decision-journal";
+import { RepairExclusion } from "./repair-exclusion";
 import { planHash } from "./review-outcome";
 
 // The decision journal on its own (decision-journal.ts): the publish protocol, the lease and its
@@ -707,5 +708,103 @@ test("prune drops settled records and keeps working ones with their reviews", as
     assert.ok(!files.some((name) => name.includes(settled.id)), "the settled review's record is gone from disk");
     assert.ok(!files.some((name) => name.includes(settledAttempt.id)), "the settled decision's record is gone from disk");
     assert.ok(files.some((name) => name.includes(workingAttempt.id)), "the working decision keeps its record");
+  });
+});
+
+// The responsibility check's repair (README, "Responsibility check") marks a lost review
+// superseded before it parks the plan again; the marker is enforced by the journal alone, so it
+// still holds with the checker rolled back (no exclusion, no repairs).
+test("a superseded review takes no decision, while its replacement and other reviews do", async () => {
+  await withJournal(async (journal, directory) => {
+    const lost = await openReview(journal, "agent-1", OPENED, { planHash: planHash(PLAN), parked: true });
+    const marker = await journal.supersede({ review: lost, issueId: "issue-1", repairId: "repair-1", parkedAt: AT });
+    assert.deepEqual(await journal.supersede({ review: lost, issueId: "issue-1", repairId: "repair-1", parkedAt: AT }), marker, "the same repair's retry returns its marker");
+    await assert.rejects(journal.supersede({ review: lost, issueId: "issue-1", repairId: "repair-2", parkedAt: AT }), DecisionPendingError, "another repair cannot take it over");
+    assert.equal(journal.supersession("repair-1")?.reviewId, lost.id);
+    const replacement = await journal.ensureReview({ agentId: "agent-1", localUrl: "http://localhost:5001/", openedAt: "2026-01-01T10:10:00Z", planHash: planHash(PLAN), parked: true, repairId: "repair-1" });
+    assert.equal(journal.replacement("repair-1")?.id, replacement.id);
+
+    await journal.stop();
+    // The checker rolled back: a new instance with no exclusion and no repairs.
+    const restarted = new DecisionJournal(directory);
+    try {
+      assert.equal(await restarted.acquire(), true);
+      await assert.rejects(restarted.begin(input(lost)), SupersededReviewError, "the lost page's decision is refused");
+      assert.equal(await restarted.report(reportInput(lost, { event: "400-1.json", exact: true })), "unbound", "a late report is kept for the owner");
+      const late = unboundOf(restarted);
+      assert.equal(late.supersededReviewId, lost.id);
+      await assert.rejects(restarted.resolve(late.id, "carry-out", async () => SNAPSHOT), StaleResolutionError, "not carried out, not even on the replacement");
+      assert.equal(restarted.attempts(lost.id).length, 0);
+      assert.equal(restarted.attempts(replacement.id).length, 0, "the replacement is not consumed");
+      await restarted.resolve(late.id, "drop", async () => SNAPSHOT);
+      assert.equal(unboundOf(restarted, "dropped").id, late.id);
+
+      const own = await restarted.begin(input(replacement));
+      assert.equal(own.state, "pending", "the replacement's own decision works");
+      const other = await openReview(restarted, "agent-2", "2026-01-01T11:00:00Z");
+      assert.equal((await restarted.begin(input(other, { agentId: "agent-2" }))).state, "pending", "an unrelated review works");
+    } finally { await restarted.stop(); }
+    await assert.rejects(restarted.supersede({ review: replacement, issueId: "issue-1", repairId: "repair-3", parkedAt: AT }), FencedError, "a stopped journal supersedes nothing");
+  });
+});
+
+test("a review with a decision is not superseded", async () => {
+  await withJournal(async (journal) => {
+    const review = await openReview(journal);
+    await journal.begin(input(review));
+    await assert.rejects(journal.supersede({ review, issueId: "issue-1", repairId: "repair-1", parkedAt: AT }), DecisionPendingError);
+    assert.equal(journal.superseded(review.id), null);
+  });
+});
+
+test("a conflict on a superseded review is kept or dismissed, never carried out the other way", async () => {
+  await withJournal(async (journal, directory) => {
+    const review = await openReview(journal);
+    await journal.begin(input(review));
+    await journal.report(reportInput(review, { event: "410-1.json", approved: false, exact: true }));
+    const conflict = conflictOf(journal, review.id);
+    // Written beside the conflict (the journal itself refuses to supersede a decided review).
+    const marker: ReviewSupersession = { kind: "superseded", id: `superseded-${review.id}`, reviewId: review.id, agentId: "agent-1", issueId: "issue-1", repairId: "repair-1", parkedAt: AT, at: AT };
+    await writeFile(join(directory, `${marker.id}.json`), JSON.stringify(marker));
+    await journal.stop();
+    const restarted = new DecisionJournal(directory);
+    try {
+      assert.equal(await restarted.acquire(), true);
+      await assert.rejects(restarted.resolve(conflict.id, "other", async () => SNAPSHOT), StaleResolutionError);
+      assert.equal(accepted(restarted, review.id).length, 1, "nothing was voided or created");
+      await restarted.resolve(conflict.id, "keep", async () => SNAPSHOT);
+      assert.equal(conflictOf(restarted, review.id).resolution, "keep");
+    } finally { await restarted.stop(); }
+  });
+});
+
+test("prune keeps a supersession and the review it names", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.parse(AT) });
+  await withJournal(async (journal) => {
+    const lost = await openReview(journal);
+    await journal.supersede({ review: lost, issueId: "issue-1", repairId: "repair-1", parkedAt: AT });
+    t.mock.timers.tick(61 * 24 * 60 * 60 * 1000);
+    await journal.prune();
+    assert.equal(journal.superseded(lost.id)?.repairId, "repair-1");
+    assert.equal(journal.get(lost.id)?.kind, "review");
+    await assert.rejects(journal.begin(input(lost)), SupersededReviewError);
+  });
+});
+
+test("an admitted journal operation waits for a repair and is fenced once admission closes", async () => {
+  await withJournal(async (journal) => {
+    const exclusion = new RepairExclusion({ open: false });
+    journal.useExclusion(exclusion);
+    const repair = exclusion.tryRepair("issue-1");
+    assert.ok(repair, "the held journal opened admission");
+    let ran = false;
+    const running = journal.run(async () => { ran = true; });
+    await immediate();
+    assert.equal(ran, false, "it waits while the repair holds a ticket");
+    repair.release();
+    await running;
+    assert.equal(ran, true);
+    exclusion.closeAdmission();
+    await assert.rejects(journal.run(async () => {}), FencedError);
   });
 });

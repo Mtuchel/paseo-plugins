@@ -22,6 +22,7 @@ import { AWAY_REASON, type Candidate } from "./scheduler";
 import { TierStore } from "./model-tiers";
 import { isUntrusted, MISSED_REACH_NOTE, MODEL_NOTE, OVERLAP_NOTE, QUESTIONS_NOTE, TicketStarter, tierMissingNote, UNTRUSTED_NOTE } from "./starter";
 import { advisorNote, PLAN_REQUIRED_NOTE, PLAN_SECTIONS_NOTE, PLAN_SLICING_NOTE, planPolicy } from "./plan-policy";
+import { REPAIR_BUSY_MESSAGE, RepairBusyError } from "./repair-exclusion";
 import type { ProcessInspector } from "./process-liveness";
 import { ReviewDeletions } from "./review-deletions";
 import { WatchdogStore } from "./watchdog";
@@ -763,6 +764,48 @@ test("a queued thread starts once its blockers finish, even after it dropped out
 
   await h.router.sweep();
   assert.equal(events.length, 4, "an ended, closed or failed wait is not tried again");
+  await h.cleanup();
+});
+
+test("a queued thread refused while a repair holds the ticket keeps its place, its owner text and its offers", async () => {
+  let busy = true;
+  const starts: string[] = [];
+  const events: string[] = [];
+  const h = routerHarness([], {
+    api: {
+      activity: async (_sessionId: string, content: { type: string; body?: string }) => { events.push(`${content.type}:${content.body ?? ""}`); },
+      openSessions: async () => [], activities: async () => [], sessionActivities: async () => new Map(),
+      sessionStatus: async () => "stale", sessionStatuses: async () => new Map(),
+    } as never,
+    linear: { viewerId: async () => OWNER, addLabel: async () => {}, removeLabel: async () => {}, complete: async () => {}, admissionStates: async (ids: string[]) => new Map(ids.map((id) => [id, { id, statusType: "unstarted", status: "Todo" }])) } as never,
+    starter: {
+      admission: async () => ({ ok: true as const }),
+      start: async (id: string) => {
+        starts.push(id);
+        if (busy) throw new RepairBusyError();
+        return { agentId: "agent-i1", warnings: [], provider: "omp", target: "repo", resumed: false, untrusted: false, plan: null };
+      },
+    },
+  });
+  await h.store.put({ ...link, sessionId: "q1", issueId: "i1", identifier: "TUC-1", agentId: null, queued: true, queueReason: "Waiting for TUC-9 to finish.", pendingText: "Ship it", pendingFrom: { activityId: "a-1", userId: OWNER, intent: "triage" }, offer: null });
+
+  await h.router.sweep();
+  const waiting = await h.store.get("q1");
+  assert.deepEqual(
+    { queued: waiting?.queued, queueReason: waiting?.queueReason, pendingText: waiting?.pendingText, pendingFrom: waiting?.pendingFrom, offer: waiting?.offer },
+    { queued: true, queueReason: REPAIR_BUSY_MESSAGE, pendingText: "Ship it", pendingFrom: { activityId: "a-1", userId: OWNER, intent: "triage" }, offer: null },
+    "the next pass finds the same work to start",
+  );
+  assert.ok(!events.some((event) => event.startsWith("error:")), `no failure is posted: ${JSON.stringify(events)}`);
+  assert.ok(events.some((event) => event.startsWith(`thought:Queued: ${REPAIR_BUSY_MESSAGE}`)), "the thread says it keeps its place");
+  assert.equal(starts.length, 1, "one attempt, no fallback");
+
+  busy = false;
+  await h.router.sweep();
+  const started = await h.store.get("q1");
+  assert.equal(started?.agentId, "agent-i1");
+  assert.equal(started?.queued, false);
+  assert.equal(starts.length, 2, "the retry starts the agent");
   await h.cleanup();
 });
 
