@@ -20,6 +20,7 @@ import { tailscaleBinary, tailnetOrigin } from "./tailscale";
 import { PipelineHost, type PipelineHost as HostPipeline } from "../shared/plan-pipeline";
 import { AuthenticationError, refusedByLinear } from "./linear";
 import { ReviewDeletions } from "./review-deletions";
+import { type RepairExclusion, withEffect } from "./repair-exclusion";
 import type { ReviewIssueInfo } from "./review-issue-info";
 import type { PipelineReview } from "./plan-pipeline";
 import { ReviewClosedError } from "./sessions";
@@ -65,6 +66,13 @@ export type ReviewEntry = {
   revision?: string;
 };
 type Registry = Record<string, ReviewEntry>;
+
+// One review step of a ticket on any host, for the responsibility check (responsibility.ts): a
+// waiting review or a decision being applied. `identifier` is what the row names (a peer's row
+// carries no issue id); `applyState` is the "Being applied" kind.
+export type TicketReviewRow = { host: string; agentId: string; identifier?: string; issueId?: string; reviewId?: string; state: "open" | "applying"; applyState?: ApplyState };
+// `unreachable`: hosts whose reviews could not be read now; the rows are incomplete then.
+export type TicketReviews = { rows: TicketReviewRow[]; unreachable: string[] };
 
 // Decides an open review as the owner would on its page (Approve / Send back with a note). The
 // implementation journals the decision for its review generation before anything happens.
@@ -256,6 +264,7 @@ export class ReviewLinks {
   private origin: string | null = null;
   private registry: Registry | null = null;
   private queue: Promise<unknown> = Promise.resolve();
+  private exclusion: Pick<RepairExclusion, "admit"> | null = null;
   private readonly misses = new Map<string, number>();
   // The peer each listed review belongs to, from the last inbox load: where its decision goes.
   private readonly peerOf = new Map<string, { origin: string; backendInstanceId?: string }>();
@@ -428,12 +437,51 @@ export class ReviewLinks {
     return null;
   }
 
+  // Recording an open review is an effect the responsibility check's repair excludes
+  // (repair-exclusion.ts).
+  useExclusion(exclusion: Pick<RepairExclusion, "admit">): void {
+    this.exclusion = exclusion;
+  }
+
+  // Every host's review steps, read now (no peer cache): a peer that does not answer, or a peer
+  // list that cannot be read, is named in `unreachable`.
+  async ticketReviews(): Promise<TicketReviews> {
+    const peers = await this.peers().then((list) => list, () => null);
+    const { open, applying } = await this.inbox();
+    const rows: TicketReviewRow[] = [
+      ...open.map((entry): TicketReviewRow => ({ host: this.host, agentId: entry.agentId, identifier: entry.identifier, issueId: entry.issueId, reviewId: entry.reviewId, state: "open" })),
+      ...applying.map((row): TicketReviewRow => ({ host: this.host, agentId: row.agentId, identifier: row.name, reviewId: row.reviewId, state: "applying", applyState: row.applyState })),
+    ];
+    if (!peers) return { rows, unreachable: ["the peer list"] };
+    const unreachable: string[] = [];
+    for (const answer of await Promise.all(peers.map((peer) => this.readPeerInbox(peer)))) {
+      if ("unreachable" in answer) { unreachable.push(answer.host); continue; }
+      for (const row of answer.open) rows.push({ host: answer.host, agentId: row.agentId, identifier: row.name, reviewId: row.reviewId, state: "open" });
+      for (const row of answer.applying) rows.push({ host: answer.host, agentId: row.agentId, identifier: row.name, reviewId: row.reviewId, state: "applying", applyState: row.applyState });
+    }
+    return { rows, unreachable };
+  }
+
+  // This host's latest recorded review of a ticket (by issue id, else by identifier), open or not.
+  async latestFor(issueId: string, identifier?: string): Promise<ReviewEntry | null> {
+    let found: ReviewEntry | null = null;
+    for (const entry of Object.values(await this.load())) {
+      if (entry.issueId !== issueId && (!identifier || entry.identifier !== identifier)) continue;
+      if (!found || entry.openedAt >= found.openedAt) found = entry;
+    }
+    return found;
+  }
+
   // Records a new review and returns the agent's stable link, or null when there is none to give
   // (the server is not published, or the review itself is not reachable in the tailnet). `since`
   // is when the owner first got the plan, for a review served again (a parked plan after a restart
   // of the central host); without it the review opened now. `model` wrote the plan; `reviewId` is
   // the journal's generation for it (decision-journal.ts), so its decisions can be listed.
   async opened(agentId: string, event: OpenedEvent, review: { identifier?: string; issueId?: string; since?: string; model?: string | null; reviewId?: string } = {}): Promise<string | null> {
+    return withEffect(this.exclusion, review.issueId ?? null, () => this.record(agentId, event, review));
+  }
+
+  private async record(agentId: string, event: OpenedEvent, review: { identifier?: string; issueId?: string; since?: string; model?: string | null; reviewId?: string }): Promise<string | null> {
     await this.starting;
     const { identifier, issueId, since, model, reviewId } = review;
     if (issueId && await this.deletions.blocked(issueId) || await this.deletions.forAgent(agentId)) return null;

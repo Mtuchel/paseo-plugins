@@ -788,7 +788,7 @@ export class PlannotatorBridge {
   // The journal's review generation for an `opened` event: its address and opening time.
   private async openedReview(event: OpenedEvent, agentId: string, name: string): Promise<ReviewGeneration> {
     const parked = this.parking ? await this.parking.plans.forAgent(agentId) : null;
-    return this.journal.ensureReview({ agentId, localUrl: event.localUrl, openedAt: event.at, parked: Boolean(parked), event: name, ...(parked ? { planHash: planHash(parked.plan) } : {}) });
+    return this.journal.ensureReview({ agentId, localUrl: event.localUrl, openedAt: event.at, parked: Boolean(parked), event: name, ...(parked ? { planHash: planHash(parked.plan) } : {}), ...(parked?.responsibilityRepairId ? { repairId: parked.responsibilityRepairId } : {}) });
   }
 
   private async deliver(event: PlannotatorEvent, agentId: string, paseo: PaseoApi, name: string, review: ReviewGeneration | null): Promise<void> {
@@ -833,6 +833,11 @@ export class PlannotatorBridge {
       return this.journal.ensureReview({ agentId, localUrl: event.review.localUrl, openedAt: event.review.servedAt, parked: true, legacy: true });
     }
     if (event.parked) {
+      // A page report without its review, from before the responsibility check parked the plan
+      // again: it belongs to the lost review, so the journal keeps it unbound for the owner.
+      const lost = parked?.responsibilityRepairId && Date.parse(event.at) < Date.parse(parked.parkedAt) ? this.journal.supersession(parked.responsibilityRepairId) : null;
+      const superseded = lost ? this.journal.review(lost.reviewId) : null;
+      if (superseded) return superseded;
       const hosted = this.journal.latestReview(agentId, { before: name, parked: true });
       if (hosted && (!parked || hosted.openedAt >= parked.parkedAt)) return hosted;
       return this.journal.ensureReview({ agentId, localUrl: `parked:${parked?.issueId ?? agentId}`, openedAt: parked?.parkedAt ?? LEGACY_OPENED_AT, parked: true, legacy: true });

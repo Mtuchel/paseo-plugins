@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { link, mkdir, open, readdir, readFile, rename, rm } from "node:fs/promises";
 import { join } from "node:path";
+import { ExclusionClosedError, type RepairExclusion } from "./repair-exclusion";
 import { planHash } from "./review-outcome";
 import { paseoHome } from "./ticket-mcp";
 import { releaseLease, takeLease } from "./watchdog";
@@ -15,7 +16,9 @@ import { releaseLease, takeLease } from "./watchdog";
 // authoritative. An agent with a `deciding`, `uncertain` or `pending` attempt, an open `unbound`
 // report or an unresolved `conflict` has its decision in progress or waiting for the owner,
 // whatever its review record or parked record says. A decision counts as received at `pending`
-// and as carried out at `applied`.
+// and as carried out at `applied`. A `superseded` review (the responsibility check parked its plan
+// again) takes no decision any more: a late report on it waits under Being applied, only to be
+// dropped.
 //
 // Only the holder of the lease `decisions/.lease` writes entries (one plugin instance per host;
 // a reloaded instance takes over once the old one drained, a dead process's lease is taken over).
@@ -57,6 +60,9 @@ export type ReviewGeneration = {
   parked: boolean;
   event?: string;
   legacy?: true;
+  // The responsibility check's repair that parked this generation's plan again (README,
+  // "Responsibility check"): this generation replaces the superseded one.
+  repairId?: string;
   at: string;
 };
 
@@ -109,6 +115,9 @@ export type UnboundReport = {
   state: "open" | "carried" | "dropped";
   attemptId?: string;
   resolvedAt?: string;
+  // A late report on a review the responsibility check superseded: never carried out (the owner
+  // decides the replacement review), only dropped.
+  supersededReviewId?: string;
 };
 
 export type ConflictReport = { event: string; at: string; feedback?: string; planContent?: string };
@@ -130,7 +139,12 @@ export type DecisionConflict = {
   resolvedAt?: string;
 };
 
-export type JournalEntry = ReviewGeneration | DecisionAttempt | ReviewClosing | UnboundReport | DecisionConflict;
+// A lost review the responsibility check parked again (README, "Responsibility check"): no
+// decision on it becomes carryable from now on, so a late one never consumes the replacement.
+// Kept as long as the repair record that names it (never pruned).
+export type ReviewSupersession = { kind: "superseded"; id: string; reviewId: string; agentId: string; issueId: string; repairId: string; parkedAt: string; at: string };
+
+export type JournalEntry = ReviewGeneration | DecisionAttempt | ReviewClosing | UnboundReport | DecisionConflict | ReviewSupersession;
 export type ResolveAction = "carry-out" | "drop" | "keep" | "other" | "dismiss";
 
 // What the inbox lists under "Being applied".
@@ -147,6 +161,11 @@ export class FencedError extends Error {
 // The review already has a decision (or a closing, or a conflict waiting for the owner).
 export class DecisionPendingError extends Error {
   constructor(message = "Already decided; it is being applied.") { super(message); }
+}
+
+// A decision on a review the responsibility check superseded.
+export class SupersededReviewError extends DecisionPendingError {
+  constructor() { super("This review was lost and restored as a new review; decide the restored one."); }
 }
 
 // An owner resolution on an entry whose state changed since the inbox listed it.
@@ -169,6 +188,7 @@ const QUICK_ATTEMPTS = 20;
 const QUICK_RETRY_MS = 3_000;
 const SLOW_RETRY_MS = 60_000;
 export const JOURNAL_KEEP_MS = 60 * 24 * 60 * 60 * 1000;
+const SUPERSEDED_CARRY = "This review was lost and restored as a new review; drop this one and decide the restored review.";
 const OPEN_STATES: ReadonlySet<AttemptState> = new Set(["deciding", "uncertain"]);
 const ACCEPTED_STATES: ReadonlySet<AttemptState> = new Set(["pending", "applied"]);
 
@@ -253,6 +273,7 @@ export class DecisionJournal {
   private readonly inFlight = new Set<Promise<unknown>>();
   private readonly locks = new Map<string, Promise<unknown>>();
   private readonly instance = randomUUID();
+  private exclusion: Pick<RepairExclusion, "admit" | "open"> | null = null;
 
   constructor(readonly directory = decisionsDirectory(), readonly now: () => number = () => Date.now()) {}
 
@@ -263,6 +284,14 @@ export class DecisionJournal {
 
   get closing(): boolean {
     return this.stopping;
+  }
+
+  // The responsibility check's repair exclusion (repair-exclusion.ts): every admitted operation
+  // holds an unknown-ticket effect token, so no repair runs beside a decision being recorded or
+  // carried out; admission opens once this instance owns and has loaded the journal.
+  useExclusion(exclusion: Pick<RepairExclusion, "admit" | "open">): void {
+    this.exclusion = exclusion;
+    if (this.active) exclusion.open();
   }
 
   // Takes the lease (false while another instance holds it) and loads the entries. A `deciding`
@@ -280,6 +309,7 @@ export class DecisionJournal {
         for (const entry of [...this.entries.values()]) {
           if (entry.kind === "attempt" && entry.state === "deciding") await this.write({ ...entry, state: "uncertain", lastError: "The plugin stopped before Plannotator answered." });
         }
+        this.exclusion?.open();
         return true;
       } catch (error) {
         console.error(`[linear-tickets] opening the decision journal failed: ${error instanceof Error ? error.message : error}`);
@@ -300,10 +330,15 @@ export class DecisionJournal {
   }
 
   // Admits one operation (a producer's decision, an intake pass, a worker step) or refuses it
-  // while the journal is not held or stopping.
+  // while the journal is not held or stopping. One effect token covers the whole operation; a
+  // repair in progress delays it, a closed exclusion (the plugin stopping) fences it.
   run<T>(work: () => Promise<T>): Promise<T> {
     if (!this.active) return Promise.reject(new FencedError());
-    const running = work();
+    const exclusion = this.exclusion;
+    const running = exclusion ? (async () => {
+      const token = await exclusion.admit(null).catch((error: unknown) => { throw error instanceof ExclusionClosedError ? new FencedError() : error; });
+      try { return await work(); } finally { token.release(); }
+    })() : work();
     this.inFlight.add(running);
     const done = () => { this.inFlight.delete(running); };
     running.then(done, done);
@@ -410,23 +445,60 @@ export class DecisionJournal {
     return { pending, uncertain };
   }
 
+  // The supersession of a review, if the responsibility check parked its plan again.
+  superseded(reviewId: string): ReviewSupersession | null {
+    const entry = this.entries.get(`superseded-${reviewId}`);
+    return entry?.kind === "superseded" ? entry : null;
+  }
+
+  // The review generation a repair's parked plan opened as (its exact replacement), if any.
+  replacement(repairId: string): ReviewGeneration | null {
+    return this.all().find((entry): entry is ReviewGeneration => entry.kind === "review" && entry.repairId === repairId) ?? null;
+  }
+
+  // The supersession a repair wrote, if any.
+  supersession(repairId: string): ReviewSupersession | null {
+    return this.all().find((entry): entry is ReviewSupersession => entry.kind === "superseded" && entry.repairId === repairId) ?? null;
+  }
+
   // --- Writing ------------------------------------------------------------------------------
 
   // The review generation for an `opened` event (or a decision on a review that predates the
   // journal: `legacy`). Replay-safe: the same generation always maps to the same entry.
-  async ensureReview(input: { agentId: string; localUrl: string; openedAt: string; planHash?: string | null; parked?: boolean; event?: string; legacy?: boolean }): Promise<ReviewGeneration> {
+  async ensureReview(input: { agentId: string; localUrl: string; openedAt: string; planHash?: string | null; parked?: boolean; event?: string; legacy?: boolean; repairId?: string }): Promise<ReviewGeneration> {
     const id = reviewEntryId(input.agentId, input.localUrl, input.openedAt);
     const known = this.review(id);
     if (known) {
-      if (!known.planHash && input.planHash) return this.write({ ...known, planHash: input.planHash });
-      return known;
+      const planHash = known.planHash ?? input.planHash ?? null;
+      const repairId = known.repairId ?? input.repairId;
+      if (planHash === known.planHash && repairId === known.repairId) return known;
+      return this.write({ ...known, planHash, ...(repairId ? { repairId } : {}) });
     }
     const entry: ReviewGeneration = {
       kind: "review", id, agentId: input.agentId, localUrl: input.localUrl, openedAt: input.openedAt,
       planHash: input.planHash ?? null, parked: input.parked ?? false, at: new Date(this.now()).toISOString(),
       ...(input.event ? { event: input.event } : {}), ...(input.legacy ? { legacy: true as const } : {}),
+      ...(input.repairId ? { repairId: input.repairId } : {}),
     };
     return this.publish(entry, `${id}.json`);
+  }
+
+  // The responsibility check's repair marks the lost review superseded before it parks the plan
+  // again (README, "Responsibility check"). Called under the repair's exclusive reservation, so no
+  // admitted operation runs meanwhile (and none waits on a review lock this could need). Refused
+  // (DecisionPendingError) while the review has a decision or a closing; a repeat of the same
+  // repair returns its marker.
+  async supersede(input: { review: ReviewGeneration; issueId: string; repairId: string; parkedAt: string }): Promise<ReviewSupersession> {
+    if (!this.active) throw new FencedError();
+    const known = this.superseded(input.review.id);
+    if (known) {
+      if (known.repairId !== input.repairId) throw new DecisionPendingError("This review was restored by another repair already.");
+      return known;
+    }
+    this.admissible(input.review.id);
+    const at = new Date(this.now()).toISOString();
+    const id = `superseded-${input.review.id}`;
+    return this.publish<ReviewSupersession>({ kind: "superseded", id, reviewId: input.review.id, agentId: input.review.agentId, issueId: input.issueId, repairId: input.repairId, parkedAt: input.parkedAt, at }, `${id}.json`);
   }
 
   // A producer's decision on an exact review generation, before anything else happens: `deciding`
@@ -470,6 +542,12 @@ export class DecisionJournal {
   report(input: ReportInput): Promise<ReportOutcome> {
     return this.withReview(input.review.id, async () => {
       if (this.knownReport(input.event)) return "replay";
+      // A late report on a superseded review: kept for the owner, never carried out.
+      if (this.superseded(input.review.id)) {
+        const id = randomUUID();
+        await this.publish<UnboundReport>({ kind: "unbound", id, agentId: input.agentId, at: input.at, approved: input.approved, ...(input.feedback ? { feedback: input.feedback } : {}), planContent: input.planContent ?? "", event: input.event, state: "open", supersededReviewId: input.review.id }, `${compactTime(input.at)}-${id}.json`);
+        return "unbound";
+      }
       const hash = input.planContent?.trim() ? planHash(input.planContent) : null;
       if (!input.exact && hash && input.review.planHash && hash !== input.review.planHash) {
         const id = randomUUID();
@@ -507,7 +585,7 @@ export class DecisionJournal {
   // The owner settles an entry the plugin cannot settle from Plannotator's answers alone.
   async resolve(entryId: string, action: ResolveAction, snapshot: (agentId: string, review: ReviewGeneration) => Promise<RouteSnapshot>): Promise<void> {
     const entry = this.entries.get(entryId);
-    if (!entry || entry.kind === "review" || entry.kind === "closing") throw new StaleResolutionError("That entry is not waiting for you any more.");
+    if (!entry || entry.kind === "review" || entry.kind === "closing" || entry.kind === "superseded") throw new StaleResolutionError("That entry is not waiting for you any more.");
     // Carrying out an unbound report creates an attempt on the agent's latest review: its lock.
     const reviewId = entry.kind === "unbound" ? this.latestReview(entry.agentId)?.id ?? `unbound:${entry.agentId}` : entry.reviewId;
     await this.withReview(reviewId, async () => {
@@ -515,6 +593,7 @@ export class DecisionJournal {
       if (current.kind === "attempt") {
         if (current.state !== "uncertain" || action !== "carry-out" && action !== "drop") throw new StaleResolutionError("That decision changed meanwhile; reload the inbox.");
         if (!current.waitsForOwner) throw new StaleResolutionError("Paseo is still sending that decision to Plannotator; it waits for you only once Plannotator can no longer confirm it.");
+        if (action === "carry-out" && this.superseded(current.reviewId)) throw new StaleResolutionError(SUPERSEDED_CARRY);
         if (action === "carry-out") await this.accept({ ...current, lastError: undefined });
         else await this.write({ ...current, state: "void", voidReason: "Dropped by the owner." });
         return;
@@ -525,6 +604,7 @@ export class DecisionJournal {
         if (action === "drop") { await this.write({ ...current, state: "dropped", resolvedAt }); return; }
         const review = this.latestReview(current.agentId);
         if (!review) throw new StaleResolutionError("The agent has no review to carry this decision out on.");
+        if (current.supersededReviewId || this.superseded(review.id)) throw new StaleResolutionError(SUPERSEDED_CARRY);
         const busy = this.attempts(review.id).some((attempt) => OPEN_STATES.has(attempt.state) || ACCEPTED_STATES.has(attempt.state));
         if (busy || this.unresolvedConflict(review.id)) throw new StaleResolutionError("That review has a decision already; drop this report instead.");
         const attempt = await this.createAttempt({ id: replacementId(current.id), review, agentId: current.agentId, planContent: current.planContent, approved: current.approved, ...(current.feedback ? { feedback: current.feedback } : {}), source: "plannotator-page", state: "pending", snapshot: await snapshot(current.agentId, review), at: current.at });
@@ -546,6 +626,7 @@ export class DecisionJournal {
         await this.write({ ...current, resolution: "keep", resolvedAt });
         return;
       }
+      if (this.superseded(current.reviewId)) throw new StaleResolutionError(SUPERSEDED_CARRY);
       if (attempt && attempt.state === "applied") throw new StaleResolutionError("That decision was carried out meanwhile; reload the inbox.");
       // Dropped before the other one exists, so the two never both run; the other one's id is
       // fixed, so a retry after a crash finds it.
@@ -637,6 +718,9 @@ export class DecisionJournal {
       } else if (entry.kind === "closing") {
         if (old(entry.at)) drop.push(entry);
         else keepReviews.add(entry.reviewId);
+      } else if (entry.kind === "superseded") {
+        // Never pruned: dropping it would let the old generation take a decision again.
+        keepReviews.add(entry.reviewId);
       }
     }
     for (const entry of this.entries.values()) if (entry.kind === "review" && old(entry.at) && !keepReviews.has(entry.id)) drop.push(entry);
@@ -652,6 +736,7 @@ export class DecisionJournal {
   // --- Internals ----------------------------------------------------------------------------
 
   private admissible(reviewId: string, options: { closing?: boolean } = {}): void {
+    if (this.superseded(reviewId)) throw new SupersededReviewError();
     for (const entry of this.entries.values()) {
       if (entry.kind === "attempt" && entry.reviewId === reviewId && (OPEN_STATES.has(entry.state) || ACCEPTED_STATES.has(entry.state))) {
         throw new DecisionPendingError(entry.state === "applied" ? "This review was decided already." : "Already decided; it is being applied.");

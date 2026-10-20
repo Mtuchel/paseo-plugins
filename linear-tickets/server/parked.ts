@@ -1,12 +1,13 @@
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, readFileSync, renameSync, statSync } from "node:fs";
-import { mkdir, open, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { link, mkdir, open, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { execFile, spawn } from "./child-processes";
 import { plannotatorPaths } from "./plannotator";
 import { PLANNOTATOR_HOST_SOURCE } from "./plannotator-host-source";
+import { type RepairExclusion, withEffect } from "./repair-exclusion";
 
 // Parked plans (README, "Parked plans"). A plan the risk policy leaves to the owner does not keep
 // its agent (a slot and its memory) waiting: the plan is parked here and the agent retired. The
@@ -26,6 +27,9 @@ export type ParkedPlan = {
   parkedAt: string;
   announced: boolean;
   staged?: boolean;
+  // The responsibility check's repair that parked this plan again (README, "Responsibility
+  // check"); absent on an ordinary parked plan.
+  responsibilityRepairId?: string;
 };
 
 export function parkedPaths(home?: string) {
@@ -49,7 +53,15 @@ export function parkedPaths(home?: string) {
 }
 
 export class ParkedPlans {
+  private exclusion: Pick<RepairExclusion, "admit"> | null = null;
+
   constructor(private readonly directory = parkedPaths().parked) {}
+
+  // Writing and removing a parked plan are effects the responsibility check's repair excludes
+  // (repair-exclusion.ts); the repair itself writes with `putIfAbsent` under its reservation.
+  useExclusion(exclusion: Pick<RepairExclusion, "admit">): void {
+    this.exclusion = exclusion;
+  }
 
   private path(issueId: string): string {
     return join(this.directory, `${issueId.replace(/[^0-9A-Za-z-]/g, "")}.json`);
@@ -68,22 +80,47 @@ export class ParkedPlans {
     return (await this.all()).find((plan) => plan.agentId === agentId) ?? null;
   }
 
+  async get(issueId: string): Promise<ParkedPlan | null> {
+    try { return JSON.parse(await readFile(this.path(issueId), "utf8")) as ParkedPlan; } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw error;
+    }
+  }
+
   async has(issueId: string): Promise<boolean> {
     return stat(this.path(issueId)).then(() => true, (error: NodeJS.ErrnoException) => { if (error.code === "ENOENT") return false; throw error; });
   }
 
-  async put(plan: ParkedPlan): Promise<void> {
+  put(plan: ParkedPlan): Promise<void> {
+    return withEffect(this.exclusion, plan.issueId, async () => {
+      await mkdir(this.directory, { recursive: true, mode: 0o700 });
+      const path = this.path(plan.issueId);
+      const temporary = join(this.directory, `.${randomUUID()}.tmp`);
+      try {
+        await writeFile(temporary, JSON.stringify(plan), { mode: 0o600, flag: "wx" });
+        await rename(temporary, path);
+      } finally { await rm(temporary, { force: true }); }
+    });
+  }
+
+  // Creates the record only if the ticket has none: false (nothing written) when one exists, so
+  // a parked plan that appeared meanwhile is never overwritten. The record appears complete or not
+  // at all.
+  async putIfAbsent(plan: ParkedPlan): Promise<boolean> {
     await mkdir(this.directory, { recursive: true, mode: 0o700 });
-    const path = this.path(plan.issueId);
     const temporary = join(this.directory, `.${randomUUID()}.tmp`);
     try {
       await writeFile(temporary, JSON.stringify(plan), { mode: 0o600, flag: "wx" });
-      await rename(temporary, path);
+      await link(temporary, this.path(plan.issueId));
+      return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
+      throw error;
     } finally { await rm(temporary, { force: true }); }
   }
 
-  async remove(issueId: string): Promise<void> {
-    await rm(this.path(issueId), { force: true });
+  remove(issueId: string): Promise<void> {
+    return withEffect(this.exclusion, issueId, () => rm(this.path(issueId), { force: true }));
   }
 }
 

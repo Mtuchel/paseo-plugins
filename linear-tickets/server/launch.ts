@@ -17,6 +17,7 @@ import { ompDiagnosticGuardInstalled, ompExtensionInstalled, paseoHome, TICKET_M
 import { shardDependencies, type ShardAssignor } from "./worktree-shards";
 
 import type { ReviewDeletions } from "./review-deletions";
+import type { RepairExclusion } from "./repair-exclusion";
 type Start = RpcInput<typeof launchAgentRpc>;
 type Result = { agentId: string; warnings: string[] };
 // What a planner run (README, "Projects") launches through Launcher.startPlanner: the run, its
@@ -82,6 +83,7 @@ export class Launcher {
   // Tickets whose automatic start path holds the start gate (see gate).
   private readonly gates = new Set<string>();
   private deletions: Pick<ReviewDeletions, "blocked"> | null = null;
+  private exclusion: Pick<RepairExclusion, "enterEffect"> | null = null;
   private readonly pending = new Map<string, Set<Promise<Result>>>();
   private readonly canonicalIds = new Map<string, string>();
 
@@ -109,6 +111,12 @@ export class Launcher {
     this.deletions = deletions;
   }
 
+  // The responsibility check's repair exclusion (repair-exclusion.ts): every ticket launch, the
+  // sidebar's included, holds an effect token from its first admission read through creation.
+  useExclusion(exclusion: Pick<RepairExclusion, "enterEffect">): void {
+    this.exclusion = exclusion;
+  }
+
   async settledFor(issueId: string): Promise<void> {
     for (;;) {
       const pending = [...this.pending].flatMap(([id, work]) => id === issueId || this.canonicalIds.get(id) === issueId ? [...work] : []);
@@ -119,7 +127,17 @@ export class Launcher {
 
   start(input: Start, paseo: PaseoApi, options: Options = {}): Promise<Result> {
     const fingerprint = JSON.stringify([input.id, input.projectId, input.baseBranch, input.provider, input.modeId, input.thinkingOptionId, input.instructions, options.promptTemplate ?? "", options.markInProgress ?? false, options.linearAccess ?? false, options.lead ?? "", options.verifier ?? ""]);
-    return this.tracked(input.id, input.requestId, fingerprint, "This launch request has already been used. Reopen the ticket to start another agent.", (onCreate) => this.launch(input, paseo, options, onCreate));
+    return this.tracked(input.id, input.requestId, fingerprint, "This launch request has already been used. Reopen the ticket to start another agent.", (onCreate) => this.excluded(input, paseo, options, onCreate));
+  }
+
+  // The launch under a repair-exclusion token: taken before the first admission read for the
+  // unresolved id (an identifier or a UUID), bound to the ticket's UUID once the detail names it,
+  // released when the launch settles. A refusal (RepairBusyError) comes before onCreate, so the
+  // request is evicted and the same request id can be retried.
+  private async excluded(input: Start, paseo: PaseoApi, options: Options, onCreate: () => void): Promise<Result> {
+    const token = this.exclusion?.enterEffect(null) ?? null;
+    try { return await this.launch(input, paseo, options, onCreate, (issueId) => token?.bind(issueId)); }
+    finally { token?.release(); }
   }
 
   // Starts the agent of a planner run (README, "Projects"): no Linear ticket, no branch, no
@@ -204,7 +222,7 @@ export class Launcher {
     }
   }
 
-  private async launch(input: Start, paseo: PaseoApi, options: Options, onCreate: () => void): Promise<Result> {
+  private async launch(input: Start, paseo: PaseoApi, options: Options, onCreate: () => void, bind: (issueId: string) => void): Promise<Result> {
     if (await this.deletions?.blocked(input.id)) throw new Error("This ticket is paused for deletion; no agent was started.");
     const blocked = await this.blocked?.(input.id);
     if (blocked) throw new Error(blocked);
@@ -230,6 +248,7 @@ export class Launcher {
     await this.requireBaseBranch(firstProject, input.baseBranch, Boolean(options.resume));
     const detail = await this.linear.detail(input.id);
     this.canonicalIds.set(input.id, detail.issue.id);
+    bind(detail.issue.id);
     const shard = shards ? await assign({ id: detail.issue.id, branch: safeBranchName(detail.issue.branchName), dependencies: shardDependencies(detail.relations) }).catch(failSafe) : null;
     const project = shard ? await findProject(paseo, shard.projectId) : firstProject;
     if (shard && shard.rootPath !== firstProject.projectRootPath) await this.requireBaseBranch(project, input.baseBranch, Boolean(options.resume));
