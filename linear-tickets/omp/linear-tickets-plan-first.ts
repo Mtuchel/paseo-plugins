@@ -45,7 +45,7 @@
 //   LINEAR_TICKETS_STRONG_MODEL, and a write to those paths from a session (the agent or one of its
 //   `task` subagents) whose live model is not that strong model is blocked. `ctx.models.current()`
 //   is per session: omp builds each subagent's extension context on the child session's own model.
-//   A `model: "@slow"` subagent passes on the launch's strong model, or on the owner-approved
+//   The strong owner writes them after a confirmed escalation, or on the owner-approved
 //   Opus 5.5 → Sol/high substitute with a matching configured fallback chain and live high thinking.
 //   Other/unknown substitutes remain blocked. `bash` writes are not checked: a routing guard,
 //   not isolation.
@@ -76,14 +76,14 @@ import { promisify } from "node:util";
 import { ADVISOR_MODEL, ADVISOR_SECTION, ADVISOR_THINKING, advisorSteps, RECORD_ADVICE_TOOL } from "../shared/plan-advisor";
 import { combinedRating, parsePlanRisk, sectionBody } from "../shared/plan-risk";
 import { parsePlanSections, ruleMismatch, sectionSteps } from "../shared/plan-sections";
-import { ESCALATE_TOOL, parsePlanModel, sessionRouting, TIERS } from "../shared/plan-model";
+import { ESCALATE_TOOL, parsePlanModel, PLANNING_RESEARCH_NOTE, sessionRouting, TIERS } from "../shared/plan-model";
 import { blockedTestWrite, STRONG_MODEL_ENV, writtenPaths, type AcceptanceTests } from "../shared/acceptance-tests";
 import type { FallbackChains } from "../shared/model-fallbacks";
 import { layoutProblem, requiredParts } from "../shared/plan-layout";
 import { decisionText, parseDecision, parseRouteFacts, routeRefusals, SMALL_ROUTE_ENV, SMALL_ROUTE_TOOL, SMALL_ROUTE_WAIT_MS, smallRouteNote, type RouteDecision } from "../shared/small-route";
 
 type Phase = "idle" | "planning" | "executing";
-type Entry = { type: string; customType?: string; data?: { reason?: string; path?: string; hash?: string }; message?: { role?: string } };
+type Entry = { type: string; customType?: string; data?: { reason?: string; path?: string; hash?: string; phase?: Phase }; message?: { role?: string } };
 type Model = { provider?: string; id?: string };
 type Context = { cwd?: string; agent?: { kind?: string }; models?: { current(): Model | undefined }; sessionManager: { getBranch(): Entry[]; getArtifactsDir?(): string } };
 type ToolResult = { content: { type: "text"; text: string }[]; details?: Record<string, unknown> };
@@ -96,7 +96,7 @@ type Schema = {
   enum(values: [string, ...string[]]): Field;
 };
 type ExtensionApi = {
-  on(event: "session_start" | "session_switch" | "session_branch" | "session_tree" | "turn_start", handler: (event: unknown, ctx: Context) => Promise<void> | void): void;
+  on(event: "session_start" | "session_switch" | "session_branch" | "session_tree" | "session_compact" | "turn_start", handler: (event: unknown, ctx: Context) => Promise<void> | void): void;
   on(event: "before_agent_start", handler: (event: unknown, ctx: Context) => Promise<{ message: { customType: string; content: string; display: boolean } } | void> | { message: { customType: string; content: string; display: boolean } } | void): void;
   on(event: "tool_call", handler: (event: { toolName: string; toolCallId?: string; input?: Record<string, unknown> }, ctx: Context) => Promise<{ block: true; reason: string } | undefined>): void;
   events: { emit(channel: string, data: unknown): void };
@@ -547,6 +547,25 @@ export default function linearTicketsPlanFirst(pi: ExtensionApi): void {
     if (await planMode("enter") === "planning") pi.appendEntry(MARKER, { reason: "launch", policy: POLICY, at: new Date().toISOString() });
   });
 
+  // Compaction is an explicit research checkpoint, not permission to approve an incomplete plan.
+  // Use Plannotator's active branch state, so execution and read-only task children stay untouched.
+  pi.on("session_compact", (_event, ctx) => {
+    if (ctx.agent?.kind === "sub") return;
+    const branch = ctx.sessionManager.getBranch();
+    for (let index = branch.length - 1; index >= 0; index--) {
+      const entry = branch[index];
+      if (entry.type !== "custom" || entry.customType !== "plannotator") continue;
+      if (entry.data?.phase === "planning") {
+        pi.sendMessage({
+          customType: "linear-tickets.planning-convergence",
+          content: `Planning convergence checkpoint: context was compacted. Before further broad research, update the existing plan with verified premises, their evidence and the remaining concrete questions. ${PLANNING_RESEARCH_NOTE}`,
+          display: false,
+        }, { deliverAs: "aside" });
+      }
+      return;
+    }
+  });
+
   // Paseo sessions outside the ticket flow get the same routing a ticket's plan settles.
   pi.on("before_agent_start", (_event, ctx) => {
     const note = sessionRouting({ ticket: TICKET, agentId: AGENT_ID, kind: ctx?.agent?.kind, model: ctx?.models?.current(), routed });
@@ -582,7 +601,7 @@ export default function linearTicketsPlanFirst(pi: ExtensionApi): void {
       testWrite = blockedTestWrite(acceptanceTests(), event.toolName, input, ctx?.models?.current(), process.env[STRONG_MODEL_ENV], { chains, thinking: pi.getThinkingLevel?.() });
     }
     if (testWrite) {
-      return { block: true, reason: `Stopped by the linear-tickets plugin: ${testWrite} is one of this plan's acceptance tests, which the strong model writes. Make the implementation pass it; if the test itself is wrong, hand the change to a subagent on the strong model (the \`task\` tool with \`model: "@slow"\`) with the reason, or call \`${ESCALATE_TOOL}\` when the work needs the strong model.` };
+      return { block: true, reason: `Stopped by the linear-tickets plugin: ${testWrite} is one of this plan's acceptance tests, which the strong model writes. Make the implementation pass it; if the test itself is wrong, report the reason to the owner. The ticket owner calls \`${ESCALATE_TOOL}\`, waits for the confirmed strong-model switch and writes the correction itself; the installed \`task\` tool cannot select a strong model for an editing child.` };
     }
     if (event.toolName === "write" || event.toolName === "edit") {
       // omp gives an edit's targets as `paths` (hashline patches) or `path`; an apply_patch edit

@@ -4,6 +4,7 @@
 
 import { advisorSteps } from "../shared/plan-advisor";
 import { sectionSteps } from "../shared/plan-sections";
+import { PLANNING_RESEARCH_NOTE } from "../shared/plan-model";
 
 // Plan-first modes where the provider's plan mode lets the planner read without asking. omp has
 // none: its "write" mode asks before every shell command, reads included, so the planner would
@@ -12,7 +13,7 @@ import { sectionSteps } from "../shared/plan-sections";
 export const SAFE_MODES: Record<string, string> = { claude: "plan", codex: "auto" };
 // Every ticket plans first (README, "Plan-first"); the risk policy approves plans within the
 // owner's threshold, the owner the rest.
-export const PLAN_REQUIRED_NOTE = "Every ticket gets a plan first. Investigate and write a plan; do not change code until it is approved, by the owner or automatically when its risk rating is within the owner's threshold. Keep the plan as short as the ticket allows: a one-line fix needs a few lines of plan, not a document.";
+export const PLAN_REQUIRED_NOTE = `Every ticket gets a plan first. Investigate and write a plan; do not change code until it is approved, by the owner or automatically when its risk rating is within the owner's threshold. Keep the plan as short as the ticket allows: a one-line fix needs a few lines of plan, not a document. ${PLANNING_RESEARCH_NOTE}`;
 // Every plan a ticket agent writes gets a second opinion before the owner sees it (README, "Plan
 // advisor"). omp planners have the extension's record tool and submission gate.
 export function advisorNote(providerKey: string): string {

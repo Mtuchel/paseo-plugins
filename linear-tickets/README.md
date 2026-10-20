@@ -941,10 +941,12 @@ account, with the official `deepseek/deepseek-flash` API behind it in omp's
 plan, or of a step the plan lists under `Strong steps`, gets `model:strong` first, so its own plan
 cannot lower it.
 
-On the cheap tier, the agent hands the plan's strong steps to subagents on the strong model (omp:
-`model: "@slow"`), and the plan's acceptance tests are written first by the strong model: it has a
-strong subagent write them failing from the plan's acceptance criteria, then makes them pass
-without editing them. The plugin wrote those paths for the agent when the plan was approved (and
+On the cheap tier, the owner calls `escalate_model` for the plan's strong steps or acceptance-test
+authorship, **waits for the confirmed strong-model switch**, and does that work itself. It keeps
+the strong work and delegates settled implementation to cheap workers. The installed OMP `task`
+tool accepts a `model` override only for historical `seance` consults, not editing children.
+Acceptance tests are written failing from the plan's criteria, then made to pass without editing
+them. The plugin wrote those paths for the agent when the plan was approved (and
 at every launch of an approved cheap plan), and the omp extension refuses the write to them from a
 session that is not on the strong model. It is a guard against accidental routing, not isolation: a
 shell can still write those files, a launch that never recorded the strong model is not blocked,
@@ -972,11 +974,16 @@ Opus ownership/planning, Astra advice and independent Sol review unchanged. Use 
 (OMP `task` without a model override; DeepSeek by default) for useful independent slices whose
 interfaces, invariants and expected behavior are settled: prescribed validators/predicates,
 established-pattern caller updates, settled behavioral fixtures, exact review fixes and specified
-smoke checks. Give each worker exact writable scope, rules and an observable verification scenario.
-A strong ticket, several files or careful execution alone does not justify `@slow`: the brief
-must name unresolved design/diagnosis, authorization/identity/financial/solver decisions,
-concurrency/recovery/external-effect boundaries or substantial rescue. New decisions and failures
-after two honest fix attempts return to the owner, who integrates and verifies; trivial or tightly
+smoke checks. Launch genuinely independent editing slices in one `tasks[]` batch, with
+`isolated: true` on **every** editing child. Verify the returned worktree, give each worker exact
+writable scope, settled contracts and an observable verification scenario, and keep one integration
+owner for final verification. Isolation resolves against the current repository: an owner running
+from `/tmp` or outside a repository uses Paseo `create_agent` with an explicit isolated worktree
+and `workspaceId` instead. Do not retry the same unsupported launch.
+A strong ticket, several files or careful execution alone does not justify an expensive worker.
+Unresolved design/diagnosis, authorization/identity/financial/solver decisions,
+concurrency/recovery/external-effect boundaries and substantial rescue stay with the strong owner.
+New decisions and failures after two honest fix attempts return to that owner; trivial or tightly
 coupled edits need no forced delegation. This is an instruction policy, not a tool-enforced model
 restriction, and does not change the existing tier maps or reviewer routing.
 
@@ -992,11 +999,12 @@ backstop made — then every cheap-tier ticket is listed with its fix rounds for
 **Sessions outside tickets.** Your own Paseo session — one that is not a ticket agent
 (`PASEO_AGENT_ID` set, no `LINEAR_TICKETS_ISSUE`) — gets the same Flash-first routing from the omp
 extension, once per session, in its first prompt (`sessionRoutingNote`, [`shared/plan-model.ts`](shared/plan-model.ts)):
-implementation runs on the cheap model unless a step needs the strong model, premises are verified
-by a cheap scout first, strong steps and acceptance tests go to `@slow` subagents, and a session
-that itself runs on a strong model frames, settles contracts and writes the acceptance tests
-itself. Subagent sessions and ticket agents get no such note: a ticket's plan already carries its
-routing.
+implementation runs on the cheap model unless a step needs the strong model, and premises are
+verified by cheap scouts first. A strong session keeps strong steps and acceptance-test authorship;
+a cheap non-ticket session creates a separate strong writer through Paseo `create_agent`, with an
+explicit configured provider/model and its own isolated workspace. It never requests an editing
+`task` child with a strong-model override. Subagent sessions and ticket agents get no such note:
+a ticket's plan already carries its routing.
 
 Claude starts in `plan` mode and Codex in `auto`; omp keeps your usual mode (its `write` mode asks
 before every shell command, reads included) and starts in Plannotator's planning phase instead.
@@ -1007,6 +1015,25 @@ of In Progress, and moves through **Plan review** and **Plan approved** (see
 [Statuses and labels](#statuses-and-labels)). Approving the plan switches the agent to your usual
 mode. A plan you sent back is planned again by the next agent, which gets the previous plan and
 your feedback from the ticket's plan document.
+
+**Planning research and convergence.** After a short initial scan, the strong owner maps useful
+independent premise investigations and launches cheap read-only scouts together, while working on
+another slice. Tiny or tightly coupled checks stay inline. Write a plan skeleton early, integrate
+the scouts' evidence instead of repeating their searches, and narrow the remaining questions after
+each round. After two research rounds or 30 minutes of active research, update the plan and choose
+targeted remaining checks, a concrete owner decision, or submission. An owner request to converge
+stops broad exploration immediately. These are instruction checkpoints, not deadlines that bypass
+evidence, safety checks or approval. On each planning-context compaction the OMP extension adds a
+convergence reminder, using the active branch's Plannotator phase; execution and task children are
+excluded.
+
+Manual Plannotator sessions must not silently inherit a cheap launch model. On each host, run
+`node scripts/planning-policy.mjs /absolute/path/to/plannotator.json` to set only the existing
+planning profile's model to `anthropic/claude-opus-5-5`, thinking `high`. The command saves the
+original configuration beside it before an atomic replacement; `--check` reports drift without
+writing. Other profiles and instructions are preserved. Apply after plugin rollout and run
+`npm run smoke:planning`; Plannotator restores the pre-planning model on phase exit as usual.
+
 
 **Plan on a running agent.** Add `plan` to the ticket while its agent implements an approved plan:
 within a minute the plugin asks the agent for a new plan. An omp agent enters the planning phase at

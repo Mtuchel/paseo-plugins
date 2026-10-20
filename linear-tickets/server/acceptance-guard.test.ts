@@ -69,9 +69,9 @@ async function write(path: string, model: typeof OPUS, kind?: string, level = "m
 
 test("a cheap session cannot write its plan's acceptance tests; the strong model can", async () => {
   await store.save("ticket-agent-1", { identifier: "TUC-7", paths: ["server/foo.test.ts"] });
-  assert.match(await write(`${root}/checkout/server/foo.test.ts`, FLASH) ?? "", /acceptance tests.*@slow/s);
+  assert.notEqual(await write(`${root}/checkout/server/foo.test.ts`, FLASH), null);
   assert.match(await write("server/foo.test.ts", FLASH, "sub") ?? "", /acceptance tests/, "a cheap task subagent is held too");
-  assert.equal(await write("server/foo.test.ts", OPUS, "sub"), null, "the @slow subagent on the strong model writes them");
+  assert.equal(await write("server/foo.test.ts", OPUS, "sub"), null, "a session actually on the strong model writes them");
   assert.equal(await write("server/foo.ts", FLASH), null, "the implementation stays open");
 });
 
