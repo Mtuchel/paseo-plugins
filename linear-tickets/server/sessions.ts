@@ -149,6 +149,8 @@ export type SessionLink = {
   identifier: string;
   createdAt: string;
   handled: string[];
+  // Inclusive frontier of a complete reconciliation; webhook delivery never advances it.
+  activityReadThrough?: string;
   // What a plain reply in the panel means right now, besides a pending permission.
   review: PendingReview | null;
   // "split" / "later": the plugin retired the planner on purpose, so no Resume is offered.
@@ -455,14 +457,12 @@ export class SessionRouter {
   // `asking`: Linear shows an elicitation's options only while it is the newest activity, so the
   // feed holds its actions from a question until the owner's reply.
   private readonly live = new Map<string, { sessionId: string; stop: () => void; pending: string[]; timer: NodeJS.Timeout | null; posted: number; asking: boolean }>();
-  // Event-driven activity reads (README, "Rate limits"): `webhookedAt` is the last webhook per
-  // session, `webhookReadAt` when its activities were last read because of one. A session with a
-  // fresh webhook is skipped by the sweep; one whose webhooks stopped, or never arrived, is read
-  // every sweep as before. `reads` counts both for `linear.agent-status`.
+  // Webhooks deliver prompts directly. Recovery reads remain due until a full history read
+  // succeeded; only then can recent webhooks cover this session between fallback reads.
   private readonly webhookedAt = new Map<string, number>();
-  private readonly webhookReadAt = new Map<string, number>();
+  private readonly activityReadAt = new Map<string, number>();
   private readonly readingSession = new Set<string>();
-  private readonly reads = { sweep: 0, skipped: 0, webhook: 0 };
+  private readonly reads = { sweep: 0, skipped: 0 };
   // The open-session listing, shared by the parts of one sweep: Linear counts every call (README,
   // "Rate limits"). A failed call is dropped rather than shared, so the other part retries it.
   private sessionList: Promise<OpenSession[]> | null = null;
@@ -558,15 +558,7 @@ export class SessionRouter {
   // Entry point for webhooks. Acknowledges `created` right away — Linear marks sessions without
   // an activity within 10 s as unresponsive — even before Paseo is reachable.
   receive(event: AgentSessionWebhook): void {
-    const sessionId = event.agentSession.id;
-    const now = this.clock();
-    // A webhook for this session is proof Linear's delivery works for it: the sweep stops reading
-    // it every minute, and a due read happens here at once instead of at the next sweep. A
-    // `created` webhook has nothing to catch up on: its session is read from its first prompt on.
-    const readAt = this.webhookReadAt.get(sessionId);
-    const due = readAt === undefined || now - readAt >= WEBHOOK_FALLBACK_MS;
-    this.webhookedAt.set(sessionId, now);
-    if (event.action !== "created" && due) this.track(this.readSession(sessionId, "webhook"));
+    this.webhookedAt.set(event.agentSession.id, this.clock());
     if (event.action === "created") void this.acknowledge(event.agentSession);
     if (!this.paseo) { this.waiting.push(event); return; }
     this.track(this.handle(event));
@@ -585,9 +577,9 @@ export class SessionRouter {
     }
   }
 
-  // What the event-driven reads did, for `linear.agent-status` (README, "Rate limits").
-  readStats(): { sweepReads: number; sweepSkips: number; webhookReads: number } {
-    return { sweepReads: this.reads.sweep, sweepSkips: this.reads.skipped, webhookReads: this.reads.webhook };
+  // Reconciliation coverage, for `linear.agent-status` (README, "Rate limits").
+  readStats(): { sweepReads: number; sweepSkips: number } {
+    return { sweepReads: this.reads.sweep, sweepSkips: this.reads.skipped };
   }
 
   // Waits for the reads and deliveries webhooks started, the way `sweep()` waits for its parts.
@@ -1508,6 +1500,7 @@ export class SessionRouter {
     const sessions = await this.listSessions();
     const failures: string[] = [];
     const due: string[] = [];
+    const since = new Map<string, string>();
     for (const session of sessions) {
       try {
         const link = await this.deps.store.get(session.id);
@@ -1528,12 +1521,13 @@ export class SessionRouter {
         if (!["pending", "active", "awaitingInput"].includes(session.status)) continue;
         const now = this.clock();
         const hookedAt = this.webhookedAt.get(session.id);
-        const readAt = this.webhookReadAt.get(session.id);
+        const readAt = this.activityReadAt.get(session.id);
         if (hookedAt !== undefined && now - hookedAt < WEBHOOK_FALLBACK_MS && readAt !== undefined && now - readAt < WEBHOOK_FALLBACK_MS) {
           this.reads.skipped += 1;
           continue;
         }
         due.push(session.id);
+        since.set(session.id, link.activityReadThrough ?? link.createdAt);
       } catch (error) {
         if (error instanceof RateLimitedError) throw error;
         failures.push(error instanceof Error ? error.message : String(error));
@@ -1543,7 +1537,7 @@ export class SessionRouter {
       const chunk = due.slice(start, start + SESSION_ACTIVITIES_BATCH);
       let activities: Map<string, AgentActivity[]>;
       try {
-        activities = await this.deps.api.sessionActivities(chunk);
+        activities = await this.deps.api.sessionActivities(chunk, since);
       } catch (error) {
         if (error instanceof RateLimitedError) throw error;
         // A failed batch read none of its sessions, as one request per session would have failed
@@ -1556,8 +1550,8 @@ export class SessionRouter {
         try {
           const found = activities.get(sessionId);
           // The batch returned no data for it: read it alone, as before.
-          if (found) await this.readSession(sessionId, "sweep", async () => found);
-          else await this.readSession(sessionId, "sweep");
+          if (found) await this.readSession(sessionId, found);
+          else await this.readSession(sessionId);
         } catch (error) {
           if (error instanceof RateLimitedError) throw error;
           failures.push(error instanceof Error ? error.message : String(error));
@@ -1578,31 +1572,26 @@ export class SessionRouter {
     return this.sessionList;
   }
 
-  // One session's activities, and the prompts among them no webhook delivered. A webhook calls
-  // this at once and the sweep at the fallback cadence; the sweep's batch passes the activities it
-  // already read, so both go through this per-session path once they have them. The link is read
-  // here because a webhook can arrive before `created` stored it; a session with no link has
-  // nothing to reach.
-  private async readSession(sessionId: string, source: "webhook" | "sweep", read?: () => Promise<AgentActivity[]>): Promise<void> {
+  // Reconcile a complete prompt history before advancing the durable inclusive frontier.
+  // A newer webhook cannot stand in for an earlier missed prompt or a failed history read.
+  private async readSession(sessionId: string, read?: AgentActivity[]): Promise<void> {
     if (this.readingSession.has(sessionId)) return;
     this.readingSession.add(sessionId);
-    const previousRead = this.webhookReadAt.get(sessionId);
     try {
       const link = await this.deps.store.get(sessionId);
       if (!link) return;
-      this.webhookReadAt.set(sessionId, this.clock());
-      if (source === "webhook") this.reads.webhook += 1;
-      else this.reads.sweep += 1;
+      this.reads.sweep += 1;
       const owner = await this.owner();
-      for (const activity of await (read ? read() : this.deps.api.activities(sessionId))) {
-        if (activity.type !== "prompt" || activity.userId !== owner || activity.createdAt < link.createdAt || link.handled.includes(activity.id)) continue;
-        await this.handle({ type: "AgentSessionEvent", action: "prompted", agentSession: { id: sessionId }, agentActivity: { id: activity.id, content: { body: activity.body }, signal: activity.signal, userId: activity.userId } });
+      const activities = read ?? await this.deps.api.activities(sessionId, link.activityReadThrough ?? link.createdAt);
+      let through = link.activityReadThrough ?? link.createdAt;
+      for (const activity of activities) {
+        if (activity.type !== "prompt") continue;
+        if (activity.createdAt > through) through = activity.createdAt;
+        if (activity.userId !== owner || activity.createdAt < link.createdAt || link.handled.includes(activity.id)) continue;
+        await this.prompted(sessionId, { id: activity.id, content: { body: activity.body }, signal: activity.signal, userId: activity.userId });
       }
-    } catch (error) {
-      // Marked unread again, so the next sweep retries it the way a failed sweep read did.
-      if (previousRead === undefined) this.webhookReadAt.delete(sessionId);
-      else this.webhookReadAt.set(sessionId, previousRead);
-      throw error;
+      if (through !== (link.activityReadThrough ?? link.createdAt)) await this.deps.store.patch(sessionId, { activityReadThrough: through });
+      this.activityReadAt.set(sessionId, this.clock());
     } finally {
       this.readingSession.delete(sessionId);
     }
