@@ -14,11 +14,12 @@ import type { NeedsYouIssues } from "./needs-you";
 import type { ParkedPlans } from "./parked";
 import type { ParentPhase, ParentProgress } from "./parents";
 import { LIVE_AGENT, type ProcessInspector } from "./process-liveness";
-import { PLAN_REVIEW_STATE, planStage } from "./plan-policy";
+import { PLAN_REVIEW_STATE, PLANNING_STATE, planStage } from "./plan-policy";
 import type { PullState, StackState } from "./pr-watch";
 import { RateLimitedError, withPriority } from "./rate-budget";
 import { EXCLUSION_CLOSED_MESSAGE, REPAIR_BUSY_MESSAGE, RepairBusyError } from "./repair-exclusion";
 import type { ReviewDeletions } from "./review-deletions";
+import { RESPONSIBILITY_GRACE_MS, type ResponsibilityCheck, type ResponsibilityTicket } from "./responsibility";
 import { AWAY_REASON } from "./scheduler";
 import type { HostOwnership, RestartResult, SessionRouter, Succession } from "./sessions";
 import type { PluginSettings, Settings } from "./settings";
@@ -127,6 +128,8 @@ export type StewardDeps = {
   now?: () => number;
   // The verifier's structured verdicts, oldest first (ticket-mcp-source.ts `steward_verdict`).
   verdicts?: (issueId: string) => Promise<StewardVerdict[]>;
+  // The responsibility check (responsibility.ts): its lost-review hold and its ten-minute run.
+  responsibility?: Pick<ResponsibilityCheck, "due" | "holds" | "run">;
 };
 
 // The pull request watch's state of one pull request, as far as this module cares (pr-watch.ts
@@ -777,7 +780,7 @@ function responsibilityView(ticket: StewardTicket): ResponsibilityView {
   };
 }
 
-type Candidate = { issue: StewardIssue; facts: StewardFacts; situation: StewardSituation; ticket: StewardTicket };
+type Candidate = { issue: StewardIssue; facts: StewardFacts; situation: StewardSituation; ticket: StewardTicket; check: ResponsibilityTicket };
 type Pass = { actions: number; cap: number };
 // What one action came to: `done` (the effect went out), `deferred` (nothing was attempted —
 // admission waits; the ticket stays queued and the pass retries, no budget spent), `failed` (it did
@@ -790,6 +793,20 @@ function message(error: unknown): string {
 
 function hasLabel(labels: { name: string }[], name: string): boolean {
   return labels.some((label) => label.name.trim().toLowerCase() === name.toLowerCase());
+}
+
+// The deliberate waits that make the owner (or the peer host) responsible for the next step, for
+// the responsibility check; a plan review, a pending permission and a Needs-you item are review
+// steps or questions it reads on their own.
+const OWNER_HOLDS: Record<StewardDeliberate, boolean> = {
+  hold: true, manual: true, "do-not-merge": true, stopped: true, remote: true, focus: true,
+  "needs-you": false, "plan-review": false, permissions: false,
+};
+
+// The steward's latest claim or logged action on a ticket (ms), if any.
+function stewardActionAt(ticket: StewardTicket | null): number | null {
+  const stamps = [ticket?.claim?.at, ticket?.log.at(-1)?.at].map((at) => (at ? Date.parse(at) : NaN)).filter(Number.isFinite);
+  return stamps.length ? Math.max(...stamps) : null;
 }
 
 function recent(at: string[], now: number): string[] {
@@ -1041,8 +1058,19 @@ export class Steward {
       if (!this.alive()) return;
       if (await this.deps.owner(issue.id).catch(() => "unknown" as HostOwnership) !== "here") continue;
       const ticket = file.tickets[issue.id] ?? null;
-      const facts = await this.facts(issue, paseo, { names, roots, record: recordOf.get(issue.id) ?? null, parent: parentOf.get(issue.id) ?? null, watchdog, needsYou, handed, pulls, now, ticket, settings });
-      candidates.push({ issue, facts, situation: classifyTicket(facts), ticket: ticket ?? newTicket(issue.identifier, this.iso(now)) });
+      const { facts, check } = await this.facts(issue, paseo, { names, roots, record: recordOf.get(issue.id) ?? null, parent: parentOf.get(issue.id) ?? null, watchdog, needsYou, handed, pulls, now, ticket, settings });
+      candidates.push({ issue, facts, situation: classifyTicket(facts), ticket: ticket ?? newTicket(issue.identifier, this.iso(now)), check });
+    }
+    // The responsibility check (README, "Responsibility check"), every ten minutes on this host's
+    // own tickets: before this pass's effects, so a repair it makes is what the next pass reads.
+    const responsibility = this.deps.responsibility;
+    if (responsibility && !options.queueBlockers && responsibility.due(now) && this.alive()) {
+      try {
+        await responsibility.run({ tickets: candidates.map((candidate) => candidate.check), enabled: settings.steward.enabled, fence: (issueId, identifier) => this.repairFence(settings, names, paseo, issueId, identifier), paseo });
+      } catch (error) {
+        if (error instanceof RateLimitedError) throw error;
+        console.error(`[linear-tickets] the responsibility check failed: ${message(error)}; it runs again in ten minutes`);
+      }
     }
     // The `<trigger>-running` labels an archive still owes: settled from the pass's own agent
     // reading, before this pass's effects add new debt.
@@ -1093,7 +1121,7 @@ export class Steward {
     now: number;
     ticket: StewardTicket | null;
     settings: PluginSettings;
-  }): Promise<StewardFacts> {
+  }): Promise<{ facts: StewardFacts; check: ResponsibilityTicket }> {
     const { names, record, parent, now } = input;
     const terminal = CLOSED_TYPES.includes(issue.statusType.trim().toLowerCase() as typeof CLOSED_TYPES[number]);
     const group = input.roots.get(issue.id) ?? null;
@@ -1129,7 +1157,7 @@ export class Steward {
     const offer = activeThread?.offer && ["split", "later", "parked"].includes(activeThread.offer) ? activeThread.offer : null;
     // The deliberate waits, strongest first: the owner's own veto or step, the plan under review,
     // the watchdog's owner Stop, the peer host, an unanswered question, a Needs-you item, focus.
-    const deliberate: StewardDeliberate | null =
+    const owned: StewardDeliberate | null =
       hasLabel(issue.labels, names.hold) ? "hold"
         : hasLabel(issue.labels, names.manual) ? "manual"
           : hasLabel(issue.labels, DO_NOT_MERGE) ? "do-not-merge"
@@ -1140,6 +1168,11 @@ export class Steward {
                     : input.needsYou.some((entry) => entry.parentId === issue.id) ? "needs-you"
                       : focused ? "focus"
                         : null;
+    // A Planning ticket whose review the responsibility check is restoring (README, "Responsibility
+    // check"): a plan under review, not a stalled planner to restart, for at most the hold's hour.
+    const held = !owned && this.enabled && planStage(issue.status, issue.statusType) === PLANNING_STATE && !live && !planned && !blocker && !waiting && !queuedThread && !input.ticket?.queued
+      && await this.deps.responsibility?.holds({ id: issue.id, identifier: issue.identifier }).catch(() => false) === true;
+    const deliberate: StewardDeliberate | null = owned ?? (held ? "plan-review" : null);
     const storedPark = input.ticket?.parked ?? null;
     const parked = storedPark !== null && parkStillWaits(storedPark, issue, now);
     const queuedAt = input.ticket?.queued?.at ?? null;
@@ -1151,7 +1184,7 @@ export class Steward {
     // aged by the situation it has been in.
     const queuedSince = input.ticket?.queued?.at ?? (input.ticket?.situation === "queued" || input.ticket?.situation === "queued-too-long" ? input.ticket.since : null);
     const queuedTooLong = Boolean((queuedThread || queuedAt) && queuedSince && now - Date.parse(queuedSince) >= input.settings.steward.queuedEscalateHours * 60 * 60_000);
-    return {
+    const facts: StewardFacts = {
       identifier: issue.identifier,
       status: issue.status,
       statusType: issue.statusType,
@@ -1189,6 +1222,21 @@ export class Steward {
       landedSignature: landedPulls.map((pull) => pull.url).sort().join(","),
       escalated: input.ticket?.escalated?.key ?? null,
     };
+    const asked = ownerWait === "live" ? { agentId: record?.agentId ?? null }
+      : activeThread?.questions ? { agentId: activeThread.agentId }
+        : permissions ? { agentId: liveRoots.find((agent) => (agent.pendingPermissions?.length ?? 0) > 0)?.id ?? null }
+          : input.needsYou.some((entry) => entry.parentId === issue.id) ? { agentId: null }
+            : null;
+    const check: ResponsibilityTicket = {
+      issue: { id: issue.id, identifier: issue.identifier, status: issue.status, statusType: issue.statusType },
+      ownerHold: blocker !== null || (owned !== null && OWNER_HOLDS[owned]),
+      question: asked,
+      liveRoots: liveRoots.filter((agent) => !agent.labels?.[STEWARD_VERIFIER_LABEL] && !agent.labels?.["paseo.parent-agent-id"]).map((agent) => agent.id),
+      queued: queuedThread || Boolean(input.ticket?.queued),
+      reviewThread: activeThread && (activeThread.review || offer) ? { agentId: activeThread.agentId } : null,
+      stewardAt: stewardActionAt(input.ticket),
+    };
+    return { facts, check };
   }
 
   // A recorded wait for the owner: `live` while something can still end it, `stale` when nothing
@@ -2164,6 +2212,16 @@ export class Steward {
   // fallback here: unreadable evidence rejects the effect. inTurn ignores only the router's own
   // exclusive resume turn; threadQueued still checks actual live queued links.
   private async ownerAuthorityFence(issue: StewardIssue, names: DispatchLabels, parent: ParentProgress | null, inTurn = false): Promise<string | null> {
+    const gate = await this.ownerGates(issue, names, parent, inTurn);
+    if (gate) return gate;
+    const stage = planStage(issue.status, issue.statusType);
+    if (stage && (!inTurn || stage === PLAN_REVIEW_STATE)) return `the ticket's plan is in ${issue.status}`;
+    return null;
+  }
+
+  // The owner's gates other than the plan stage: an owner Stop, a parked plan, a thread waiting for
+  // a decision, an answer or the peer host, a queued turn, and the owner's labels.
+  private async ownerGates(issue: StewardIssue, names: DispatchLabels, parent: ParentProgress | null, inTurn: boolean): Promise<string | null> {
     const [watchdog, planned, thread, queuedThread] = await Promise.all([
       this.deps.watchdog.read(),
       this.deps.planned?.has(issue.id) ?? Promise.resolve(false),
@@ -2181,8 +2239,42 @@ export class Steward {
     if (hasLabel(issue.labels, names.manual)) return `the ticket carries a manual step (${names.manual})`;
     if (hasLabel(issue.labels, names.needsYou)) return `the ticket needs the owner (${names.needsYou})`;
     if (hasLabel(issue.labels, DO_NOT_MERGE)) return "the ticket is marked do-not-merge";
-    const stage = planStage(issue.status, issue.statusType);
-    if (stage && (!inTurn || stage === PLAN_REVIEW_STATE)) return `the ticket's plan is in ${issue.status}`;
+    return null;
+  }
+
+  // The responsibility check's fence (responsibility.ts RepairFence), read fresh under the
+  // repair's reservation: this host still owns the ticket, it is still in Planning or Plan review,
+  // and nothing of the owner's or the steward's own stands in the way — a pause, an owner gate, a
+  // blocker, a live agent, an owner wait or question, a steward action within the grace. Unreadable
+  // evidence refuses; every answer is temporary.
+  private async repairFence(settings: PluginSettings, names: DispatchLabels & { trigger: string }, paseo: PaseoApi, issueId: string, identifier: string): Promise<string | null> {
+    const now = this.clock();
+    if (await this.deps.deletions?.blocked(issueId).catch(() => true)) return "the ticket is paused for deletion";
+    const ownership = await this.deps.owner(issueId).catch(() => "unknown" as HostOwnership);
+    if (ownership !== "here") return `another host owns the ticket (${ownership})`;
+    const appIds = (await this.deps.linear.trustedAppIds().catch(() => [])).filter(Boolean);
+    const labelNames = [names.trigger, names.running, names.failed, names.blocked, names.needsYou, names.manual, names.hold, names.attended, names.queued];
+    const fresh = (await this.deps.linear.stewardIssues({ teamKeys: settings.dispatch.teamKeys, labels: labelNames, appIds, ids: [issueId] })).find((entry) => entry.id === issueId) ?? null;
+    if (!fresh) return "the ticket cannot be read";
+    const stage = planStage(fresh.status, fresh.statusType);
+    if (stage !== PLANNING_STATE && stage !== PLAN_REVIEW_STATE) return `the ticket moved to ${fresh.status}`;
+    const parent = await this.deps.sessions.parentProgress(issueId);
+    if (parent?.phase === "paused" || parent?.phase === "closed") return `parent orchestration is ${parent.phase}: ${parent.nextAction}`;
+    const gate = await this.ownerGates(fresh, names, parent, false);
+    if (gate) return gate;
+    const blocker = fresh.blockers.find((entry) => !finishedBlocker(entry));
+    if (blocker) return `it waits for ${blocker.identifier}`;
+    const live = (await classifyTicketAgents(paseo, issueId, now, this.deps.inspect)).live
+      .filter((agent) => !agent.labels?.[STEWARD_VERIFIER_LABEL] && !agent.labels?.["paseo.parent-agent-id"]);
+    if (live.length) return `an agent works on it (${short(live[0].id)})`;
+    const record = (await this.deps.handover.all()).find((item) => item.issueId === issueId) ?? null;
+    if (record?.waiting) {
+      const handed = await this.deps.watchdog.handedOver();
+      if (await this.waitState(fresh, record.waiting, [], { handed, record, roots: new Map() }, now) === "live") return "it waits for the owner";
+    }
+    if ((await this.deps.needsYou.allStrict()).some((entry) => entry.parentId === issueId)) return "it has an open Needs-you question";
+    const stewardAt = stewardActionAt((await this.deps.store.read()).tickets[issueId] ?? null);
+    if (stewardAt !== null && now - stewardAt < RESPONSIBILITY_GRACE_MS) return `the steward acted on ${identifier} within the last ten minutes`;
     return null;
   }
 
