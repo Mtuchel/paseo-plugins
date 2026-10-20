@@ -292,12 +292,36 @@ function plannerTargets(history: History): string[] {
   return [...targets];
 }
 
-// `hosts`: for agent kinds, the hosts complete in every window (only their problems are counted);
-// null for repository kinds. Complete needs the digest's own host among them.
+// The ticket-responsibility check is read per host too (TUC-1290): a host is a candidate once a run
+// names its unit, whether or not that run read it, so a host that was never tried stays out.
+function responsibilityTargets(history: History): string[] {
+  const targets = new Set<string>();
+  for (const run of history.runs) {
+    for (const unit of Object.keys(run.units)) {
+      const match = /^responsibility@(.+)$/.exec(unit);
+      if (match) targets.add(match[1]);
+    }
+  }
+  return [...targets];
+}
+
+function responsibilityRead(run: RunRecord, host: string): boolean {
+  const at = host === run.host ? "" : `@${host}`;
+  return run.units[`responsibility${at}`] === true;
+}
+
+// `hosts`: for agent and responsibility kinds, the hosts complete in every window (only their
+// problems are counted); null for repository kinds. Complete needs the digest's own host among them.
 export type Coverage = { complete: boolean; hosts: string[] | null; excluded: string[] };
 
 export function coverage(history: History, source: Source, windows: Window[]): Coverage {
   const clean = windows.every((window) => malformedShare(history, window) < MALFORMED_SHARE);
+  if (source.section === "responsibility") {
+    const primary = history.primaryHost;
+    const candidates = [...new Set([...(primary ? [primary] : []), ...responsibilityTargets(history)])].sort();
+    const hosts = candidates.filter((host) => windows.every((window) => coveredShare(history, window, (run) => responsibilityRead(run, host)) >= COVERED_SHARE));
+    return { complete: clean && primary !== null && hosts.includes(primary), hosts, excluded: candidates.filter((host) => !hosts.includes(host)) };
+  }
   if (source.section !== "agents") {
     const complete = clean && windows.every((window) => coveredShare(history, window, (run) => repositoryRead(run, source.section)) >= COVERED_SHARE);
     return { complete, hosts: null, excluded: [] };
