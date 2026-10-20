@@ -143,6 +143,36 @@ const SESSION_ACTIVITIES_QUERY = `query sessionActivities($id: String!) {
     ... on AgentActivityErrorContent { body }
   } } } }
 }`;
+// Aliased lookups: `s0`…`s<n-1>` bound to the session ids. A session's activities cost about 181
+// points at `first: 50`, so a full batch stays far below Linear's 10,000-point query ceiling.
+export const SESSION_ACTIVITIES_BATCH = 20;
+function sessionActivitiesQuery(count: number): string {
+  const indexes = Array.from({ length: count }, (_, index) => index);
+  return `query sessionActivities(${indexes.map((index) => `$s${index}: String!`).join(", ")}) {\n${indexes.map((index) => `  s${index}: agentSession(id: $s${index}) { activities(first: 50) { nodes { id createdAt signal user { id } content {
+    __typename
+    ... on AgentActivityPromptContent { body }
+    ... on AgentActivityResponseContent { body }
+    ... on AgentActivityElicitationContent { body }
+    ... on AgentActivityThoughtContent { body }
+    ... on AgentActivityErrorContent { body }
+  } } } }`).join("\n")}\n}`;
+}
+// An `activities` page's nodes as activities, oldest first: the same mapping for a single session's
+// read and for every alias of a batch.
+function activityNodes(page: Record<string, unknown>): AgentActivity[] {
+  const nodes = Array.isArray(page.nodes) ? page.nodes : [];
+  return nodes.map((node) => record(node)).map((node) => {
+    const content = record(node.content ?? {});
+    return {
+      id: String(node.id ?? ""),
+      createdAt: String(node.createdAt ?? ""),
+      signal: typeof node.signal === "string" ? node.signal : null,
+      type: String(content.__typename ?? "").replace(/^AgentActivity|Content$/g, "").toLowerCase(),
+      body: typeof content.body === "string" ? content.body : "",
+      userId: node.user ? String(record(node.user).id ?? "") || null : null,
+    };
+  }).filter((activity) => activity.id).sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+}
 
 // The agent-session half of Linear's API, authenticated as the app. A 401 refreshes the
 // token once and retries; every other error surfaces to the caller.
@@ -289,20 +319,40 @@ export class AgentApi {
     return result;
   }
 
+  // Several sessions' activities, one request per SESSION_ACTIVITIES_BATCH ids (Linear has no id
+  // filter on `agentSessions`, so each id is an aliased `agentSession` lookup). Linear answers a
+  // batch that names an id it has no session for with no data at all, so those ids are dropped and
+  // the rest read again; a dropped id is absent from the result, as is one with no session data,
+  // and its caller reads it alone (`activities`). Every other failure propagates.
+  async sessionActivities(sessionIds: string[]): Promise<Map<string, AgentActivity[]>> {
+    const result = new Map<string, AgentActivity[]>();
+    const ids = [...new Set(sessionIds)];
+    for (let start = 0; start < ids.length; start += SESSION_ACTIVITIES_BATCH) {
+      let chunk = ids.slice(start, start + SESSION_ACTIVITIES_BATCH);
+      while (chunk.length) {
+        let data: Record<string, unknown>;
+        try {
+          data = await this.call(sessionActivitiesQuery(chunk.length), Object.fromEntries(chunk.map((id, index) => [`s${index}`, id])));
+        } catch (error) {
+          const missing = new Set(error instanceof LinearApiError && entityNotFound(error) && error.reasons.every((reason) => /^Entity not found\b/.test(reason)) ? error.fields : []);
+          const rest = chunk.filter((_, index) => !missing.has(`s${index}`));
+          if (!missing.size || rest.length === chunk.length) throw error;
+          chunk = rest;
+          continue;
+        }
+        chunk.forEach((id, index) => {
+          const session = data[`s${index}`];
+          if (session === undefined || session === null) return;
+          result.set(id, activityNodes(record(record(session).activities ?? {})));
+        });
+        break;
+      }
+    }
+    return result;
+  }
+
   async activities(sessionId: string): Promise<AgentActivity[]> {
     const session = record(record(await this.call(SESSION_ACTIVITIES_QUERY, { id: sessionId })).agentSession ?? {});
-    const page = record(session.activities ?? {});
-    const nodes = Array.isArray(page.nodes) ? page.nodes : [];
-    return nodes.map((node) => record(node)).map((node) => {
-      const content = record(node.content ?? {});
-      return {
-        id: String(node.id ?? ""),
-        createdAt: String(node.createdAt ?? ""),
-        signal: typeof node.signal === "string" ? node.signal : null,
-        type: String(content.__typename ?? "").replace(/^AgentActivity|Content$/g, "").toLowerCase(),
-        body: typeof content.body === "string" ? content.body : "",
-        userId: node.user ? String(record(node.user).id ?? "") || null : null,
-      };
-    }).filter((activity) => activity.id).sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+    return activityNodes(record(session.activities ?? {}));
   }
 }

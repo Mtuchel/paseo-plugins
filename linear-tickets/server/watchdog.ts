@@ -4,7 +4,7 @@ import { dirname, isAbsolute, join } from "node:path";
 import type { PaseoAgent } from "@getpaseo/client";
 import { dispatchLabels } from "./dispatch";
 import type { HandoverRecord } from "./handover";
-import type { LinearService } from "./linear";
+import type { IssueState, LinearService } from "./linear";
 import type { NeedsYouIssues } from "./needs-you";
 import type { OpenPull } from "./pr-watch";
 import { RateLimitedError } from "./rate-budget";
@@ -37,6 +37,10 @@ const MINUTE = 60_000;
 // "Silent and stuck agents"): the deep check reads Linear and GitHub, whose hourly budgets the
 // plugin's other polls share.
 const EXCLUSION_RECHECK_MS = 5 * MINUTE;
+// How long a pass's batched screening states are reused (see screened). A cycle started on a wrong
+// screen consumes recovery budget, and every effect re-checks its ticket fresh right before it
+// goes out; a pass that screens tickets further apart than this reads them alone.
+const SCREEN_SNAPSHOT_MS = 30_000;
 const DO_NOT_MERGE = "do-not-merge";
 const NEEDS_INPUT = "needs input";
 const TERMINAL = ["completed", "canceled", "duplicate"];
@@ -555,10 +559,14 @@ export type WatchdogPoll = {
   reserved: Set<string>;
 };
 
+// A pass's screening states (see screened): the ids of its tickets that have roots, and the one
+// batched read of them. `read` null: no screening has needed one yet.
+type ScreenStates = { ids: string[]; at: number | null; read: Promise<Map<string, Pick<IssueState, "status" | "statusType" | "labels">>> | null };
+
 export type WatchdogDeps = {
   store: WatchdogStore;
   sessions: WatchdogSessions;
-  linear: Pick<LinearService, "issueWatchState" | "comment" | "hasComment" | "viewerId" | "userUrl">;
+  linear: Pick<LinearService, "issueWatchState" | "issueWatchStates" | "comment" | "hasComment" | "viewerId" | "userUrl">;
   settings: Pick<Settings, "read">;
   handover: { all(): Promise<HandoverRecord[]> };
   needsYou?: Pick<NeedsYouIssues, "all">;
@@ -640,10 +648,14 @@ export class Watchdog {
         for (const agent of roots.get(issueId)?.roots ?? []) poll.reserved.add(agent.id);
       }
       const issues = [...new Set([...Object.keys(file.tickets), ...roots.keys()])];
+      // The pass screens its quiet tickets on one batched read of the ones with roots (see
+      // exclusion): a falsely started cycle consumes recovery budget, so the snapshot is short-lived
+      // and every effect re-checks its ticket fresh.
+      const screen: ScreenStates = { ids: [...roots.keys()], at: null, read: null };
       for (const issueId of issues) {
         if (!this.alive()) return;
         try {
-          await this.ticket(issueId, roots.get(issueId) ?? null, poll, settings);
+          await this.ticket(issueId, roots.get(issueId) ?? null, poll, settings, screen);
         } catch (error) {
           if (error instanceof RateLimitedError) throw error;
           const label = roots.get(issueId)?.identifier ?? file.tickets[issueId]?.identifier ?? issueId;
@@ -655,7 +667,7 @@ export class Watchdog {
     }
   }
 
-  private async ticket(issueId: string, found: TicketRoots | null, poll: WatchdogPoll, settings: PluginSettings): Promise<void> {
+  private async ticket(issueId: string, found: TicketRoots | null, poll: WatchdogPoll, settings: PluginSettings, screen: ScreenStates): Promise<void> {
     const now = this.clock();
     let entry = (await this.deps.store.read()).tickets[issueId];
     if (entry?.reports?.length) {
@@ -689,7 +701,7 @@ export class Watchdog {
       return;
     }
     if (!root) return;
-    await this.maybeStart(issueId, identifier, entry ?? null, root, found!, record, poll, settings);
+    await this.maybeStart(issueId, identifier, entry ?? null, root, found!, record, poll, settings, screen);
   }
 
   // The ticket's current root: the handover record's agent while it is an unarchived root, else
@@ -715,7 +727,7 @@ export class Watchdog {
 
   // Everything that keeps the watchdog's hands off a ticket. `deep` also reads Linear, the
   // owner's waits and the open pull requests; the cheap part runs after every await of an effect.
-  private async exclusion(issueId: string, identifier: string, agent: WatchedAgent | null, deep: boolean, poll: WatchdogPoll, kind: WatchdogKind | null, settings?: PluginSettings): Promise<string | null> {
+  private async exclusion(issueId: string, identifier: string, agent: WatchedAgent | null, deep: boolean, poll: WatchdogPoll, kind: WatchdogKind | null, settings?: PluginSettings, screen?: ScreenStates): Promise<string | null> {
     if (!this.alive()) return "the plugin is unloading";
     const current = settings ?? await this.deps.settings.read();
     if (!current.writeback.watchdog) return "the watchdog is turned off";
@@ -737,7 +749,7 @@ export class Watchdog {
     if (thread?.group) return "the ticket hands out sub-issues";
     if (thread?.offer && ["split", "later", "parked"].includes(thread.offer)) return `the ticket's plan is ${thread.offer === "later" ? "approved for later" : thread.offer}`;
     if (!deep) return null;
-    const state = await this.deps.linear.issueWatchState(issueId);
+    const state = await (screen ? this.screened(screen, issueId) : this.deps.linear.issueWatchState(issueId));
     if (TERMINAL.includes(state.statusType.trim().toLowerCase())) return `${identifier} is ${state.status}`;
     if (state.status.trim().toLowerCase() === NEEDS_INPUT) return `${identifier} waits for the owner in ${state.status}`;
     const labels = dispatchLabels(current.dispatch.label);
@@ -758,6 +770,24 @@ export class Watchdog {
     return null;
   }
 
+  // A screening ticket's state: the pass's one batched read while it is younger than
+  // SCREEN_SNAPSHOT_MS, else alone, and alone too for a ticket Linear left out of it. Only the
+  // screening uses it: a wrongly started cycle consumes recovery budget, while the checks right
+  // before an effect (continueCycle, watchdogAct) read their ticket fresh.
+  private async screened(screen: ScreenStates, issueId: string): Promise<Pick<IssueState, "status" | "statusType" | "labels">> {
+    let read = screen.read;
+    if (read === null) {
+      read = this.deps.linear.issueWatchStates(screen.ids);
+      screen.read = read;
+      screen.at = this.clock();
+    }
+    if (this.clock() - (screen.at ?? 0) < SCREEN_SNAPSHOT_MS) {
+      const state = (await read).get(issueId);
+      if (state) return state;
+    }
+    return this.deps.linear.issueWatchState(issueId);
+  }
+
   // Silent since: the newest execution progress, the turn's start, the session file's last change
   // and the last message to the agent, whichever is latest (a recent message or file change only
   // postpones the first step; it never ends a cycle).
@@ -765,7 +795,7 @@ export class Watchdog {
     return Math.max(activity.progressAt ?? 0, ms(agent.activeTurn?.startedAt) ?? 0, activity.touchedAt, ms(agent.lastUserMessageAt) ?? 0);
   }
 
-  private async maybeStart(issueId: string, identifier: string, entry: WatchdogTicket | null, root: WatchedAgent, found: TicketRoots, record: HandoverRecord | null, poll: WatchdogPoll, settings: PluginSettings): Promise<void> {
+  private async maybeStart(issueId: string, identifier: string, entry: WatchdogTicket | null, root: WatchedAgent, found: TicketRoots, record: HandoverRecord | null, poll: WatchdogPoll, settings: PluginSettings, screen: ScreenStates): Promise<void> {
     const now = this.clock();
     const label = `${identifier}: watchdog`;
     const timings = settings.watchdog;
@@ -791,7 +821,7 @@ export class Watchdog {
     if (!kind) return;
     const excludedKey = `${issueId}:${root.id}:${kind}`;
     if ((this.excludedUntil.get(excludedKey) ?? 0) > now) return;
-    const reason = await this.exclusion(issueId, identifier, root, true, poll, kind, settings);
+    const reason = await this.exclusion(issueId, identifier, root, true, poll, kind, settings, screen);
     if (reason) {
       this.excludedUntil.set(excludedKey, now + EXCLUSION_RECHECK_MS);
       this.once(`excluded:${issueId}`, `${label}: ${short(root.id)} is ${kind === "silent" ? "silent" : kind === "ghost" ? "a ghost" : `${root.status} and quiet`}, but ${reason}`);

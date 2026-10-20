@@ -517,6 +517,19 @@ export const ISSUE_STATUSES_BATCH = 250;
 export const ISSUE_STATUSES_QUERY = `query issueStatuses($ids: [ID!]!, $first: Int!) {
   issues(first: $first, filter: { id: { in: $ids } }) { nodes { id state { name type } completedAt } }
 }`;
+// The attachments of many tickets in one request: pull request discovery and the stack policy
+// read them for each linkless ticket of a poll (pr-watch.ts). `includeArchived`: a handed-over
+// ticket is often archived. Parsed by the same code as `issueAttachments`.
+export const ISSUES_ATTACHMENTS_BATCH = 50;
+export const ISSUES_ATTACHMENT_URLS_QUERY = `query issuesAttachmentUrls($ids: [ID!]!, $first: Int!) {
+  issues(first: $first, includeArchived: true, filter: { id: { in: $ids } }) { nodes { id attachments(first: 50) { nodes { url } } } }
+}`;
+// The workflow state and labels of many tickets in one request, for the watchdog's screening of a
+// pass's quiet tickets. Parsed exactly as `issueWatchState`.
+export const ISSUES_WATCH_STATES_BATCH = 50;
+export const ISSUES_WATCH_STATES_QUERY = `query issuesWatchStates($ids: [ID!]!, $first: Int!) {
+  issues(first: $first, includeArchived: true, filter: { id: { in: $ids } }) { nodes { id state { name type } labels(first: 50) { nodes { id name } } } }
+}`;
 // Everything the queue's admission decides on (TicketStarter.admission), for up to 50 waiting
 // tickets in one request: measured 2026-10-09 on 50 live tickets, 502 points against 498 for one
 // `issueState` read (README, "Rate limits"). Parsed by the same function as `issueState`.
@@ -2650,6 +2663,41 @@ export class LinearService {
       for (const node of connection(record(data.issues ?? {})).nodes.map((item) => record(item))) {
         const state = record(node.state ?? {});
         result.set(label(node.id), { status: label(state.name), statusType: label(state.type), completedAt: label(node.completedAt) || null });
+      }
+    }
+    return result;
+  }
+
+  // Attachments of up to 50 tickets per request (pr-watch.ts reads them for every linkless ticket
+  // of a poll). Each id is asked for once; a ticket neither pool returns is absent, so its caller
+  // reads it alone. The URLs are parsed exactly as `issueAttachments`.
+  async issuesAttachments(ids: string[]): Promise<Map<string, string[]>> {
+    const result = new Map<string, string[]>();
+    const unique = [...new Set(ids)];
+    for (let start = 0; start < unique.length; start += ISSUES_ATTACHMENTS_BATCH) {
+      const chunk = unique.slice(start, start + ISSUES_ATTACHMENTS_BATCH);
+      const data = record(await this.read(ISSUES_ATTACHMENT_URLS_QUERY, { ids: chunk, first: chunk.length }, (found) => connection(record(found.issues ?? {})).nodes.length === chunk.length));
+      for (const node of connection(record(data.issues ?? {})).nodes.map((item) => record(item))) {
+        const id = label(node.id);
+        if (id) result.set(id, connection(record(node.attachments ?? { nodes: [] })).nodes.map((item) => label(record(item).url)).filter(Boolean));
+      }
+    }
+    return result;
+  }
+
+  // State and labels of up to 50 tickets per request (the watchdog screens a pass's quiet tickets
+  // with them), parsed exactly as `issueWatchState`. Tickets Linear does not return are absent.
+  async issueWatchStates(ids: string[]): Promise<Map<string, Pick<IssueState, "status" | "statusType" | "labels">>> {
+    const result = new Map<string, Pick<IssueState, "status" | "statusType" | "labels">>();
+    const unique = [...new Set(ids)];
+    for (let start = 0; start < unique.length; start += ISSUES_WATCH_STATES_BATCH) {
+      const chunk = unique.slice(start, start + ISSUES_WATCH_STATES_BATCH);
+      const data = record(await this.read(ISSUES_WATCH_STATES_QUERY, { ids: chunk, first: chunk.length }, (found) => connection(record(found.issues ?? {})).nodes.length === chunk.length));
+      for (const node of connection(record(data.issues ?? {})).nodes.map((item) => record(item))) {
+        const id = label(node.id);
+        if (!id) continue;
+        const state = record(node.state ?? {});
+        result.set(id, { status: label(state.name), statusType: label(state.type), labels: labelNodes(node.labels) });
       }
     }
     return result;

@@ -7,8 +7,8 @@ import { createHash, randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
 import type { PaseoAgent, PaseoAgentHandle, PaseoApi } from "@getpaseo/client";
 import type { AgentPermissionRequest } from "@getpaseo/protocol/agent-types";
-import type { AgentApi, OpenSession, SelectOption, SessionPlanStep } from "./agent-app";
-import { agentAppDirectory } from "./agent-app";
+import type { AgentActivity, AgentApi, OpenSession, SelectOption, SessionPlanStep } from "./agent-app";
+import { agentAppDirectory, SESSION_ACTIVITIES_BATCH } from "./agent-app";
 import { recoverActivationId, type ActivationSink } from "./activation";
 import type { AgentSessionWebhook } from "./agent-webhook";
 import { groupProgress, groupStatus, isGroup } from "./groups";
@@ -1507,6 +1507,7 @@ export class SessionRouter {
   private async catchUp(): Promise<void> {
     const sessions = await this.listSessions();
     const failures: string[] = [];
+    const due: string[] = [];
     for (const session of sessions) {
       try {
         const link = await this.deps.store.get(session.id);
@@ -1532,10 +1533,35 @@ export class SessionRouter {
           this.reads.skipped += 1;
           continue;
         }
-        await this.readSession(session.id, "sweep");
+        due.push(session.id);
       } catch (error) {
         if (error instanceof RateLimitedError) throw error;
         failures.push(error instanceof Error ? error.message : String(error));
+      }
+    }
+    for (let start = 0; start < due.length; start += SESSION_ACTIVITIES_BATCH) {
+      const chunk = due.slice(start, start + SESSION_ACTIVITIES_BATCH);
+      let activities: Map<string, AgentActivity[]>;
+      try {
+        activities = await this.deps.api.sessionActivities(chunk);
+      } catch (error) {
+        if (error instanceof RateLimitedError) throw error;
+        // A failed batch read none of its sessions, as one request per session would have failed
+        // them: each counts here and is read again next sweep, not one request each now.
+        const message = error instanceof Error ? error.message : String(error);
+        failures.push(...chunk.map(() => message));
+        continue;
+      }
+      for (const sessionId of chunk) {
+        try {
+          const found = activities.get(sessionId);
+          // The batch returned no data for it: read it alone, as before.
+          if (found) await this.readSession(sessionId, "sweep", async () => found);
+          else await this.readSession(sessionId, "sweep");
+        } catch (error) {
+          if (error instanceof RateLimitedError) throw error;
+          failures.push(error instanceof Error ? error.message : String(error));
+        }
       }
     }
     if (failures.length) throw new Error(`${failures.length} of ${sessions.length} threads skipped until the next sweep: ${failures[0]}`);
@@ -1553,9 +1579,11 @@ export class SessionRouter {
   }
 
   // One session's activities, and the prompts among them no webhook delivered. A webhook calls
-  // this at once and the sweep at the fallback cadence. The link is read here because a webhook
-  // can arrive before `created` stored it; a session with no link has nothing to reach.
-  private async readSession(sessionId: string, source: "webhook" | "sweep"): Promise<void> {
+  // this at once and the sweep at the fallback cadence; the sweep's batch passes the activities it
+  // already read, so both go through this per-session path once they have them. The link is read
+  // here because a webhook can arrive before `created` stored it; a session with no link has
+  // nothing to reach.
+  private async readSession(sessionId: string, source: "webhook" | "sweep", read?: () => Promise<AgentActivity[]>): Promise<void> {
     if (this.readingSession.has(sessionId)) return;
     this.readingSession.add(sessionId);
     const previousRead = this.webhookReadAt.get(sessionId);
@@ -1566,7 +1594,7 @@ export class SessionRouter {
       if (source === "webhook") this.reads.webhook += 1;
       else this.reads.sweep += 1;
       const owner = await this.owner();
-      for (const activity of await this.deps.api.activities(sessionId)) {
+      for (const activity of await (read ? read() : this.deps.api.activities(sessionId))) {
         if (activity.type !== "prompt" || activity.userId !== owner || activity.createdAt < link.createdAt || link.handled.includes(activity.id)) continue;
         await this.handle({ type: "AgentSessionEvent", action: "prompted", agentSession: { id: sessionId }, agentActivity: { id: activity.id, content: { body: activity.body }, signal: activity.signal, userId: activity.userId } });
       }

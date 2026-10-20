@@ -105,6 +105,29 @@ test("only this app's sessions are open here: another host's app never has its t
   assert.deepEqual(await unknown.openSessions(), [], "without its own id the app claims no thread");
 });
 
+test("sessionActivities reads up to SESSION_ACTIVITIES_BATCH sessions per aliased request; a session Linear has none for leaves the batch", async () => {
+  const sent: Record<string, unknown>[] = [];
+  const prompt = (id: string) => ({ id: `p-${id}`, createdAt: "2026-01-02T00:00:00Z", signal: null, user: { id: OWNER }, content: { __typename: "AgentActivityPromptContent", body: `reply in ${id}` } });
+  const api = new AgentApi({ accessToken: async () => "t" }, async (_key, query, variables) => {
+    sent.push(variables);
+    assert.match(query, /^query sessionActivities\(/);
+    const gone = Object.entries(variables).find(([, id]) => id === "s3");
+    if (gone) throw new LinearApiError("The Linear API request failed: Entity not found: AgentSession", 400, ["INPUT_ERROR"], ["Entity not found: AgentSession"], [gone[0]]);
+    return Object.fromEntries(Object.entries(variables).map(([alias, id]) => [alias, { activities: { nodes: [prompt(String(id))] } }]));
+  });
+  const ids = Array.from({ length: 23 }, (_, index) => `s${index}`);
+  const found = await api.sessionActivities(ids);
+  assert.deepEqual(sent.map((variables) => Object.keys(variables).length), [20, 19, 3], "20 per request; the batch naming s3 is sent again without it");
+  assert.ok(!Object.values(sent[1]).includes("s3"));
+  assert.equal(found.has("s3"), false, "the session Linear has none for is left to a single read");
+  assert.equal(found.size, 22);
+  assert.deepEqual(found.get("s7"), [{ id: "p-s7", createdAt: "2026-01-02T00:00:00Z", signal: null, type: "prompt", body: "reply in s7", userId: OWNER }]);
+
+  const failing = new AgentApi({ accessToken: async () => "t" }, async () => { throw new LinearApiError("The Linear API request failed (HTTP 503). Try again.", 503); });
+  await assert.rejects(failing.sessionActivities(["s1"]), /HTTP 503/, "every other failure propagates");
+  assert.deepEqual(await failing.sessionActivities([]), new Map(), "no ids, no request");
+});
+
 const NOW = 1_000_000_000_000;
 const MINUTE = 60_000;
 
@@ -219,6 +242,7 @@ function harness(options: { owner?: (issueId: string) => Promise<"here" | "elsew
     viewer: async () => ({ id: "paseo-app", name: "Paseo" }),
     openSessions: async () => [],
     activities: async () => [],
+    sessionActivities: async () => new Map(),
     sessionStatus: async () => "stale",
     sessionStatuses: async (ids: string[]) => new Map(ids.map((id) => [id, "stale"])),
   };
@@ -772,7 +796,7 @@ test("a mention on a ticket with a running agent is passed to that agent instead
 test("a mention whose webhook never came keeps its text when the sweep adopts the thread, also for a ticket another host handles", async (t) => {
   const received: ActivationRequest[] = [];
   const missed = { id: "s9", status: "pending", createdAt: new Date().toISOString(), creatorId: OWNER, issueId: "i1", identifier: "TUC-1", commentBody: "@paseo Begrenzte Ausnahme" };
-  const api = { activity: async () => {}, updateSession: async () => {}, openSessions: async () => [missed], activities: async () => [], sessionStatus: async () => "pending", sessionStatuses: async () => new Map() };
+  const api = { activity: async () => {}, updateSession: async () => {}, openSessions: async () => [missed], activities: async () => [], sessionActivities: async () => new Map(), sessionStatus: async () => "pending", sessionStatuses: async () => new Map() };
   const h = harness({ manual: true, api: api as never, route: { take: async (request) => { received.push(request); return { peer: "server087" }; } } });
   t.after(h.cleanup);
   await h.router.sweep();

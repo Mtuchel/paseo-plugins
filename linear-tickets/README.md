@@ -3460,6 +3460,29 @@ No tokens, query bodies or ticket text appear in the report.
   `webhooks` (delivered since the plugin loaded), `sweepReads`, `sweepSkips` and `webhookReads`;
   `sweepSkips` against `sweepReads + sweepSkips` is how much of the saving the webhooks actually
   cover.
+- **Reads of many sessions or tickets go out in batches.** The router spends both pools on
+  background reads (the key first while it has at least the app's headroom), so only less total
+  demand lowers the app's hourly count. On server087 in the first hour after the per-session status
+  check was dropped (2026-10-20 10:17–11:16 UTC) the app answered 4,850 requests and the key 2,401;
+  the two largest per-ticket or per-session reads below made up 1,633 of them. These reads, and the
+  watchdog's screening, now go out in batches, as fresh as before because every batch is read in
+  the pass that uses it:
+  - The minute sweep reads the due sessions' activities 20 per request (`sessionActivities`,
+    aliased `agentSession` lookups at about 181 points a session) instead of one request each
+    (`session-sweep.missed replies`: 737 requests in that hour). A session Linear no longer has is
+    dropped from the batch and the rest read again; a due session the batch does not return is read
+    alone. A failed batch fails its sessions for this sweep, and the next sweep reads them again.
+    Webhooks still read their session alone, at once.
+  - The PR watch reads the attachment links of a run's tickets without a worktree 50 per request
+    (`issuesAttachmentUrls`) the first time discovery, a ticket's pull-request lookup or the stack
+    policy needs one, instead of one `issueAttachmentUrls` per ticket (896 requests in that hour,
+    with about 114 such tickets). Every poll, backstop and watchdog pass builds a new run, so nothing
+    is carried across runs. A ticket the batch does not cover is read alone, once per run; a failed
+    batch fails that run's readers. The completion check still reads its ticket alone.
+  - The watchdog screens a pass's quiet roots on one `issuesWatchStates` read (state and labels,
+    50 tickets per request) instead of one `issueWatchState` each, and uses it for at most 30
+    seconds. The checks right before an effect, and before a cycle ends, still read their ticket
+    alone, so no step goes out on a batched state.
 - **Menu-bar owner reads reuse Linear sources for at most 60 seconds.** Its 15-second refresh
   starts a collection with current local agent state and decision receipts. Overlapping reads
   from the same SDK and source generation share that in-flight collection, not a completed
