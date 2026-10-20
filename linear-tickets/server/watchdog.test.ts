@@ -93,8 +93,10 @@ async function harness(options: { settings?: PluginSettings } = {}) {
     sessionFor: async (agentId: string): Promise<SessionLink | null> => ({ sessionId: `s-${agentId}`, agentId, issueId: ISSUE.id, identifier: ISSUE.identifier, createdAt: iso(T0), handled: [], review: null, offer: null }),
     say: async (_sessionId: string, _type: string, body: string) => { said.push(body); },
   };
+  const watchState = () => ({ status: state.status.status, statusType: state.status.statusType, labels: state.status.labels.map((name) => ({ id: name, name })) });
   const linear = {
-    issueWatchState: async () => ({ status: state.status.status, statusType: state.status.statusType, labels: state.status.labels.map((name) => ({ id: name, name })) }),
+    issueWatchState: async () => watchState(),
+    issueWatchStates: async (ids: string[]) => new Map(ids.map((id) => [id, watchState()])),
     comment: async (_issueId: string, body: string) => { comments.push(body); },
     hasComment: async (_issueId: string, mark: string) => comments.some((body) => body.includes(mark)),
     viewerId: async () => "owner-1",
@@ -208,6 +210,38 @@ test("an excluded ticket is rechecked within five minutes after the gate clears"
   assert.equal(h.acts.length, 0);
   await h.poll(10);
   assert.deepEqual(h.acts.map((act) => act.action), ["steer"]);
+  await h.cleanup();
+});
+
+test("one pass screens its quiet tickets on one batched Linear read; the check right before an effect reads its ticket alone", async (t) => {
+  quiet(t);
+  const h = await harness();
+  const tickets = ["issue-1", "issue-2", "issue-3"];
+  h.deps.sessions.watchdogRoots = async () => new Map(tickets.map((issueId, index) => [issueId, {
+    issueId, identifier: `TUC-${index + 1}`, ghosts: new Set<string>(),
+    roots: [agent(`agent-${index + 1}`, { labels: { "linear.issueId": issueId, "linear.identifier": `TUC-${index + 1}` } })],
+  }]));
+  const done = new Set(["issue-2", "issue-3"]);
+  const stateOf = (id: string) => done.has(id) ? { status: "Done", statusType: "completed", labels: [] } : { status: "In Progress", statusType: "started", labels: [] };
+  const batches: string[][] = [];
+  const singles: string[] = [];
+  Object.assign(h.deps.linear, {
+    issueWatchStates: async (ids: string[]) => { batches.push([...ids]); return new Map(ids.map((id) => [id, stateOf(id)])); },
+    issueWatchState: async (id: string) => { singles.push(id); return stateOf(id); },
+  });
+  // All three roots have been silent for five minutes: each is screened this pass.
+  await h.poll(5);
+  assert.equal(batches.length, 1, "one request screens the pass's tickets");
+  assert.deepEqual(batches[0].filter((id) => tickets.includes(id)).sort(), tickets);
+  assert.deepEqual(h.acts.map((act) => act.action), ["steer"], "only the open ticket's agent is steered; the Done ones are left alone");
+  assert.deepEqual(singles, ["issue-1"], "the deep check right before the steer reads its ticket alone, fresh");
+  assert.equal((await h.store.read()).tickets["issue-2"]?.starts.length ?? 0, 0, "no cycle is counted for a Done ticket");
+  // Within the exclusion recheck window nothing is screened again; after it, a later pass reads afresh.
+  await h.poll(7);
+  assert.equal(batches.length, 1);
+  await h.poll(11);
+  assert.equal(batches.length, 2, "a later pass never reuses an earlier pass's states");
+  assert.deepEqual(batches[1].filter((id) => done.has(id)).sort(), ["issue-2", "issue-3"]);
   await h.cleanup();
 });
 

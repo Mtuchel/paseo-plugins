@@ -619,6 +619,57 @@ test("a session with no webhook keeps the minute sweep", async () => {
   await h.cleanup();
 });
 
+test("the minute sweep reads the due sessions' activities in batches of SESSION_ACTIVITIES_BATCH, not one request per session", async () => {
+  const batches: string[][] = [];
+  const singles: string[] = [];
+  const ids = Array.from({ length: 25 }, (_, index) => `s${index + 1}`);
+  const h = routerHarness([], {
+    api: {
+      activity: async () => {},
+      openSessions: async () => ids.map((id) => ({ id, status: "active" })),
+      sessionActivities: async (asked: string[]) => {
+        batches.push(asked);
+        return new Map(asked.map((id) => [id, id === "s7" ? [{ id: "p7", type: "prompt", userId: OWNER, createdAt: "2026-01-02T00:00:00Z", body: "Also update the README" }] : []]));
+      },
+      activities: async (id: string) => { singles.push(id); return []; },
+    } as never,
+  });
+  for (const [index, id] of ids.entries()) await h.store.put({ ...link, sessionId: id, agentId: `a${index + 1}`, issueId: `i${index + 1}`, paseoLinked: `a${index + 1}` });
+  await h.router.sweep();
+  assert.deepEqual(batches.map((asked) => asked.length), [20, 5], "25 due sessions cost two requests");
+  assert.deepEqual(batches.flat().sort(), [...ids].sort(), "every due session is in exactly one batch");
+  assert.deepEqual(singles, [], "no session is read alone when the batch returned it");
+  assert.ok(h.calls.some((call) => call.startsWith("send a7:") && call.includes("Also update the README")), JSON.stringify(h.calls));
+  assert.deepEqual(h.router.readStats(), { sweepReads: 25, sweepSkips: 0, webhookReads: 0 });
+  await h.cleanup();
+});
+
+test("a due session the batch leaves out is read alone, and a failed batch is retried at the next sweep", async () => {
+  const singles: string[] = [];
+  let failBatch = true;
+  const h = routerHarness([], {
+    api: {
+      activity: async () => {},
+      openSessions: async () => [{ id: "s1", status: "active" }, { id: "s2", status: "active" }],
+      sessionActivities: async (asked: string[]) => {
+        if (failBatch) throw new Error("HTTP 503");
+        return new Map(asked.filter((id) => id !== "s2").map((id) => [id, []]));
+      },
+      activities: async (id: string) => { singles.push(id); return [{ id: "p2", type: "prompt", userId: OWNER, createdAt: "2026-01-02T00:00:00Z", body: "Ship it" }]; },
+    } as never,
+  });
+  await h.store.put({ ...link, sessionId: "s1", paseoLinked: "a1" });
+  await h.store.put({ ...link, sessionId: "s2", agentId: "a2", issueId: "i2", paseoLinked: "a2" });
+  await h.router.sweep();
+  assert.deepEqual(singles, [], "a failed batch is not repeated one request per session");
+  assert.ok(!h.calls.some((call) => call.startsWith("send ")), JSON.stringify(h.calls));
+  failBatch = false;
+  await h.router.sweep();
+  assert.deepEqual(singles, ["s2"], "the session missing from the batch is read alone");
+  assert.ok(h.calls.some((call) => call.startsWith("send a2:") && call.includes("Ship it")), JSON.stringify(h.calls));
+  await h.cleanup();
+});
+
 test("a queued thread starts once its blockers finish, even after it dropped out of Linear's recent sessions", async () => {
   const events: string[] = [];
   const blocked = new Set(["i1", "i2", "i3", "i4", "i5"]);

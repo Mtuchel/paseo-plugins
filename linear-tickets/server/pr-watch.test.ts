@@ -233,7 +233,9 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
   // states of tickets a run has several of (`state` is every other ticket's). `issueFailure` fails
   // the ticket reads (`issueReads`), `statesFailure` the per-poll batch of the running tickets
   // (`stateReads`). `written` hears the states the plugin writes (LinearService.onStateWritten).
-  const linear = { failure: null as Error | null, issueFailure: null as Error | null, statesFailure: null as Error | null, attachments: [] as string[], issueReads: [] as string[], stateReads: [] as string[][], arrive: async () => {}, stall: async () => {}, lost: false, comments: {} as Record<string, string[]>, state: { status: "In Progress", statusType: "started" }, completedAt: null as string | null, byIssue: {} as Record<string, { status: string; statusType: string; id?: string; identifier?: string }>, written: (_issueId: string, _type: string) => {} };
+  // `attachmentBatches`: each batched attachment read's ids (issuesAttachments, whose ids also go
+  // to `issueReads`); `attachmentReads`: the tickets whose attachments were read alone.
+  const linear = { failure: null as Error | null, issueFailure: null as Error | null, statesFailure: null as Error | null, attachments: [] as string[], issueReads: [] as string[], attachmentBatches: [] as string[][], attachmentReads: [] as string[], stateReads: [] as string[][], arrive: async () => {}, stall: async () => {}, lost: false, comments: {} as Record<string, string[]>, state: { status: "In Progress", statusType: "started" }, completedAt: null as string | null, byIssue: {} as Record<string, { status: string; statusType: string; id?: string; identifier?: string }>, written: (_issueId: string, _type: string) => {} };
   // No test worktree exists unless its git source is explicitly provided.
   const git = { origin: null as string | null, root: null as string | null, reads: [] as string[][] };
   // Open before-merge manual tasks of the ticket; `unreadable`: reading them fails.
@@ -330,8 +332,15 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
       },
       issueAttachments: async (id) => {
         linear.issueReads.push(id);
+        linear.attachmentReads.push(id);
         if (linear.issueFailure) throw linear.issueFailure;
         return linear.attachments;
+      },
+      issuesAttachments: async (ids) => {
+        linear.attachmentBatches.push([...ids]);
+        linear.issueReads.push(...ids);
+        if (linear.issueFailure) throw linear.issueFailure;
+        return new Map(ids.map((id) => [id, linear.attachments]));
       },
       issueStatusAnyPool: async (id) => {
         linear.issueReads.push(id);
@@ -1521,6 +1530,25 @@ test("a removed worktree recovers its open remainder from the ticket's canonical
     await h.restart();
     assert.deepEqual(await h.poll(), [], "attachment fallback is not relinked on restart");
   }
+});
+
+test("one poll reads the attachments of its linkless records in one batch, and the next poll reads them afresh", async (t) => {
+  const h = harness(t);
+  // Three handed-over tickets whose worktrees are gone: only their attachments name a repository.
+  h.records[0] = { ...h.records[0], identifier: "TUC-654", branch: "mtuchel/tuc-654", worktreePath: null, links: {} };
+  h.records.push({ ...h.records[0], issueId: "i2", agentId: "a2", identifier: "TUC-566", branch: "mtuchel/tuc-566" });
+  h.records.push({ ...h.records[0], issueId: "i3", agentId: "a3", identifier: "TUC-567", branch: "mtuchel/tuc-567" });
+  h.linear.attachments = [prUrl(2000)];
+  h.github.view = { ...OPEN_PR, state: "CLOSED" };
+  h.github.open = [listed(prUrl(2001), OPEN_PR, "Fix TUC-654 [queue] Recover")];
+  await h.poll();
+  assert.equal(h.records[0].links["Pull request"], prUrl(2001), "discovery decides on the batched attachments as on a single read");
+  assert.deepEqual(h.linear.attachmentBatches.map((ids) => [...ids].sort()), [["i1", "i2", "i3"]], "one request for the poll's linkless records");
+  assert.deepEqual(h.linear.attachmentReads, [], "no ticket's attachments are read alone");
+  assert.deepEqual(h.github.listings, ["tuchel-sohn/tuchel-platform"]);
+  await h.poll();
+  assert.deepEqual(h.linear.attachmentBatches.map((ids) => [...ids].sort()), [["i1", "i2", "i3"], ["i2", "i3"]], "the next poll reads afresh, without the ticket linked since");
+  assert.deepEqual(h.linear.attachmentReads, []);
 });
 
 test("linkless records share one repository listing and retain same-poll recovered records", async (t) => {

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { AgentApi } from "./agent-app";
 import { Credentials } from "./credentials";
-import { AuthenticationError, CREATE_ISSUE_QUERY, ISSUE_ATTACHMENT_URLS_QUERY, ISSUE_COMMENT_HISTORY_QUERY, ISSUE_CORE_QUERY, ISSUE_GROUP_QUERY, ISSUE_GROUP_LABELS_QUERY, ISSUE_WATCH_STATE_QUERY, ISSUE_METADATA_QUERY, ISSUE_STATUS_QUERY, ISSUE_STATE_QUERY, ISSUE_STATUSES_QUERY, LABELED_ISSUES_QUERY, LinearApiError, LinearService, MARKED_COMMENT_QUERY, MENTIONING_ISSUES_QUERY, OWNER_ASKS_QUERY, TEAM_STATES_QUERY, type App, type IssueCore, type Post } from "./linear";
+import { AuthenticationError, CREATE_ISSUE_QUERY, ISSUE_ATTACHMENT_URLS_QUERY, ISSUE_COMMENT_HISTORY_QUERY, ISSUE_CORE_QUERY, ISSUE_GROUP_QUERY, ISSUE_GROUP_LABELS_QUERY, ISSUE_WATCH_STATE_QUERY, ISSUE_METADATA_QUERY, ISSUE_STATUS_QUERY, ISSUE_STATE_QUERY, ISSUE_STATUSES_QUERY, ISSUES_ATTACHMENT_URLS_QUERY, ISSUES_ATTACHMENTS_BATCH, ISSUES_WATCH_STATES_BATCH, ISSUES_WATCH_STATES_QUERY, LABELED_ISSUES_QUERY, LinearApiError, LinearService, MARKED_COMMENT_QUERY, MENTIONING_ISSUES_QUERY, OWNER_ASKS_QUERY, TEAM_STATES_QUERY, type App, type IssueCore, type Post } from "./linear";
 import { RateLimitedError } from "./rate-budget";
 
 const issue = { id: "i1", identifier: "TUC-1", state: { id: "s1", name: "Todo", type: "unstarted" }, team: { id: "t1" }, labels: { nodes: [] }, attachments: { nodes: [] }, inverseRelations: { nodes: [] } };
@@ -252,6 +252,61 @@ test("the status batch asks for exactly the rows of its chunk (AC-11): two ids s
   assert.equal((await linear.issueStatuses(ids)).size, 300);
   assert.deepEqual(asked.map((variables) => ({ first: variables.first, count: (variables.ids as string[]).length })), [{ first: 250, count: 250 }, { first: 50, count: 50 }]);
   assert.deepEqual((asked[0].ids as string[]).concat(asked[1].ids as string[]), ids, "the chunks cover every id in order, without overlap");
+  assert.deepEqual(keyCalls, []);
+});
+
+// TUC-2225: the per-poll and per-pass reads of many tickets' attachments and watch states.
+const uuids = (count: number) => Array.from({ length: count }, (_, index) => `00000000-0000-4000-8000-${String(index).padStart(12, "0")}`);
+
+test("issuesAttachments reads 50 tickets per request, archived ones included; a ticket Linear does not return is absent", async () => {
+  assert.equal(ISSUES_ATTACHMENTS_BATCH, 50);
+  assert.match(ISSUES_ATTACHMENT_URLS_QUERY, /^query issuesAttachmentUrls\(\$ids: \[ID!\]!, \$first: Int!\)/);
+  assert.match(ISSUES_ATTACHMENT_URLS_QUERY, /issues\(first: \$first, includeArchived: true, filter: \{ id: \{ in: \$ids \} \}\)/, "a handed-over ticket is often archived");
+  assert.match(ISSUES_ATTACHMENT_URLS_QUERY, /attachments\(first: 50\) \{ nodes \{ url \} \}/, "the same URLs a single read returns");
+  const ids = uuids(120);
+  const gone = ids[61];
+  const asked: Record<string, unknown>[] = [];
+  const reader: Pick<App, "query"> = {
+    query: (query, variables) => {
+      assert.equal(query, ISSUES_ATTACHMENT_URLS_QUERY);
+      asked.push(variables);
+      return Promise.resolve({ issues: { nodes: (variables.ids as string[]).filter((id) => id !== gone).map((id) => ({ id, attachments: { nodes: [{ url: `https://github.com/o/r/pull/${id.slice(-3)}` }, { url: "" }] } })) } });
+    },
+  };
+  // The app misses one ticket of the second chunk: the key re-reads that chunk, as for issueStatuses.
+  const { linear, keyCalls } = service(reader, (query, variables) => {
+    assert.equal(query, ISSUES_ATTACHMENT_URLS_QUERY);
+    return { issues: { nodes: (variables.ids as string[]).filter((id) => id !== gone).map((id) => ({ id, attachments: { nodes: [] } })) } };
+  });
+  const found = await linear.issuesAttachments([...ids, ids[0]]);
+  assert.deepEqual(asked.map((variables) => ({ first: variables.first, count: (variables.ids as string[]).length })), [{ first: 50, count: 50 }, { first: 50, count: 50 }, { first: 20, count: 20 }], "duplicates are read once");
+  assert.deepEqual(keyCalls, [ISSUES_ATTACHMENT_URLS_QUERY], "only the chunk the app answered incompletely goes to the key");
+  assert.equal(found.has(gone), false, "neither pool returned it: its caller reads it alone");
+  assert.equal(found.size, 119);
+  assert.deepEqual(found.get(ids[0]), ["https://github.com/o/r/pull/000"]);
+  assert.deepEqual(await linear.issuesAttachments([]), new Map(), "no ids, no request");
+  assert.equal(asked.length, 3);
+});
+
+test("issueWatchStates reads 50 tickets' state and labels per request, parsed exactly as issueWatchState", async () => {
+  assert.equal(ISSUES_WATCH_STATES_BATCH, 50);
+  assert.match(ISSUES_WATCH_STATES_QUERY, /^query issuesWatchStates\(\$ids: \[ID!\]!, \$first: Int!\)/);
+  assert.match(ISSUES_WATCH_STATES_QUERY, /issues\(first: \$first, includeArchived: true, filter: \{ id: \{ in: \$ids \} \}\) \{ nodes \{ id state \{ name type \} labels\(first: 50\) \{ nodes \{ id name \} \} \} \}/);
+  const node = (id: string) => ({ id, state: { name: "In Progress", type: "started" }, labels: { nodes: [{ id: "l1", name: "paseo" }, { id: "", name: "broken" }] } });
+  const ids = uuids(51);
+  const asked: Record<string, unknown>[] = [];
+  const { linear, keyCalls } = service({
+    query: (query, variables) => {
+      if (query === ISSUE_WATCH_STATE_QUERY) return Promise.resolve({ issue: node(String(variables.id)) });
+      assert.equal(query, ISSUES_WATCH_STATES_QUERY);
+      asked.push(variables);
+      return Promise.resolve({ issues: { nodes: (variables.ids as string[]).map(node) } });
+    },
+  }, () => { throw new Error("the key must not be used"); });
+  const states = await linear.issueWatchStates(ids);
+  assert.deepEqual(asked.map((variables) => (variables.ids as string[]).length), [50, 1]);
+  assert.equal(states.size, 51);
+  assert.deepEqual(states.get(ids[50]), await linear.issueWatchState(ids[50]), "the same fields as the single read");
   assert.deepEqual(keyCalls, []);
 });
 
