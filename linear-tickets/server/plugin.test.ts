@@ -10,6 +10,7 @@ import type { PaseoApi, PaseoWorkspaceAgentCreateOptions, PaseoWorkspaceCreateOp
 import { buildContext, buildPrompt, issuePage, normalizeIssue, connection, relationships, stateHistorySpans, ticketRelations } from "./context";
 import { Credentials } from "./credentials";
 import { Launcher, safeBranchName } from "./launch";
+import { REPAIR_BUSY_MESSAGE, RepairBusyError, RepairExclusion } from "./repair-exclusion";
 import { DEFAULT_WORKTREE_SHARDS, Settings, MAX_TEMPLATE_LENGTH, normalizeTemplate, DEFAULT_CHEAP_MODELS, DEFAULT_DISPATCH, DEFAULT_WRITEBACK, DEFAULT_WATCHDOG, DEFAULT_STEWARD, DEFAULT_DEPUTY, DEFAULT_ACTIVATION, DEFAULT_BACKSTOP } from "./settings";
 import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
 import { LinearService, postGraphQL, ADD_LABEL_QUERY, CREATE_LABEL_QUERY, LABEL_BY_NAME_QUERY, resolveReviewState, COMMENT_QUERY, ISSUE_DETAIL_QUERY, LIST_ISSUES_QUERY, SEARCH_ISSUES_QUERY, VIEWER_QUERY, TEAM_STATES_QUERY, UPDATE_ISSUE_STATE_QUERY, resolveStartedState, listIssueFilter, type Post, type TeamState } from "./linear";
@@ -719,6 +720,49 @@ test("launch fetches fresh context and starts exactly one agent for concurrent c
   assert.equal(fetches, 1);
   assert.equal(creates, 1);
   await assert.rejects(launcher.start({ ...configured, id: "ENG-99" }, paseo), /already been used/);
+});
+
+test("a launch by identifier blocks every repair until the detail names its ticket, then that ticket's only", async () => {
+  const exclusion = new RepairExclusion();
+  let named!: () => void;
+  // Executor form: the plugin's TypeScript lib predates Promise.withResolvers.
+  const detailRead = new Promise<void>((resolve) => { named = resolve; });
+  let created!: (agent: { id: string }) => void;
+  const creating = new Promise<{ id: string }>((resolve) => { created = resolve; });
+  let creates = 0;
+  const launcher = new Launcher({ ...noMark, detail: async () => { await detailRead; return detail; } });
+  launcher.useExclusion(exclusion);
+  const result = launcher.start(input, mockPaseo(() => { creates++; return creating; }));
+  assert.equal(exclusion.tryRepair("issue-1"), null, "the identifier is not resolved yet: no repair anywhere");
+  assert.equal(exclusion.tryRepair("issue-2"), null);
+  named();
+  while (!creates) await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(exclusion.tryRepair("issue-1"), null, "bound to the ticket's UUID through creation");
+  const other = exclusion.tryRepair("issue-2");
+  assert.ok(other, "another ticket's repair proceeds");
+  other.release();
+  created({ id: "agent-1" });
+  assert.equal((await result).agentId, "agent-1");
+  const after = exclusion.tryRepair("issue-1");
+  assert.ok(after, "released once the launch settled");
+  after.release();
+});
+
+test("a launch during a repair is refused before anything is created, and the same request id starts it afterwards", async () => {
+  const exclusion = new RepairExclusion();
+  let fetches = 0, creates = 0;
+  const launcher = new Launcher({ ...noMark, detail: async () => { fetches++; return detail; } });
+  launcher.useExclusion(exclusion);
+  const paseo = mockPaseo(async () => { creates++; return { id: "agent-1" }; });
+  const repair = exclusion.tryRepair("issue-1");
+  assert.ok(repair);
+  await assert.rejects(launcher.start(input, paseo), (error: unknown) => error instanceof RepairBusyError && error.message === REPAIR_BUSY_MESSAGE);
+  assert.deepEqual([fetches, creates], [0, 0], "refused before the first read");
+  repair.release();
+  const first = await launcher.start(input, paseo);
+  assert.equal(first.agentId, "agent-1");
+  assert.deepEqual(await launcher.start(input, paseo), first, "a retry returns the same result");
+  assert.equal(creates, 1);
 });
 
 test("a saved default prompt template shapes the agent's first prompt", async () => {

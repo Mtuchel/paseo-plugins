@@ -16,7 +16,8 @@ import type { AdmissionState, IssueCore, IssueState, LabeledIssue } from "./line
 import { SessionRouter, SessionStore, type HostOwnership, type SessionLink, type Succession } from "./sessions";
 import { DEFAULT_WORKTREE_SHARDS, DEFAULT_ACTIVATION, DEFAULT_BACKSTOP, DEFAULT_DISPATCH, DEFAULT_WRITEBACK, DEFAULT_WATCHDOG, DEFAULT_STEWARD, DEFAULT_DEPUTY, type PluginSettings } from "./settings";
 import { ResumeUnavailableError, TicketStarter, runningTicketAgents, type Started } from "./starter";
-import { REPAIR_BUSY_MESSAGE, RepairBusyError } from "./repair-exclusion";
+import { REPAIR_BUSY_MESSAGE, RepairBusyError, RepairExclusion } from "./repair-exclusion";
+import type { ParkedPlan } from "./parked";
 import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
 import { ticketProcessLiveness, type ProcessAgent, type ProcessInspector } from "./process-liveness";
 import { WATCHDOG_LABEL, type WatchdogHistory, type WatchdogRequest } from "./watchdog";
@@ -561,7 +562,7 @@ test("a start that fails because the ticket cannot fit in a prompt says so, type
 
 // --- TicketStarter: resume-only never falls back to a fresh agent ------------------------------
 
-function starterHarness(options: { resumeTarget?: ResumeTarget | null; projectKind?: string; resumeFails?: boolean; resumeError?: Error; projectRootPath?: string; branchName?: string } = {}) {
+function starterHarness(options: { resumeTarget?: ResumeTarget | null; projectKind?: string; resumeFails?: boolean; resumeError?: Error; projectRootPath?: string; branchName?: string; repairs?: ConstructorParameters<typeof TicketStarter>[0]["repairs"] } = {}) {
   const launches: { resume?: ResumeTarget }[] = [];
   const branchName = options.branchName ?? "dev";
   const branches = { branches: [{ id: `refs/heads/${branchName}`, label: branchName }], defaultBranch: `refs/heads/${branchName}` };
@@ -575,6 +576,7 @@ function starterHarness(options: { resumeTarget?: ResumeTarget | null; projectKi
       return { agentId: "agent-new", warnings: [] };
     } } as never,
     branches: async () => branches,
+    repairs: options.repairs,
   });
   const paseo = {
     projects: { list: async () => ({ projects: [{ projectId: "p1", projectKind: options.projectKind ?? "git", projectRootPath: options.projectRootPath ?? "/repo", projectDisplayName: "repo" }] }) },
@@ -610,6 +612,23 @@ test("a resume refused because a repair holds the ticket rejects as transient an
     (error: unknown) => error instanceof RepairBusyError && error.message === REPAIR_BUSY_MESSAGE);
   assert.equal(h.launches.length, 1, "the resume was tried once and not replaced by a fresh start");
   assert.ok(h.launches[0].resume, "and it was a resume, not a branch-off");
+});
+
+test("a start while a repair holds the ticket, or while its repaired plan waits parked, is refused as transient and launches nothing", async () => {
+  const exclusion = new RepairExclusion();
+  const plan = (responsibilityRepairId?: string): ParkedPlan => ({ issueId: ISSUE.id, identifier: "TUC-1", agentId: "a1", plan: "# Plan", line: "", reasons: [], model: null, parkedAt: "2026-10-07T12:00:00.000Z", announced: false, ...(responsibilityRepairId ? { responsibilityRepairId } : {}) });
+  const parked: { current: ParkedPlan | null } = { current: null };
+  const h = starterHarness({ repairs: { exclusion, parked: { get: async () => parked.current } } });
+  const start = () => h.starter.start(ISSUE.id, h.paseo, settings, { retryHint: "assign Paseo again" });
+  const repair = exclusion.tryRepair(ISSUE.id);
+  assert.ok(repair);
+  await assert.rejects(start(), RepairBusyError);
+  repair.release();
+  parked.current = plan("r1");
+  await assert.rejects(start(), RepairBusyError, "the owner decides the restored plan first");
+  assert.deepEqual(h.launches, []);
+  parked.current = plan();
+  assert.equal((await start()).agentId, "agent-new", "an ordinary parked plan does not defer the start");
 });
 
 // The resume an activation forwards is continued exactly (starter.ts importedResume): this host
