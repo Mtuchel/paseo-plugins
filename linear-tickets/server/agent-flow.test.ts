@@ -1151,7 +1151,7 @@ test("a legacy standard plan line reads as strong and launches on the launch mod
   const legacy = starterHarness({ creatorId: OWNER, labels: [READY], blockedBy: [] }, 0, APP, false, legacyPlan(2));
   await legacy.starter.start("i1", legacy.paseo, settings, { retryHint: "retry" });
   assert.deepEqual({ provider: legacy.launches[0].provider, labels: legacy.launches[0].labels }, { provider: "omp/opus", labels: { "linear.tier": "strong" } }, "the standard tier was dropped: an in-flight plan keeps the strong model");
-  assert.match(legacy.launches[0].instructions, /implements on the strong model tier.*Worker allocation is slice-specific/s, "the strong tier's note, without an escalation sentence");
+  assert.match(legacy.launches[0].instructions, /implements on the strong model tier.*Worker allocation is slice-specific/s, "the strong tier's note");
   const risky = starterHarness({ creatorId: OWNER, labels: [READY], blockedBy: [] }, 0, APP, false, legacyPlan(3));
   await risky.starter.start("i1", risky.paseo, settings, { retryHint: "retry" });
   assert.deepEqual({ provider: risky.launches[0].provider, labels: risky.launches[0].labels }, { provider: "omp/opus", labels: { "linear.tier": "strong" } }, "impact 3 always implements on the strong tier");
