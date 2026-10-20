@@ -242,6 +242,7 @@ function harness(options: { owner?: (issueId: string) => Promise<"here" | "elsew
     viewer: async () => ({ id: "paseo-app", name: "Paseo" }),
     openSessions: async () => [],
     activities: async () => [],
+    sessionActivities: async () => new Map(),
     sessionStatus: async () => "stale",
     sessionStatuses: async (ids: string[]) => new Map(ids.map((id) => [id, "stale"])),
   };
@@ -795,7 +796,7 @@ test("a mention on a ticket with a running agent is passed to that agent instead
 test("a mention whose webhook never came keeps its text when the sweep adopts the thread, also for a ticket another host handles", async (t) => {
   const received: ActivationRequest[] = [];
   const missed = { id: "s9", status: "pending", createdAt: new Date().toISOString(), creatorId: OWNER, issueId: "i1", identifier: "TUC-1", commentBody: "@paseo Begrenzte Ausnahme" };
-  const api = { activity: async () => {}, updateSession: async () => {}, openSessions: async () => [missed], activities: async () => [], sessionStatus: async () => "pending", sessionStatuses: async () => new Map() };
+  const api = { activity: async () => {}, updateSession: async () => {}, openSessions: async () => [missed], activities: async () => [], sessionActivities: async () => new Map(), sessionStatus: async () => "pending", sessionStatuses: async () => new Map() };
   const h = harness({ manual: true, api: api as never, route: { take: async (request) => { received.push(request); return { peer: "server087" }; } } });
   t.after(h.cleanup);
   await h.router.sweep();
