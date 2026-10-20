@@ -3657,7 +3657,8 @@ async function linearRefused(t: TestContext, agent: Parameters<typeof harness>[1
 test("Linear refusing discovery stops discovery only: every repo still gets its Greptile request and its enqueue pass, and nothing waits for GitHub (TUC-2502 AC-1)", async (t) => {
   const { h, logs } = await linearRefused(t);
   await h.backstop();
-  assert.deepEqual(h.linear.issueReads, ["TUC-2"], "discovery backs off at the first refusal");
+  assert.deepEqual(h.linear.issueReads, ["TUC-2", "TUC-3"], "one batch reads both linkless tickets, and the refusal backs discovery off");
+  assert.deepEqual(h.linear.attachmentBatches, [["TUC-2", "TUC-3"]], "no further attachment read follows the refusal");
   assert.ok(logs.some((line) => line.startsWith(`[linear-tickets] queue backstop discovery for TUC-2 stopped: ${BACKGROUND_PAUSED}`)));
   assert.deepEqual(h.scripts.runs, [`${GREPTILE_REQUEST} --trigger`, READY_RUN, `${GREPTILE_REQUEST} --trigger`, READY_RUN]);
   assert.deepEqual(h.scripts.outage.syncs.map((run) => run.map((found) => [found.repo, found.result])), [[[PLATFORM, "answer"], ["o/other", "answer"]]]);
@@ -4617,6 +4618,7 @@ test("the watchdog resumes an idle agent whose ticket names no repository and no
       },
       linear: {
         issueWatchState: async () => ({ status: "Planning", statusType: "started", labels: [] }),
+        issueWatchStates: async (ids: string[]) => new Map(ids.map((id) => [id, { status: "Planning", statusType: "started", labels: [] }])),
         comment: async () => {}, hasComment: async () => false, viewerId: async () => "me", userUrl: async () => OWNER,
       },
       settings: { read: async () => ({ ...settings, watchdog: DEFAULT_WATCHDOG }) },

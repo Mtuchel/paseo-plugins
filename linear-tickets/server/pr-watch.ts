@@ -284,7 +284,7 @@ type Drop = { key: string; reason: string; repo: string; number: number; draft: 
 type DropKind = "plain" | "conflict" | "main";
 // What one poll or backstop run reads at most once per repo. `owner`: the ticket (issue id) whose
 // record owns a pull request, over every record of this host's files, another host's tickets too.
-type RunContext = { records: HandoverRecord[]; owner(url: string): string | undefined; repo(worktree: string): Promise<string | null>; pulls(repo: string): Promise<OpenPull[]>; drafts(repo: string): Promise<QueueDraft[]>; checkout(repo: string): Promise<string | null>; now: number };
+type RunContext = { records: HandoverRecord[]; owner(url: string): string | undefined; repo(worktree: string): Promise<string | null>; pulls(repo: string): Promise<OpenPull[]>; drafts(repo: string): Promise<QueueDraft[]>; checkout(repo: string): Promise<string | null>; attachments(issueId: string): Promise<string[]>; now: number };
 
 // An open pull request found on a ticket's recorded branch counts for the ticket unless another
 // ticket's record owns it (it moved there, see PullRequestWatch.reconcile): a branch never keeps a
@@ -1218,7 +1218,7 @@ export class PullRequestWatch {
       // running agents' tickets known with one `issueStatuses` read per poll (see crashPass).
       // `reopenToCoding` moves a Done ticket whose stack has not landed back to its coding state
       // (see reopenDone).
-      linear: Pick<LinearService, "moveToStateNamed" | "comment" | "hasComment" | "viewerId" | "userUrl" | "linkUrl" | "issueCore" | "issueAttachments" | "issueStatusAnyPool" | "issueStatuses" | "reopenToCoding">;
+      linear: Pick<LinearService, "moveToStateNamed" | "comment" | "hasComment" | "viewerId" | "userUrl" | "linkUrl" | "issueCore" | "issueAttachments" | "issuesAttachments" | "issueStatusAnyPool" | "issueStatuses" | "reopenToCoding">;
       // `tasks` finds the before-merge tasks of tickets that have no handover record.
       manualTasks?: Pick<ManualTasks, "openBlockers" | "merged" | "awaitingMerge"> & Partial<Pick<ManualTasks, "tasks">>;
       settings: Pick<Settings, "read">;
@@ -1579,10 +1579,32 @@ export class PullRequestWatch {
       }
     };
     const checkout = this.deps.backstop?.checkout ?? new BackstopCheckout();
+    const now = this.deps.backstop?.now?.() ?? Date.now();
+    // The run's linkless tickets read their attachments in one request (discovery and the stack
+    // policy read them, and a poll has many of them): the first reader pays for the batch, every
+    // later one is answered from it. A ticket the batch leaves out (a linked one, or one Linear
+    // did not return) is read alone, once per run. A failed batch fails every reader of this run:
+    // reading each ticket alone instead would send the requests the batch exists to save.
+    // Per run only: every poll and backstop builds a new context, so nothing is carried across.
+    let batch: Promise<Map<string, string[]>> | null = null;
+    const alone = new Map<string, Promise<string[]>>();
+    const attachments = async (issueId: string): Promise<string[]> => {
+      batch ??= this.deps.linear.issuesAttachments([...new Set([...records.filter((record) => this.discoverable(record, now)).map((record) => record.issueId), issueId])]);
+      const found = await batch;
+      const urls = found.get(issueId);
+      if (urls) return urls;
+      let single = alone.get(issueId);
+      if (!single) {
+        single = this.deps.linear.issueAttachments(issueId);
+        alone.set(issueId, single);
+      }
+      return single;
+    };
     return {
       records,
+      attachments,
       owner: (url) => owners.get(pullKey(url)),
-      now: this.deps.backstop?.now?.() ?? Date.now(),
+      now,
       repo: (worktree) => {
         const source = repos.get(worktree) ?? repo(worktree);
         repos.set(worktree, source);
@@ -1696,7 +1718,7 @@ export class PullRequestWatch {
     if (!repo) {
       // Removed worker folders can still have a landed PR attached to the ticket. It supplies
       // only the repo, never the candidate: list what remains open and match the whole ticket.
-      const attachments = await this.deps.linear.issueAttachments(record.issueId);
+      const attachments = await context.attachments(record.issueId);
       const repos = new Set(attachments.flatMap((url) => {
         const source = /^https:\/\/github\.com\/([A-Za-z0-9-]+\/[A-Za-z0-9_.-]+)\/pull\/[1-9]\d*\/?$/.exec(url);
         return source ? [source[1].toLowerCase()] : [];
@@ -1747,7 +1769,7 @@ export class PullRequestWatch {
       const own = ticket.worktree ? await context.repo(ticket.worktree) : null;
       if (own) repos.add(own.toLowerCase());
       if (!repos.size) {
-        const attachments = await this.deps.linear.issueAttachments(ticket.issueId);
+        const attachments = await context.attachments(ticket.issueId);
         for (const url of attachments) {
           const source = /^https:\/\/github\.com\/([A-Za-z0-9-]+\/[A-Za-z0-9_.-]+)\/pull\/[1-9]\d*\/?$/.exec(url);
           if (source) repos.add(source[1].toLowerCase());
@@ -3584,7 +3606,7 @@ export class PullRequestWatch {
       const worktree = record.worktreePath ? await context.repo(record.worktreePath) : null;
       if (worktree) repos.add(worktree.toLowerCase());
       if (!repos.size) {
-        const attached = new Set((await this.deps.linear.issueAttachments(record.issueId)).flatMap((url) => {
+        const attached = new Set((await context.attachments(record.issueId)).flatMap((url) => {
           const source = /^https:\/\/github\.com\/([A-Za-z0-9-]+\/[A-Za-z0-9_.-]+)\/pull\/[1-9]\d*\/?$/.exec(url);
           return source ? [source[1].toLowerCase()] : [];
         }));
