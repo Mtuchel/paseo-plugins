@@ -3032,8 +3032,15 @@ and repairs a ticket that is in none of the five states below with exactly one a
 
 **Acknowledged continuations.** Recovery messages use a stable operation ID stored under
 `linear-tickets/continuations/`. A busy worker leaves the operation `queued`; an independent
-one-minute drain retries it after fresh owner, ticket, worker-generation, process, and PR-veto
-checks. `sent` means the transport acknowledged the message, not that useful work finished.
+one-minute drain retries it after fresh owner, worker-generation, process, and PR-veto checks.
+These retries read nothing from Linear: the ticket's status is read once, inside the ticket gate
+right before the dispatch claim, so a ticket that ended meanwhile still cancels the operation
+without a busy worker spending a Linear request every minute. A new operation for the same worker
+and ticket cancels that worker's older `queued` ones (`superseded by continuation …`): only the
+newest instruction is delivered. An older one whose delivery attempt is running at that moment is
+not interrupted; it is cancelled on its next run if it is still `queued`. `sent` and `unknown`
+operations are never superseded. `sent` means the transport acknowledged the message, not that
+useful work finished.
 `started` requires a matching native user-message marker followed by assistant/tool progress on
 the current transcript branch. Before sending, the operation is durably marked `unknown`;
 after a crash or ambiguous transport failure that operation is reconciled, never blindly resent.

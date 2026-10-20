@@ -84,3 +84,32 @@ test("overlapping plugin instances cannot dispatch the same operation concurrent
     assert.equal((await new Continuations(dir).get(input.operationId))?.status, "sent");
   } finally { release(); await rm(dir, { recursive: true, force: true }); }
 });
+
+test("an older continuation mid-delivery when a newer one arrives is cancelled on its next run, not interrupted", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "continuation-supersede-"));
+  const store = new Continuations(dir);
+  const older = { issueId: "ticket", agentId: "worker", operationId: "nudge-1", text: "first" };
+  let entered!: () => void;
+  let release!: () => void;
+  const started = new Promise<void>((resolve) => { entered = resolve; });
+  const blocked = new Promise<void>((resolve) => { release = resolve; });
+  try {
+    const inFlight = store.run(older, async (_record, save) => {
+      entered();
+      await blocked;
+      await save({ status: "queued", reason: "worker busy" });
+      return { status: "queued" };
+    });
+    await started;
+    assert.equal((await store.run({ ...older, operationId: "nudge-2", text: "second" }, async (record) => record)).status, "queued", "the newer one never waits for the older run");
+    release();
+    await inFlight;
+    assert.equal((await store.get("nudge-1"))?.status, "queued", "the running delivery attempt is not overwritten");
+    let worked = 0;
+    const next = await store.run(older, async (record) => { worked++; return record; });
+    assert.equal(next.status, "cancelled");
+    assert.match(next.reason ?? "", /superseded by continuation nudge-2/);
+    assert.equal(worked, 1);
+    assert.deepEqual((await store.pending()).map((record) => record.operationId), ["nudge-2"]);
+  } finally { release(); await rm(dir, { recursive: true, force: true }); }
+});

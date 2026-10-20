@@ -15,8 +15,12 @@ export type ContinuationRecord = z.infer<typeof schema>;
 
 // One file per stable operation: persist the ambiguous state BEFORE dispatch. A process death
 // never turns an uncertain send back into a queued retry. Callers reconcile the same identity.
+// A new operation for a worker supersedes that worker's older queued (never dispatched) ones on
+// the same ticket: only the newest instruction is delivered, and stale ones stop being retried.
 export class Continuations {
   private readonly active = new Map<string, Promise<ContinuationResult>>();
+  // Older operation → the newer one that superseded it while its own run held the lease.
+  private readonly superseded = new Map<string, string>();
   async pending(): Promise<ContinuationRecord[]> {
     let names: string[];
     try { names = await readdir(this.directory); }
@@ -58,6 +62,13 @@ export class Continuations {
         if (!record) {
           record = { ...input, status: "queued", updatedAt: new Date().toISOString() };
           await this.save(record);
+          await this.supersede(input);
+        }
+        const newer = this.superseded.get(input.operationId);
+        this.superseded.delete(input.operationId);
+        if (newer && record.status === "queued") {
+          record = { ...record, status: "cancelled", reason: `superseded by continuation ${newer}`, updatedAt: new Date().toISOString() };
+          await this.save(record);
         }
         const save = async (result: ContinuationResult) => {
           if (record!.status === result.status && record!.reason === result.reason) return;
@@ -70,6 +81,23 @@ export class Continuations {
     this.active.set(input.operationId, run);
     void run.finally(() => { if (this.active.get(input.operationId) === run) this.active.delete(input.operationId); }).catch(() => {});
     return run;
+  }
+
+  // Never waits for another run (a run may be waiting for the ticket the caller holds): an older
+  // record whose lease is held is marked and cancelled at the start of its next run here, unless it
+  // has left `queued` by then. Sent and unknown records are never touched: their delivery may
+  // already have happened.
+  private async supersede(newer: ContinueOperation): Promise<void> {
+    const older = (await this.pending()).filter((record) => record.status === "queued" && record.operationId !== newer.operationId && record.agentId === newer.agentId && record.issueId === newer.issueId);
+    for (const candidate of older) {
+      const path = this.path(candidate.operationId);
+      const instance = randomUUID();
+      if (!await takeLease(path, instance)) { this.superseded.set(candidate.operationId, newer.operationId); continue; }
+      try {
+        const current = await this.get(candidate.operationId);
+        if (current?.status === "queued") await this.save({ ...current, status: "cancelled", reason: `superseded by continuation ${newer.operationId}`, updatedAt: new Date().toISOString() });
+      } finally { await releaseLease(path, instance); }
+    }
   }
 }
 

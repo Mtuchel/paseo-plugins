@@ -365,6 +365,61 @@ test("unload after saving a dispatch claim preserves a retryable unsent continua
   } finally { h.router.stop(); await h.cleanup(); }
 });
 
+// server087, 2026-10-20: the watchdog queued a new nudge for a busy TUC-2319 worker every ~40
+// minutes; 76 unsent ones stayed queued and each re-read the ticket's Linear status every minute.
+test("a newer continuation for the same worker cancels its unsent older ones; only the newest is delivered", async () => {
+  const worker = ticketAgent("worker", "2026-02-01T00:00:00Z", { status: "running" });
+  const other = ticketAgent("other", "2026-02-01T00:00:00Z", { status: "running", labels: { "linear.issueId": "issue-other", "linear.identifier": "ENG-2" } });
+  const h = routerHarness({ agents: [worker, other], processLiveness: async () => "absent" });
+  const ledger = h.router["continuations"];
+  const old = { issueId: ISSUE.id, agentId: worker.id, operationId: "nudge-1", text: "no progress for 7 minutes" };
+  const elsewhere = { issueId: "issue-other", agentId: other.id, operationId: "nudge-other", text: "other worker" };
+  const newest = { issueId: ISSUE.id, agentId: worker.id, operationId: "nudge-2", text: "no progress for 12 minutes" };
+  try {
+    assert.equal((await h.router.continueOperation(old)).status, "queued");
+    assert.equal((await h.router.continueOperation(elsewhere)).status, "queued");
+    assert.equal((await h.router.continueOperation(newest)).status, "queued");
+    assert.equal((await ledger.get(old.operationId))?.status, "cancelled", "the older unsent nudge is superseded");
+    assert.equal((await ledger.get(elsewhere.operationId))?.status, "queued", "another worker's continuation is untouched");
+    assert.deepEqual((await ledger.pending()).map((record) => record.operationId).sort(), ["nudge-2", "nudge-other"]);
+    worker.status = "idle";
+    assert.equal((await h.router.continueOperation(old)).status, "cancelled");
+    assert.equal((await h.router.continueOperation(newest)).status, "sent");
+    assert.equal(h.daemon.sent.length, 1);
+    assert.match(h.daemon.sent[0], /no progress for 12 minutes/);
+  } finally { h.router.stop(); await h.cleanup(); }
+});
+
+test("a newer continuation never cancels an older one whose delivery is unknown", async () => {
+  const worker = ticketAgent("worker", "2026-02-01T00:00:00Z");
+  const h = routerHarness({ agents: [worker], processLiveness: async () => "absent" });
+  const ledger = h.router["continuations"];
+  const ambiguous = { issueId: ISSUE.id, agentId: worker.id, operationId: "ambiguous", text: "first" };
+  try {
+    h.daemon.state.failSend = true;
+    assert.equal((await h.router.continueOperation(ambiguous)).status, "unknown");
+    h.daemon.state.failSend = false;
+    worker.status = "running";
+    assert.equal((await h.router.continueOperation({ ...ambiguous, operationId: "later", text: "second" })).status, "queued");
+    assert.equal((await ledger.get(ambiguous.operationId))?.status, "unknown");
+  } finally { h.router.stop(); await h.cleanup(); }
+});
+
+test("a busy worker's queued continuation reads no Linear status until it can be dispatched", async () => {
+  const worker = ticketAgent("worker", "2026-02-01T00:00:00Z", { status: "running" });
+  const h = routerHarness({ agents: [worker], processLiveness: async () => "absent" });
+  const input = { issueId: ISSUE.id, agentId: worker.id, operationId: "busy-claim", text: "continue" };
+  try {
+    for (let pass = 0; pass < 3; pass++) assert.equal((await h.router.continueOperation(input)).status, "queued");
+    assert.equal(h.linear.reads.filter((read) => read.startsWith("status ")).length, 0, "retries against a busy worker spend no Linear requests");
+    worker.status = "idle";
+    h.linear.statusType = "completed";
+    assert.equal((await h.router.continueOperation(input)).status, "cancelled", "the dispatch gate still reads the ticket fresh");
+    assert.equal(h.linear.reads.filter((read) => read.startsWith("status ")).length, 1);
+    assert.deepEqual(h.daemon.sent, []);
+  } finally { h.router.stop(); await h.cleanup(); }
+});
+
 // A gate acquired and released proves the ticket's gate is free again (AC-19).
 function assertGateFree(gates: Launcher, issueId = ISSUE.id): void {
   const gate = gates.gate(issueId);
