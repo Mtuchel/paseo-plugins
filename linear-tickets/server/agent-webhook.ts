@@ -1,8 +1,8 @@
-import { createHmac, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { createServer, type Server } from "node:http";
 
 export const WEBHOOK_PORT = 47_831;
-const MAX_BODY_BYTES = 1024 * 1024;
+const MAX_BODY_BYTES = 5 * 1024 * 1024;
 const MAX_AGE_MS = 60_000;
 const SEEN_LIMIT = 500;
 
@@ -15,6 +15,13 @@ export type AgentSessionWebhook = {
   agentActivity?: Record<string, unknown>;
   promptContext?: string;
   guidance?: unknown;
+};
+
+export type ResourceWebhook = {
+  type: "Issue" | "Comment" | "IssueLabel" | "Attachment";
+  action: string;
+  data: Record<string, unknown> & { id: string };
+  updatedFrom?: Record<string, unknown>;
 };
 
 // Linear signs the raw body with HMAC-SHA256 (hex) in `Linear-Signature`, and puts the send
@@ -32,22 +39,20 @@ export function verifyWebhook(body: Buffer, signature: string | undefined, secre
   return payload as Record<string, unknown>;
 }
 
-// Answers Linear within its 5 s budget — 200 as soon as the signature checks out — and
-// hands agent session events to `onEvent` afterwards. Retries of the same delivery are
-// dropped by webhook id.
+// Acknowledge within Linear's 5 s budget. Linear-Delivery identifies a delivery;
+// webhookId identifies the subscription and must never suppress its later events.
 export class AgentWebhookServer {
   private server: Server | null = null;
   private readonly seen = new Set<string>();
   lastEventAt: string | null = null;
-  // Agent session events accepted since the plugin loaded (deduplicated deliveries). The sweep
-  // skips sessions this receiver covers, so this is the delivery rate that saving rests on
-  // (README, "Rate limits").
+  // Accepted agent-session deliveries since load; resource events do not affect session status.
   events = 0;
 
   constructor(
     private readonly secret: () => Promise<string | null>,
     private readonly onEvent: (event: AgentSessionWebhook) => void,
     private readonly port = WEBHOOK_PORT,
+    private readonly onResource: (event: ResourceWebhook) => void = () => {},
   ) {}
 
   start(): Promise<void> {
@@ -64,19 +69,25 @@ export class AgentWebhookServer {
         void (async () => {
           if (request.method !== "POST") { response.writeHead(405).end(); return; }
           const secret = await this.secret();
-          const payload = secret ? verifyWebhook(Buffer.concat(chunks), request.headers["linear-signature"] as string | undefined, secret) : null;
+          const raw = Buffer.concat(chunks);
+          const payload = secret ? verifyWebhook(raw, request.headers["linear-signature"] as string | undefined, secret) : null;
           if (!payload) { response.writeHead(401).end(); return; }
           response.writeHead(200).end();
-          if (payload.type !== "AgentSessionEvent") return;
-          const id = typeof payload.webhookId === "string" ? payload.webhookId : "";
+          const id = typeof request.headers["linear-delivery"] === "string"
+            ? request.headers["linear-delivery"] : createHash("sha256").update(raw).digest("hex");
           if (id) {
             if (this.seen.has(id)) return;
             this.seen.add(id);
             if (this.seen.size > SEEN_LIMIT) this.seen.delete(this.seen.values().next().value as string);
           }
-          this.lastEventAt = new Date().toISOString();
-          this.events += 1;
-          this.onEvent(payload as AgentSessionWebhook);
+          if (payload.type === "AgentSessionEvent") {
+            this.lastEventAt = new Date().toISOString();
+            this.events += 1;
+            this.onEvent(payload as AgentSessionWebhook);
+          } else if (["Issue", "Comment", "IssueLabel", "Attachment"].includes(String(payload.type))
+            && payload.data && typeof payload.data === "object" && typeof (payload.data as Record<string, unknown>).id === "string") {
+            this.onResource(payload as ResourceWebhook);
+          }
         })().catch((error: unknown) => {
           console.error(`[linear-tickets] agent webhook failed: ${error instanceof Error ? error.message : error}`);
           if (!response.headersSent) response.writeHead(500).end();

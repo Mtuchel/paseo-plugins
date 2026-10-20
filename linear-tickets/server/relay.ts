@@ -83,7 +83,7 @@ export function approvalDecision(message: string): AgentPermissionResponse | nul
   return { behavior: "deny", ...(match[2].trim() ? { message: match[2].trim() } : {}) };
 }
 
-// Linear → agent. On every poll, the owner's comments on the issues running ticket agents watch are
+// Linear → agent. The owner's comments on the issues running ticket agents watch are
 // delivered to the agent: as the answer to its pending question, as an approve/deny decision for a
 // pending approval, or as a new message. The agent's reply comes back through turn-summary
 // write-back (or its own comment), so the conversation stays in Linear. A 👀 reaction marks a
@@ -96,10 +96,11 @@ export function approvalDecision(message: string): AgentPermissionResponse | nul
 // "@paseo" comments, replies to Paseo comments and replies in the agent's threads count. Comments the agents and the plugin wrote
 // themselves (agent-records.ts) never count.
 //
-// All watched issues are read in one request (see LinearService.relayComments), each from its own
+// Due watched issues are read in one request (see LinearService.relayComments), each from its own
 // cursor: the creation time of the last comment the relay handled, persisted, so a pause of any
-// length or a restart loses nothing. The cursor only moves past a comment once it is handled; a
-// failed read moves nothing. Reactions are queued (`acks`, persisted with the cursors) and sent
+// length or a restart loses nothing. Verified Comment coverage gates quiet history reads to five
+// minutes; discovery, dirty issues and new readers stay immediate. The cursor only moves past a
+// comment once it is handled; a failed read moves nothing. Reactions are queued (`acks`, persisted with the cursors) and sent
 // when the key has room, so a paused key never makes a comment deliver twice.
 // `agentId`: the issue's primary reader; `threads`: "<comment id>:<agent id>" of its thread readers.
 type Cursor = { agentId: string | null; threads?: string[]; since: string; boundaryIds: string[] };
@@ -107,6 +108,8 @@ type Ack = { commentId: string; issueId: string; emoji: string; reacted: boolean
 // `version` 2: cursors also cover plain comments (no "@paseo").
 type RelayState = { version?: number; cursors: Record<string, Cursor>; acks: Ack[] };
 const STATE_VERSION = 2;
+const COVERED_RECONCILE_MS = 300_000;
+type HistoryRead = { lastSuccess?: number; dirty: boolean };
 
 // Who reads an issue's comments, from `start` on (earlier ones predate the agent, or its thread,
 // or were in its first prompt).
@@ -146,6 +149,10 @@ function routeComment(watch: Watch, comment: RelayComment, plain: boolean, appId
 export class CommentRelay {
   private state: RelayState | null = null;
   private saved = "";
+  // Ephemeral: every restart reads immediately from the durable cursors.
+  private readonly history = new Map<string, HistoryRead>();
+  private polling: Promise<void> | null = null;
+  private pollAgain = false;
   // Issues neither credential could read (deleted, no access); skipped until the plugin restarts.
   private readonly unseen = new Set<string>();
   // The plugin's state directory, where the cursor file and the agents' records live.
@@ -157,7 +164,8 @@ export class CommentRelay {
   // `needsYou`: the open "Needs you" sub-issues, whose replies go to the agent that asked.
   // `route`: activation routing, so a comment for a ticket this host no longer owns goes to the
   // host that owns it instead of being delivered (or reported ❌) here.
-  constructor(private readonly linear: Linear, private readonly path = join(paseoHome(), "linear-tickets", "relay-cursors.json"), private readonly needsYou?: NeedsYouIssues, private readonly route?: ActivationSink, private readonly replies = new PermissionReplies({ directory: dirname(path), daemon: async () => null })) {
+  // `options.covered`: verified Comment webhook coverage; otherwise every poll reads history.
+  constructor(private readonly linear: Linear, private readonly path = join(paseoHome(), "linear-tickets", "relay-cursors.json"), private readonly needsYou?: NeedsYouIssues, private readonly route?: ActivationSink, private readonly replies = new PermissionReplies({ directory: dirname(path), daemon: async () => null }), private readonly options: { covered?: () => boolean } = {}) {
     this.directory = dirname(path);
   }
 
@@ -165,57 +173,139 @@ export class CommentRelay {
     this.deputy = deputy;
   }
 
+  // Called only for signed Comment events. Unknown issues never allocate tracking state.
+  issueChanged(issueId: string): void {
+    const known = this.history.get(issueId);
+    if (!known) return;
+    known.dirty = true;
+    if (this.polling) this.pollAgain = true;
+  }
+
+  // Receiver/transport recovery must catch up now, even after a recent successful read.
+  // Keep durable cursors and queued acknowledgements; only invalidate the in-memory read gate.
+  recover(): void {
+    for (const history of this.history.values()) history.dirty = true;
+    if (this.polling && this.history.size) this.pollAgain = true;
+  }
+
+  // Dispatcher and event callbacks share one flight. Events during a pass are drained before
+  // it resolves; a failed pass leaves its issues dirty for the next call, without a retry loop.
+  poll(paseo: PaseoApi): Promise<void> {
+    if (this.polling) return this.polling;
+    this.polling = (async () => {
+      try {
+        do {
+          this.pollAgain = false;
+          await this.pollOnce(paseo);
+        } while (this.pollAgain);
+      } finally { this.polling = null; }
+    })();
+    return this.polling;
+  }
+
   // Background priority is set here, not left to the dispatch tick that usually calls it: a direct
   // poll (a peer, a test) must pause at the pool's reserve too (see rate-budget.ts).
-  async poll(paseo: PaseoApi): Promise<void> {
+  private async pollOnce(paseo: PaseoApi): Promise<void> {
     await withPriority("background", "comment-relay", async () => {
       const state = await this.load();
+      // A previous cursor save may have failed. Retrying its acknowledgement must not
+      // make the still-due inclusive history read enqueue that delivered comment again.
+      const pendingAtStart = new Set(state.acks.map((ack) => ack.commentId));
       await this.acknowledge(state);
       const linked = await this.linkedAgents(paseo);
       const { watches, written } = await this.watches(linked);
       const active = watches.filter((watch) => !this.unseen.has(watch.issueId));
       const cursors: Record<string, Cursor> = {};
-      for (const watch of active) cursors[watch.issueId] = nextCursor(state.cursors[watch.issueId], watch);
+      for (const watch of active) {
+        const known = state.cursors[watch.issueId];
+        const cursor = cursors[watch.issueId] = nextCursor(known, watch);
+        let history = this.history.get(watch.issueId);
+        if (!history) {
+          history = { dirty: true };
+          this.history.set(watch.issueId, history);
+        }
+        if (!known || cursor.agentId !== known.agentId || cursor.since !== known.since
+          || cursor.threads!.length !== (known.threads?.length ?? 0)
+          || cursor.threads!.some((thread) => !known.threads?.includes(thread))) history.dirty = true;
+      }
+      for (const issueId of this.history.keys()) if (!Object.hasOwn(cursors, issueId)) this.history.delete(issueId);
       state.cursors = cursors;
-      if (active.length) {
-        const viewerId = await this.linear.viewerId();
-        // Reactions are written as the Paseo app (or the owner when the app is not usable, and before
-        // writes moved to the app): either one marks the comment as handled.
-        const appId = await this.linear.appUserId();
-        const plain = appId !== null;
-        const { comments, unseen } = await this.linear.relayComments(viewerId, active.map((watch) => ({ issueId: watch.issueId, since: cursors[watch.issueId].since })), plain);
-        for (const issueId of unseen) this.unseen.add(issueId);
-        for (const watch of active) {
-          const cursor = cursors[watch.issueId];
-          for (const comment of comments.get(watch.issueId) ?? []) {
-            if (comment.createdAt < cursor.since || (comment.createdAt === cursor.since && cursor.boundaryIds.includes(comment.id))) continue;
-            // An @mention of the Paseo app opens (or replies in) an agent session, and so does a reply
-            // in a session's thread; the session webhook delivers those, and relaying them too would
-            // hand the agent the same message twice.
-            const handled = comment.userId !== viewerId
-              || written.has(comment.id)
-              || comment.sessionId !== null
-              || comment.parent?.sessionId != null
-              || comment.reactions.some((reaction) => (reaction.userId === viewerId || (appId !== null && reaction.userId === appId)) && (reaction.emoji === ACK_EMOJI || reaction.emoji === FAILED_EMOJI))
-              || state.acks.some((ack) => ack.commentId === comment.id);
-            // A correction of a deputy answer (a reply to its notice, or "override D-…") goes to the
-            // agent that got that answer, before the comment could answer a newer question.
-            const correction = handled ? null : await this.correction(comment);
-            const route = handled || correction ? null : routeComment(watch, comment, plain, appId);
-            if (correction) state.acks.push({ commentId: comment.id, issueId: watch.issueId, reacted: false, ...correction });
-            if (route) {
-              const outcome = await this.deliver(paseo, route.reader.agent, comment, route.message, watch.issueId);
-              state.acks.push({ commentId: comment.id, issueId: watch.issueId, reacted: false, ...outcome });
+      const covered = this.options.covered?.() ?? false;
+      const now = Date.now();
+      const due = active.filter((watch) => {
+        const history = this.history.get(watch.issueId)!;
+        return !covered || history.dirty || history.lastSuccess === undefined || now - history.lastSuccess >= COVERED_RECONCILE_MS;
+      });
+      // Consume before any await: a notification during the request/handling stays dirty.
+      for (const watch of due) this.history.get(watch.issueId)!.dirty = false;
+      try {
+        if (due.length) {
+          const viewerId = await this.linear.viewerId();
+          // Reactions are written as the Paseo app (or the owner when the app is not usable, and before
+          // writes moved to the app): either one marks the comment as handled.
+          const appId = await this.linear.appUserId();
+          const plain = appId !== null;
+          const { comments, unseen } = await this.linear.relayComments(viewerId, due.map((watch) => ({ issueId: watch.issueId, since: cursors[watch.issueId].since })), plain);
+          for (const issueId of unseen) {
+            this.unseen.add(issueId);
+            this.history.delete(issueId);
+          }
+          for (const watch of due) {
+            const cursor = cursors[watch.issueId];
+            for (const comment of comments.get(watch.issueId) ?? []) {
+              if (comment.createdAt < cursor.since || (comment.createdAt === cursor.since && cursor.boundaryIds.includes(comment.id))) continue;
+              // An @mention of the Paseo app opens (or replies in) an agent session, and so does a reply
+              // in a session's thread; the session webhook delivers those, and relaying them too would
+              // hand the agent the same message twice.
+              const handled = comment.userId !== viewerId
+                || written.has(comment.id)
+                || comment.sessionId !== null
+                || comment.parent?.sessionId != null
+                || comment.reactions.some((reaction) => (reaction.userId === viewerId || (appId !== null && reaction.userId === appId)) && (reaction.emoji === ACK_EMOJI || reaction.emoji === FAILED_EMOJI))
+                || pendingAtStart.has(comment.id)
+                || state.acks.some((ack) => ack.commentId === comment.id);
+              // A correction of a deputy answer (a reply to its notice, or "override D-…") goes to the
+              // agent that got that answer, before the comment could answer a newer question.
+              const correction = handled ? null : await this.correction(comment);
+              const route = handled || correction ? null : routeComment(watch, comment, plain, appId);
+              if (correction) state.acks.push({ commentId: comment.id, issueId: watch.issueId, reacted: false, ...correction });
+              if (route) {
+                const outcome = await this.deliver(paseo, route.reader.agent, comment, route.message, watch.issueId);
+                state.acks.push({ commentId: comment.id, issueId: watch.issueId, reacted: false, ...outcome });
+              }
+              const previousSince = cursor.since;
+              const previousBoundaryIds = cursor.boundaryIds;
+              const previousBoundaryLength = cursor.boundaryIds.length;
+              if (comment.createdAt === cursor.since) cursor.boundaryIds.push(comment.id);
+              else cursor.boundaryIds = [comment.id];
+              cursor.since = comment.createdAt;
+              // Recorded before the reaction: a restart in between must not deliver the comment again.
+              if (route || correction) {
+                try { await this.save(state); }
+                catch (error) {
+                  cursor.since = previousSince;
+                  previousBoundaryIds.length = previousBoundaryLength;
+                  cursor.boundaryIds = previousBoundaryIds;
+                  throw error;
+                }
+              }
             }
-            if (comment.createdAt === cursor.since) cursor.boundaryIds.push(comment.id);
-            else Object.assign(cursor, { since: comment.createdAt, boundaryIds: [comment.id] });
-            // Recorded before the reaction: a restart in between must not deliver the comment again.
-            if (route || correction) await this.save(state);
           }
         }
+        await this.acknowledge(state);
+        await this.save(state);
+        const succeededAt = Date.now();
+        for (const watch of due) {
+          const history = this.history.get(watch.issueId);
+          if (history) history.lastSuccess = succeededAt;
+        }
+      } catch (error) {
+        for (const watch of due) {
+          const history = this.history.get(watch.issueId);
+          if (history) history.dirty = true;
+        }
+        throw error;
       }
-      await this.acknowledge(state);
-      await this.save(state);
     });
   }
 

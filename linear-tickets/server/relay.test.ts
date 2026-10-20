@@ -46,13 +46,14 @@ test("approval replies are recognised, with an optional deny reason; other text 
 type AgentFixture = { id: string; issueId: string; createdAt: string; updatedAt: string; parent?: string; pending?: AgentPermissionRequest[] };
 
 // `appId`: the Paseo app's user, or null when the app is not usable on this host.
-type Fake = { comments: Record<string, RelayComment[]>; appId: string | null; failRead?: Error | null; failReact?: Error | null };
+type Fake = { comments: Record<string, RelayComment[]>; appId: string | null; failRead?: Error | null; failReact?: Error | null; afterRead?: () => Promise<void> };
 
 // A throwaway cursor file per setup; pass `path` to reuse one (a plugin restart).
-function setup(agents: AgentFixture[], comments: Record<string, RelayComment[]>, path = join(mkdtempSync(join(tmpdir(), "relay-")), "cursors.json"), needsYou?: NeedsYouIssues, checked = false) {
+function setup(agents: AgentFixture[], comments: Record<string, RelayComment[]>, path = join(mkdtempSync(join(tmpdir(), "relay-")), "cursors.json"), needsYou?: NeedsYouIssues, checked = false, options: { covered?: () => boolean } = {}) {
   const events: string[] = [];
   const since: string[] = [];
   const reads: number[] = [];
+  const readIssues: string[][] = [];
   const fake: Fake = { comments, appId: APP };
   const linear = {
     async viewerId() { return ME; },
@@ -60,12 +61,14 @@ function setup(agents: AgentFixture[], comments: Record<string, RelayComment[]>,
     // Like Linear: comments at or after each ticket's cursor.
     async relayComments(_userId: string, cursors: { issueId: string; since: string }[]) {
       reads.push(cursors.length);
+      readIssues.push(cursors.map((cursor) => cursor.issueId));
       if (fake.failRead) throw fake.failRead;
       const found = new Map<string, RelayComment[]>();
       for (const cursor of cursors) {
         since.push(`${cursor.issueId}@${cursor.since}`);
         found.set(cursor.issueId, (fake.comments[cursor.issueId] ?? []).filter((item) => item.createdAt >= cursor.since));
       }
+      await fake.afterRead?.();
       return { comments: found, unseen: [] };
     },
     async comment(issueId: string, body: string) { events.push(`comment ${issueId}: ${body}`); },
@@ -103,7 +106,7 @@ function setup(agents: AgentFixture[], comments: Record<string, RelayComment[]>,
       if (needsYou && (await needsYou.all()).some((entry) => entry.id === issueId && entry.agentId === agentId)) await closeAnswered(needsYou, linear, issueId!);
     },
   });
-  return { relay: new CommentRelay(linear, path, needsYou, undefined, replies), paseo, events, since, reads, fake, path, replies, answers, failAnswer: (error: Error) => { answerError = error; } };
+  return { relay: new CommentRelay(linear, path, needsYou, undefined, replies, options), paseo, events, since, reads, readIssues, fake, path, replies, answers, failAnswer: (error: Error) => { answerError = error; } };
 }
 
 const comment = (id: string, body: string, extra: Partial<RelayComment> = {}): RelayComment => ({ id, body, createdAt: `2026-02-01T00:00:0${id.length}Z`, userId: ME, reactions: [], sessionId: null, parent: null, ...extra });
@@ -264,6 +267,235 @@ test("all linked tickets are read in one call, each from its own agent's start",
   await relay.poll(paseo);
   assert.deepEqual(reads, [2]);
   assert.deepEqual(since, ["i1@2026-01-01T00:00:00Z", "i2@2026-01-05T00:00:00Z"]);
+});
+
+test("twenty quiet covered issues skip minute history reads and catch a missed event at five minutes", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: 0 });
+  const agents = Array.from({ length: 20 }, (_, index) => ({ id: `a${index}`, issueId: `i${index}`, createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z" }));
+  const h = setup(agents, {}, undefined, undefined, false, { covered: () => true });
+  t.after(() => rmSync(dirname(h.path), { recursive: true, force: true }));
+  await h.relay.poll(h.paseo);
+  h.fake.comments.i7 = [comment("c1", "missed webhook")];
+  for (let minute = 1; minute < 5; minute++) {
+    t.mock.timers.tick(60_000);
+    await h.relay.poll(h.paseo);
+  }
+  t.mock.timers.tick(59_999);
+  await h.relay.poll(h.paseo);
+  assert.deepEqual(h.reads, [20]);
+  assert.deepEqual(h.events, []);
+  t.mock.timers.tick(1);
+  await h.relay.poll(h.paseo);
+  assert.deepEqual(h.reads, [20, 20]);
+  assert.deepEqual(h.events, ["send a7: missed webhook", "react c1 eyes"]);
+});
+
+test("a covered comment event promptly delivers only that watched issue's owner reply", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: 0 });
+  const question: AgentPermissionRequest = { id: "q", provider: "omp", name: "ask", kind: "question", input: { questions: [{ header: "Response", question: "Format?", options: [{ label: "CSV" }] }] } };
+  const h = setup([
+    { id: "a", issueId: "i1", createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z", pending: [question] },
+    { id: "b", issueId: "i2", createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z" },
+  ], {}, undefined, undefined, true, { covered: () => true });
+  t.after(() => rmSync(dirname(h.path), { recursive: true, force: true }));
+  await h.relay.poll(h.paseo);
+  h.fake.comments.i1 = [comment("c1", "CSV")];
+  h.fake.comments.i2 = [comment("c2", "not notified yet")];
+  h.relay.issueChanged("untracked");
+  h.relay.issueChanged("i1");
+  await h.relay.poll(h.paseo);
+  assert.deepEqual(h.readIssues, [["i1", "i2"], ["i1"]]);
+  assert.deepEqual(h.events, [`respond a q ${JSON.stringify({ behavior: "allow", updatedInput: { answers: { Response: "CSV" } } })}`, "react c1 eyes"]);
+  assert.deepEqual(h.answers, [`a q linear-comment c1 ${ME}`]);
+  h.relay.issueChanged("untracked");
+  await h.relay.poll(h.paseo);
+  assert.deepEqual(h.readIssues, [["i1", "i2"], ["i1"]]);
+});
+
+test("uncovered history reads stay fast by default and immediately resume when coverage is lost", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: 0 });
+  const agent = { id: "a", issueId: "i1", createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z" };
+  let covered = true;
+  for (const options of [{}, { covered: () => covered }]) {
+    covered = true;
+    const h = setup([agent], {}, undefined, undefined, false, options);
+    t.after(() => rmSync(dirname(h.path), { recursive: true, force: true }));
+    await h.relay.poll(h.paseo);
+    h.fake.comments.i1 = [comment("c1", "without a webhook")];
+    covered = false;
+    await h.relay.poll(h.paseo);
+    assert.deepEqual(h.reads, [1, 1]);
+    assert.deepEqual(h.events, ["send a: without a webhook", "react c1 eyes"]);
+  }
+});
+
+test("a failed covered event read retries next poll without moving the durable cursor", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: 0 });
+  const agent = { id: "a", issueId: "i1", createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z" };
+  const h = setup([agent], { i1: [comment("c1", "first")] }, undefined, undefined, false, { covered: () => true });
+  t.after(() => rmSync(dirname(h.path), { recursive: true, force: true }));
+  await h.relay.poll(h.paseo);
+  h.fake.comments.i1.push(comment("c22", "second"));
+  h.relay.issueChanged("i1");
+  h.fake.failRead = new Error("Linear unavailable");
+  await assert.rejects(h.relay.poll(h.paseo), /Linear unavailable/);
+  h.fake.failRead = null;
+  await h.relay.poll(h.paseo);
+  assert.deepEqual(h.reads, [1, 1, 1]);
+  assert.deepEqual(h.since, ["i1@2026-01-01T00:00:00Z", "i1@2026-02-01T00:00:02Z"]);
+  assert.deepEqual(h.events, ["send a: first", "react c1 eyes", "send a: second", "react c22 eyes"]);
+  h.fake.comments.i1.push(comment("c333", "after restart"));
+  const restarted = setup([agent], h.fake.comments, h.path, undefined, false, { covered: () => true });
+  await restarted.relay.poll(restarted.paseo);
+  assert.deepEqual(restarted.events, ["send a: after restart", "react c333 eyes"]);
+});
+
+test("covered discovery reads new watchers and replacement readers immediately", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: 0 });
+  const agents = [{ id: "a", issueId: "i1", createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z" }];
+  const h = setup(agents, {}, undefined, undefined, false, { covered: () => true });
+  t.after(() => rmSync(dirname(h.path), { recursive: true, force: true }));
+  await h.relay.poll(h.paseo);
+  agents.push({ id: "b", issueId: "i2", createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z" });
+  h.fake.comments.i2 = [comment("c1", "new watcher")];
+  await h.relay.poll(h.paseo);
+  agents.push({ id: "new", issueId: "i1", createdAt: "2026-01-02T00:00:00Z", updatedAt: "2026-01-03T00:00:00Z" });
+  h.fake.comments.i1 = [comment("c22", "new reader")];
+  await h.relay.poll(h.paseo);
+  assert.deepEqual(h.readIssues, [["i1"], ["i2"], ["i1"]]);
+  assert.deepEqual(h.events, ["send b: new watcher", "react c1 eyes", "send new: new reader", "react c22 eyes"]);
+});
+
+test("a covered watcher whose new thread moves its cursor back is read immediately", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: 0 });
+  const issueId = "00000000-0000-4000-8000-000000000001";
+  const agents = [{ id: "a", issueId, createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z" }];
+  const h = setup(agents, { [issueId]: [comment("c1", "advance cursor")], other: [comment("c2", "first thread reply", { parent: { id: "p1", userId: ME, sessionId: null } })] }, undefined, undefined, false, { covered: () => true });
+  t.after(() => rmSync(dirname(h.path), { recursive: true, force: true }));
+  const records = join(dirname(h.path), "agent-comments", issueId);
+  mkdirSync(records, { recursive: true });
+  writeFileSync(join(records, "p1.json"), JSON.stringify({ id: "p1", issueId: "other", identifier: "TUC-9", createdAt: "2026-01-03T00:00:00Z" }));
+  await h.relay.poll(h.paseo);
+  h.fake.comments.other[0].reactions = [{ emoji: "eyes", userId: APP }];
+  writeFileSync(join(records, "p2.json"), JSON.stringify({ id: "p2", issueId: "other", identifier: "TUC-9", createdAt: "2026-01-02T00:00:00Z" }));
+  h.fake.comments.other.push(comment("c3", "older thread reply", { createdAt: "2026-01-02T01:00:00Z", parent: { id: "p2", userId: ME, sessionId: null } }));
+  h.fake.comments.other.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  await h.relay.poll(h.paseo);
+  assert.deepEqual(h.readIssues, [[issueId, "other"], ["other"]]);
+  assert.deepEqual(h.events, ["send a: advance cursor", "send a: Reply to your comment on TUC-9: first thread reply", "react c1 eyes", "react c2 eyes", "send a: Reply to your comment on TUC-9: older thread reply", "react c3 eyes"]);
+});
+
+test("concurrent direct polls share one read and drain in-flight covered events before resolving", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: 0 });
+  const h = setup([{ id: "a", issueId: "i1", createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z" }], {}, undefined, undefined, false, { covered: () => true });
+  t.after(() => rmSync(dirname(h.path), { recursive: true, force: true }));
+  await h.relay.poll(h.paseo);
+  let entered!: () => void;
+  let release!: () => void;
+  const reading = new Promise<void>((resolve) => { entered = resolve; });
+  const blocked = new Promise<void>((resolve) => { release = resolve; });
+  h.fake.afterRead = async () => { entered(); await blocked; };
+  h.relay.issueChanged("i1");
+  const pending = h.relay.poll(h.paseo);
+  await reading;
+  const concurrent = h.relay.poll(h.paseo);
+  try {
+    h.fake.comments.i1 = [comment("c1", "arrived during read")];
+    h.relay.issueChanged("i1");
+    h.relay.issueChanged("i1");
+    assert.deepEqual(h.reads, [1, 1], "the concurrent poll must not start a second read");
+  } finally { release(); }
+  await Promise.all([pending, concurrent]);
+  h.fake.afterRead = undefined;
+  assert.deepEqual(h.events, ["send a: arrived during read", "react c1 eyes"]);
+  await h.relay.poll(h.paseo);
+  assert.deepEqual(h.reads, [1, 1, 1]);
+  assert.deepEqual(h.readIssues, [["i1"], ["i1"], ["i1"]]);
+});
+
+test("receiver recovery immediately catches up every known watcher from its durable cursor", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: 0 });
+  const h = setup([
+    { id: "a", issueId: "i1", createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z" },
+    { id: "b", issueId: "i2", createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z" },
+  ], { i1: [comment("c1", "before outage")] }, undefined, undefined, false, { covered: () => true });
+  t.after(() => rmSync(dirname(h.path), { recursive: true, force: true }));
+  await h.relay.poll(h.paseo);
+  h.fake.comments.i1.push(comment("c22", "missed during outage"));
+  h.fake.comments.i2 = [comment("c3", "also missed")];
+  t.mock.timers.tick(60_000);
+  await h.relay.poll(h.paseo);
+  assert.deepEqual(h.events, ["send a: before outage", "react c1 eyes"]);
+  h.relay.recover();
+  await h.relay.poll(h.paseo);
+  await h.relay.poll(h.paseo);
+  assert.deepEqual(h.readIssues, [["i1", "i2"], ["i1", "i2"]]);
+  assert.deepEqual(h.since, ["i1@2026-01-01T00:00:00Z", "i2@2026-01-01T00:00:00Z", "i1@2026-02-01T00:00:02Z", "i2@2026-01-01T00:00:00Z"]);
+  assert.deepEqual(h.events, ["send a: before outage", "react c1 eyes", "send a: missed during outage", "send b: also missed", "react c22 eyes", "react c3 eyes"]);
+});
+
+test("receiver recovery during a read drains a catch-up pass before the poll resolves", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: 0 });
+  const h = setup([{ id: "a", issueId: "i1", createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z" }], {}, undefined, undefined, false, { covered: () => true });
+  t.after(() => rmSync(dirname(h.path), { recursive: true, force: true }));
+  await h.relay.poll(h.paseo);
+  h.fake.afterRead = async () => {
+    h.fake.afterRead = undefined;
+    h.fake.comments.i1 = [comment("c1", "missed before recovery")];
+    h.relay.recover();
+  };
+  h.relay.issueChanged("i1");
+  await h.relay.poll(h.paseo);
+  assert.deepEqual(h.reads, [1, 1, 1]);
+  assert.deepEqual(h.events, ["send a: missed before recovery", "react c1 eyes"]);
+});
+
+test("covered history skips still retry queued acknowledgements without delivering twice", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: 0 });
+  const h = setup([{ id: "a", issueId: "i1", createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z" }], { i1: [comment("c1", "go")] }, undefined, undefined, false, { covered: () => true });
+  t.after(() => rmSync(dirname(h.path), { recursive: true, force: true }));
+  h.fake.failReact = new RateLimitedError("key", Date.now() + 60_000);
+  await h.relay.poll(h.paseo);
+  h.fake.failReact = null;
+  await h.relay.poll(h.paseo);
+  assert.deepEqual(h.reads, [1]);
+  assert.deepEqual(h.events, ["send a: go", "react c1 eyes"]);
+});
+
+test("a covered comment handling failure retries next poll from the unhandled comment", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: 0 });
+  const h = setup([{ id: "a", issueId: "i1", createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z" }], {}, undefined, undefined, false, { covered: () => true });
+  t.after(() => rmSync(dirname(h.path), { recursive: true, force: true }));
+  await h.relay.poll(h.paseo);
+  let fail = true;
+  h.relay.recordDeputy({
+    byRef: async () => null,
+    noticeFor: async () => { if (fail) throw new Error("deputy lookup failed"); return null; },
+    correct: async () => ({ delivered: true, reply: "" }),
+  });
+  h.fake.comments.i1 = [comment("c1", "retry handling")];
+  h.relay.issueChanged("i1");
+  await assert.rejects(h.relay.poll(h.paseo), /deputy lookup failed/);
+  fail = false;
+  await h.relay.poll(h.paseo);
+  assert.deepEqual(h.since, ["i1@2026-01-01T00:00:00Z", "i1@2026-01-01T00:00:00Z", "i1@2026-01-01T00:00:00Z"]);
+  assert.deepEqual(h.events, ["send a: retry handling", "react c1 eyes"]);
+});
+
+test("a failed covered cursor save retries from the durable boundary without redelivering", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: 0 });
+  const h = setup([{ id: "a", issueId: "i1", createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z" }], {}, undefined, undefined, false, { covered: () => true });
+  t.after(() => rmSync(dirname(h.path), { recursive: true, force: true }));
+  await h.relay.poll(h.paseo);
+  h.fake.comments.i1 = [comment("c1", "save must retry")];
+  h.fake.afterRead = async () => { rmSync(h.path); mkdirSync(h.path); };
+  h.relay.issueChanged("i1");
+  await assert.rejects(h.relay.poll(h.paseo));
+  h.fake.afterRead = undefined;
+  rmSync(h.path, { recursive: true });
+  await h.relay.poll(h.paseo);
+  assert.deepEqual(h.since, ["i1@2026-01-01T00:00:00Z", "i1@2026-01-01T00:00:00Z", "i1@2026-01-01T00:00:00Z"]);
+  assert.deepEqual(h.events, ["send a: save must retry", "react c1 eyes"]);
 });
 
 test("a failed read moves no cursor: the next poll delivers everything", async () => {

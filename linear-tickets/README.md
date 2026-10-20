@@ -593,21 +593,40 @@ The app is also the author of everything the plugin and its agents write in Line
 3. Install the app with `actor=app` and the scopes `read,write,app:assignable,app:mentionable`, and store the token response as `token.json` next to it.
    The plugin refreshes it with the refresh token.
 4. Allow Tailscale Funnel for the machine.
+5. After deploying the receiver, configure this host's workspace-resource subscriptions:
+   `node scripts/configure-webhooks.mjs https://<machine>.<tailnet>.ts.net:8443/linear/agent`
+   from `linear-tickets`. This uses the saved workspace-admin API key (or `LINEAR_API_KEY`)
+   and the host's existing app signing secret. It creates or updates only subscriptions labelled
+   `Paseo reconciliation (<clientId>)`: `Issue`, `Comment`, `IssueLabel`, and `Attachment`,
+   for all public teams and separately for each visible private team. Re-running is idempotent.
+   Unrelated subscriptions, OAuth scopes, and app tokens are unchanged. Repeat on each host;
+   a new private team needs another run before its polls can use verified coverage.
 
 The plugin receives webhooks on `127.0.0.1:47831` and publishes only `/linear/agent` on port
 8443 with `tailscale funnel` (never 443). Each webhook is checked for its HMAC signature and a
-timestamp newer than 60 s, answered at once, and deduplicated. The minute sweep is the fallback
-for what a webhook did not deliver: a session Linear has webhooked for is re-read on a 5-minute
-cadence instead of every minute, and a webhook whose read is due pulls that read forward to the
-webhook. A session it never webhooked for, or without one for over 5 minutes, is read every minute
-as before, so a missed webhook costs what the sweep always cost and no reply is missed (see
-[Rate limits](#rate-limits) for what that saves and how it is measured); the sweep also picks up a
-new thread whose `created` webhook never came, pending or already marked stale because this host was
-down when it arrived (up to two hours old, unless the ticket got a newer thread since). It reads the
-`@paseo` comment that opened the thread along with it, so the text reaches the agent or the host
-that handles the ticket as the webhook would have carried it. Ordinary failures skip only the affected sweep
-part or thread. A rate limit stops the part with one pause log; while the app's background budget
-is paused, the whole sweep is skipped until it refills.
+timestamp newer than 60 s, answered at once, and deduplicated by `Linear-Delivery`, not the
+subscription's `webhookId`. Valid resource events wake the affected comment watcher or state
+cache; label-rule events coalesce into an incremental sweep. Local agent/workspace creation
+wakes discovery without waiting for a Linear event.
+
+**Events first; polling reconciles.** Covered comment history and ticket-state reads use a
+five-minute backstop. Coverage requires enabled subscriptions for the resource and every
+visible team, matching this receiver's URL and signing secret, plus fresh transport health.
+The plugin refreshes that evidence with its five-minute health check; stale or failed evidence
+restores the original fast fallback. Native session history uses five minutes after this process
+has accepted a signed agent-session delivery and while transport health remains fresh. Quiet
+sessions stay covered; their lack of recent traffic does not restore minute-by-minute reads.
+Startup reads are immediate. Observed receiver/Funnel recovery invalidates history freshness
+and catches up without resetting durable cursors. A lost event is recovered by reconciliation;
+failed processing never buys another five-minute quiet window.
+
+The minute sweep still discovers threads whose `created` webhook never came, pending or
+already stale because this host was down (up to two hours old, unless the ticket got a newer
+thread since). It reads the `@paseo` comment that opened the thread so the text reaches the
+agent or owning host. Permission handling, queued admission, watchdog/liveness checks,
+dispatch/project polling, plan/manual-task checks, and local-file checks retain their existing
+fast clocks; the whole dispatcher is not slowed. Ordinary failures skip only the affected part
+or thread. A rate limit pauses the affected background work until its pool refills.
 The Paseo Agents menu bar app's **Control panel → Linear agent** shows the state.
 
 **Several hosts.** Each host that runs the plugin installs its own app (for example "Paseo" on the
@@ -3343,9 +3362,12 @@ needs input pink, and anything else, such as In Progress, amber. A workspace who
 different tickets shows the ticket its name carries (`TUC-1: …` or a `tuc-1-…` branch). Otherwise
 it shows the ticket of its oldest agent.
 
-States are read about once a minute in one batched Linear request, on the app's pool like the
-other polled reads. A state the plugin sets itself shows at once, and a new agent's workspace is
-labelled within seconds. The plugin SDK cannot set workspace labels, so this uses the daemon's
+With verified Issue webhook coverage, states reconcile every five minutes in one batched
+Linear request; otherwise they retain their roughly minute cadence. An Issue event invalidates
+only that ticket and triggers a coalesced read within seconds, so out-of-order events cannot
+overwrite the current state with an old payload. A state the plugin sets itself shows at once,
+and a new agent/workspace is labelled within seconds. The plugin SDK cannot set workspace labels,
+so this uses the daemon's
 internal `workspace.label.*` protocol. It connects to the local daemon the way the `paseo` CLI
 does: the address in `$PASEO_HOME/paseo.pid` and `PASEO_PASSWORD` when the daemon needs one.
 A daemon without that API, or a lost connection, is logged once per cause and affects nothing
@@ -3405,10 +3427,12 @@ moved into its group, keeping its issues. A label that already belongs to anothe
 and left out. Linear refuses to group labels that share an issue, so remove one of them from such
 issues first.
 
-Every 2 minutes, the plugin reads the issues updated since the last cycle. Every 30 minutes, or
-while issues are still undecided, it reads all of them. All of this runs at background priority on
-the app's pool. Each change is logged as `label rules: TUC-12 Area/Quality (pull requests)`.
-Editing the file takes effect at the next cycle.
+Issue, IssueLabel, and Attachment events coalesce for two seconds before an incremental sweep.
+With verified coverage for all three, the periodic backstop is five minutes; otherwise, or after
+failed processing, it remains two minutes. Every 30 minutes, or while issues are still undecided,
+the plugin reads all issues. Local rule-file changes are checked each minute and apply without
+waiting for the five-minute backstop. All Linear work runs at background priority on the app's
+pool. Each change is logged as `label rules: TUC-12 Area/Quality (pull requests)`.
 
 ## Rate limits
 
@@ -3481,11 +3505,12 @@ No tokens, query bodies or ticket text appear in the report.
   that payload immediately and deduplicates it against recovery reads. It still lists open
   sessions every minute (one request shared by the sweep's parts) to recover missed `created`
   events. A session's first recovery read remains due at the next sweep: receiving a newer webhook
-  does not prove every earlier message arrived. After a complete successful read, recent webhooks
-  cover the session between the existing five-minute recovery reads. Sessions without webhooks,
-  whose webhooks stopped five minutes ago, or whose recovery read failed keep minute recovery.
-  No blanket five-minute polling slowdown is applied. `linear.agent-status` reports `webhooks`,
-  `sweepReads` and `sweepSkips`; the obsolete `webhookReads` counter is removed.
+  does not prove every earlier message arrived. After a complete successful read, verified native
+  delivery and healthy transport allow five-minute history reconciliation even for quiet sessions.
+  Without that evidence, or after a failed due read, history retains minute recovery. Resource
+  subscriptions separately gate the comment/state/label-rule backstops; neither permissions nor
+  the dispatcher inherit a blanket slowdown. `linear.agent-status` reports `webhooks`,
+  `sweepReads` and `sweepSkips`.
 - **Recovery reads are incremental and prompt-only.** The API filters `type = prompt` and
   `createdAt >= activityReadThrough`, starting from the session's creation time for older links.
   The durable frontier advances only after the complete read has been processed, to the latest
@@ -5301,8 +5326,9 @@ GraphQL response parsing, pagination, context preservation, prompt template rend
 and validation, repository orientation (guide matching, ranking and the cap), credential and
 settings persistence, ticket retrieval, state-transition
 resolution and failure handling, agent creation/retries with mocked Linear and Paseo
-calls, the session sweep's webhook-driven activity reads (skipped while a webhook is fresh, the
-5-minute fallback, the minute sweep without webhooks), the waiting threads' batched status reads
+calls, signed delivery deduplication and coverage scope, quiet covered history and its
+five-minute missed-event recovery, fast uncovered/failure recovery, in-flight invalidation,
+comment acknowledgement persistence, and the waiting threads' batched status reads
 (120 threads in four requests; a session Linear no longer has is dropped and read alone), and the pull request view (CI summaries,
 merge queue parsing, polling cadence, the GitHub budget's reserve and its routed bypass,
 labelling, the stack policy's cap message once per changed stack and its reopen of Done tickets

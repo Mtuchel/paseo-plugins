@@ -28,6 +28,7 @@ import { evaluateWithOmp } from "./server/deputy-evaluator";
 import { hostReaders, recallAccess } from "./server/deputy-sources";
 import { AgentApi, AppAuth } from "./server/agent-app";
 import { AgentWebhookServer, WEBHOOK_PORT } from "./server/agent-webhook";
+import { WebhookCoverage } from "./server/webhook-coverage";
 import { ensureFunnel, type FunnelStatus } from "./server/funnel";
 import { ReviewLinks } from "./server/review-links";
 import { ensureBackendSecret } from "./server/inbox-transport";
@@ -96,6 +97,7 @@ export default function contribute(server: PluginServerContext) {
     await broker.start();
   }).catch(() => { console.error("[linear-tickets] Linear broker initialization failed; agent tools fail closed."); });
   const credentials = new Credentials();
+  const coverage = new WebhookCoverage(credentials);
   // The native Linear agent ("Paseo" app): sessions, webhooks through Tailscale Funnel, and the
   // handover record every agent keeps on its ticket. Without the app installed, only the
   // handover comments and the comment-based paths run. Its token also serves the reads pollers
@@ -185,6 +187,7 @@ export default function contribute(server: PluginServerContext) {
   const usage = new UsageReader();
   const sessions = new SessionRouter({ api: agentApi, linear, starter, handover, launcher, settings, store: sessionStore, parents, needsYou, route, deletions, watchdog: watchdogStore, replies,
     limitResumes: new LimitResumeStore(), usage,
+    webhookCovered: () => coverage.coversAgentSessions(),
     owner: (issueId) => ticketOwner(issueId),
     parentResumeWait: (issueId) => steward ? steward.parentResumeWait(issueId) : Promise.resolve("Parent verification authority is unavailable"),
     recoveryWait: (issueId) => pullRequests.recoveryWait(issueId, issueId),
@@ -262,7 +265,7 @@ export default function contribute(server: PluginServerContext) {
     recoveryWait: (issueId, identifier, urls) => pullRequests.recoveryWait(issueId, identifier, urls),
     intake, doneTickets, labels: new RetiredLabels(), deletions, focus, planned: waitingPlans,
   });
-  const relay = new CommentRelay(linear, undefined, needsYou, route, replies);
+  const relay = new CommentRelay(linear, undefined, needsYou, route, replies, { covered: () => coverage.covers("Comment") });
   const dispatcher = new Dispatcher({ linear, starter, launcher, settings, route, relay, afterLaunch: openSession, handOff: (issueId, openChildren) => sessions.handOffGroup(issueId, openChildren), projects, steward, focus, parked: waitingPlans });
   // The owner's plan feedback and answers, for the weekly decision candidates (README, "Decision candidates").
   const decisions = new DecisionLog();
@@ -445,15 +448,77 @@ export default function contribute(server: PluginServerContext) {
     // The steward's pass, at the end of every poll (steward.ts).
     steward: { pass: async () => { if (steward && attachedPaseo) await steward.tick(attachedPaseo, await settings.read()); }, stop: () => steward?.stop() } });
   const planRequests = new PlanRequests({ linear, prompt: (agentId, text) => sessions.prompt(agentId, text), routes: smallRoutes });
-  const webhook = new AgentWebhookServer(async () => (await auth.credentials())?.webhookSecret ?? null, (event) => asCaller("session-webhook", () => sessions.receive(event)));
+  let commentWake: NodeJS.Timeout | null = null;
+  const wakeComments = () => {
+    if (commentWake) return;
+    commentWake = setTimeout(() => {
+      commentWake = null;
+      if (stopped || !attachedPaseo) return;
+      void settings.read().then(async (value) => {
+        if (value.writeback.mentions) await relay.poll(attachedPaseo!);
+      }).catch((error: unknown) => console.error("[linear-tickets] comment webhook reconciliation failed:", error));
+    }, 200);
+    commentWake.unref?.();
+  };
+  const webhook = new AgentWebhookServer(
+    async () => (await auth.credentials())?.webhookSecret ?? null,
+    (event) => { coverage.noteAgentSession(); asCaller("session-webhook", () => sessions.receive(event)); },
+    WEBHOOK_PORT,
+    (event) => {
+      if (event.type === "Issue") {
+        // Deliveries can arrive out of order; read the current state instead of caching an old payload.
+        stateLabels.issueChanged(event.data.id);
+        if (event.action !== "update" || !event.updatedFrom
+          || ["title", "description", "projectId", "parentId", "labelIds"].some((key) => key in event.updatedFrom!)) labelSync.issueChanged(event.data.id);
+      } else if (event.type === "Comment") {
+        const issue = event.data.issue;
+        const id = typeof event.data.issueId === "string" ? event.data.issueId
+          : issue && typeof issue === "object" && "id" in issue && typeof issue.id === "string" ? issue.id : null;
+        if (id) { relay.issueChanged(id); wakeComments(); }
+      } else if (event.type === "IssueLabel") labelSync.catalogChanged();
+      else if (event.type === "Attachment") {
+        if (typeof event.data.issueId === "string") labelSync.issueChanged(event.data.issueId);
+      }
+    },
+  );
   // Each ticket workspace shows its ticket's Linear state as a workspace label ("Linear: In Review").
-  const stateLabels = new StateLabels({ linear, daemon: async () => { const client = await internalDaemon(); return client ? labelDaemon(client) : null; } });
+  const stateLabels = new StateLabels({ linear, covered: () => coverage.covers("Issue"), daemon: async () => { const client = await internalDaemon(); return client ? labelDaemon(client) : null; } });
   linear.onStateWritten((issueId, state) => stateLabels.noteState(issueId, state));
   // Label groups kept current on every issue of some teams ("Area", "Type"), from label-rules.json.
-  const labelSync = new LabelSync({ linear, pullRequests: new PullRequestFiles() });
+  const labelSync = new LabelSync({ linear, pullRequests: new PullRequestFiles(), covered: () => coverage.covers("Issue") && coverage.covers("IssueLabel") && coverage.covers("Attachment") });
   // The Paseo Agents menu bar's pull request view: polled only while the app asks (README, "Pull request view").
   const pullBoard = new PullRequestBoard();
   let funnel: FunnelStatus | null = null;
+  let transportReady = false;
+  const refreshCoverage = async () => {
+    const app = await auth.credentials();
+    if (!app || !funnel?.active || !funnel.url) {
+      transportReady = false;
+      coverage.setTransport(false);
+      return;
+    }
+    const url = funnel.url;
+    try {
+      const response = await fetch(`http://127.0.0.1:${WEBHOOK_PORT}/`, { method: "POST", body: "{}", signal: AbortSignal.timeout(5_000) });
+      if (response.status !== 401) throw new Error(`The local receiver answered HTTP ${response.status} instead of refusing an unsigned request.`);
+      await coverage.refresh(url, app.webhookSecret).catch((error: unknown) => {
+        console.error("[linear-tickets] workspace webhook coverage could not be verified; retaining fast reconciliation:", error);
+      });
+      coverage.setTransport(true);
+      if (!transportReady) {
+        sessions.reconcile();
+        relay.recover();
+        wakeComments();
+        void stateLabels.recover();
+        void labelSync.sync();
+      }
+      transportReady = true;
+    } catch (error) {
+      transportReady = false;
+      coverage.setTransport(false);
+      throw error;
+    }
+  };
   const health = new HealthMonitor(linear, settings, [
     { name: "Linear API key", run: () => linear.ping() },
     { name: "Paseo Linear app", run: async () => { if (await auth.credentials()) await agentApi.viewer(); } },
@@ -462,11 +527,7 @@ export default function contribute(server: PluginServerContext) {
       funnel = await ensureFunnel(WEBHOOK_PORT);
       if (!funnel.active) throw new Error(funnel.note ?? "Funnel is off; Linear webhooks cannot reach this Mac.");
     } },
-    { name: "Webhook receiver", run: async () => {
-      if (!await auth.credentials()) return;
-      const response = await fetch(`http://127.0.0.1:${WEBHOOK_PORT}/`, { method: "POST", body: "{}", signal: AbortSignal.timeout(5_000) });
-      if (response.status !== 401) throw new Error(`The local receiver answered HTTP ${response.status} instead of refusing an unsigned request.`);
-    } },
+    { name: "Webhook receiver", run: refreshCoverage },
   ]);
   // Started shortly after load (so a reload never leaves Linear's webhooks unanswered) or with the
   // first daemon connection, whichever comes first. Events wait for the connection before they
@@ -489,6 +550,7 @@ export default function contribute(server: PluginServerContext) {
     await webhook.start();
     funnel = await ensureFunnel(WEBHOOK_PORT);
     if (!funnel.active) console.error(`[linear-tickets] Linear agent webhooks are not public: ${funnel.note}`);
+    await refreshCoverage();
     return true;
   }).catch((error: unknown) => {
     console.error(`[linear-tickets] starting the Linear agent receiver failed: ${error instanceof Error ? error.message : error}`);
@@ -597,8 +659,8 @@ export default function contribute(server: PluginServerContext) {
   server.on("agent.permission_requested", (event, { paseo }) => { attach(paseo); return asCaller("writeback.permission-requested", () => writeback.permissionRequested(event, paseo)); });
   server.on("agent.permission_resolved", (event, { paseo }) => asCaller("writeback.permission-resolved", () => writeback.permissionResolved(event, paseo)));
   server.on("agent.archived", (event, { paseo }) => asCaller("writeback.archived", () => writeback.archived(event, paseo)));
-  server.on("agent.created", (_event, { paseo }) => { attach(paseo); asCaller("state-labels", () => stateLabels.soon()); });
-  server.on("workspace.created", (_event, { paseo }) => attach(paseo));
+  server.on("agent.created", (_event, { paseo }) => { attach(paseo); asCaller("state-labels", () => stateLabels.soon()); wakeComments(); });
+  server.on("workspace.created", (_event, { paseo }) => { attach(paseo); asCaller("state-labels", () => stateLabels.soon()); wakeComments(); });
   server.before("agent.session_open", async ({ request }, { paseo }) => {
     attach(paseo);
     const browser = await plannotatorHook();
@@ -775,6 +837,8 @@ export default function contribute(server: PluginServerContext) {
   planningSmoke.start();
   return async () => {
     stopped = true;
+    clearTimeout(commentWake ?? undefined);
+    coverage.setTransport(false);
     clearInterval(controlTimer);
     watchdog.stop();
     steward?.stop();
