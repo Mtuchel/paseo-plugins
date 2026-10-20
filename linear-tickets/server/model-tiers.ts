@@ -110,10 +110,10 @@ export function tierNote(tier: Tier, plan: { strongSteps: string | null; accepta
   if (tier === "strong") return `This ticket implements on the strong model tier (its plan's \`## ${MODEL_SECTION}\` section or the ticket's \`model:strong\` label). ${workerDelegationNote()}`;
   return [
     "This ticket implements on the cheap model tier (its plan's `## Model` section): you run on a fast, inexpensive model, and the approved plan is what settles your steps.",
-    plan?.strongSteps ? `Strong steps: ${plan.strongSteps}. Hand each of them to a subagent on the strong model (in omp: the \`task\` tool with \`model: "@slow"\`, which the plugin's extension runs on the launch's strong model), with its slice-specific reason, and integrate the result yourself. The strong model implements exactly those steps, never the mechanical remainder.` : "",
-    plan?.acceptanceTests?.length ? `Your plan's acceptance tests (${plan.acceptanceTests.join(", ")}) are written first, by the strong model: hand a subagent on the strong model the job of writing them failing from the plan's acceptance criteria, then make them pass and do not edit them yourself (the omp extension blocks a cheap agent's edits to those files; \`${ESCALATE_TOOL}\` lifts the block).` : "",
+    plan?.strongSteps ? `Strong steps: ${plan.strongSteps}. Call \`${ESCALATE_TOOL}\` with each step's slice-specific reason and wait for the plugin's confirmed switch to the strong model, then do those steps yourself and keep them; the installed omp \`task\` tool accepts a model override only for \`seance\` historical consults, so hand only the settled implementation to cheap workers.` : "",
+    plan?.acceptanceTests?.length ? `Your plan's acceptance tests (${plan.acceptanceTests.join(", ")}) are written first, by the strong model: call \`${ESCALATE_TOOL}\`, wait for the confirmed switch, write them failing yourself from the plan's acceptance criteria, then make the implementation pass them without editing them (the omp extension blocks a cheap agent's edits to those files).` : "",
     workerDelegationNote(),
-    `Call \`${ESCALATE_TOOL}\` with the reason when the same check still fails after two honest fix attempts, the work needs judgment the plan did not settle, or a review finds a design problem; the plugin then switches you to the strong model.`,
+    `Call \`${ESCALATE_TOOL}\` with the reason when the same check still fails after two honest fix attempts, the work needs judgment the plan did not settle, or a review finds a design problem; the plugin then switches you to the strong model. Wait for the confirmed switch, keep the strong work and the acceptance tests, and hand the settled implementation to cheap workers.`,
   ].filter(Boolean).join(" ");
 }
 
