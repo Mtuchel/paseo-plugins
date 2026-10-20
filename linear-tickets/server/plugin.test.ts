@@ -18,6 +18,7 @@ import { LinearBroker } from "./linear-broker";
 import { rateBudget, RateBudget, RateLimitedError, withPriority } from "./rate-budget";
 import { linearUsage } from "./linear-usage";
 import { PlannotatorHost } from "./parked";
+import { DecisionJournal } from "./decision-journal";
 import { ReviewLinks } from "./review-links";
 import { agentStatusRpc, cachedOverviewRpc, countIssuesRpc, listIssuesRpc, searchIssuesRpc, setSettingsRpc } from "../shared/contracts";
 
@@ -84,6 +85,27 @@ test("agent status reports each credential's dimensions, pause and hourly caller
   assert.equal(key.points?.limit, 3_000_000);
   assert.deepEqual(result.budget.hours.find((entry) => entry.pool === "app")!.callers, [{ caller: "app decision", requests: 1, points: 12 }]);
   assert.deepEqual(result.budget.hours.find((entry) => entry.pool === "key")!.callers, [{ caller: "key decision", requests: 1, points: 12 }]);
+});
+
+test("shutdown closes repair admission and drains every effect and repair before the decision journal releases its lease", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
+  t.mock.method(ReviewLinks.prototype, "start", async () => {});
+  t.mock.method(PlannotatorHost.prototype, "start", async () => {});
+  t.mock.method(LinearBroker.prototype, "start", async () => {});
+  const order: string[] = [];
+  // Executor form: the plugin's TypeScript lib predates Promise.withResolvers.
+  let drained!: () => void;
+  const draining = new Promise<void>((resolve) => { drained = resolve; });
+  t.mock.method(RepairExclusion.prototype, "closeAdmission", () => { order.push("close admission"); });
+  t.mock.method(RepairExclusion.prototype, "drain", async () => { order.push("drain"); await draining; order.push("drained"); });
+  t.mock.method(DecisionJournal.prototype, "stop", async () => { order.push("journal stop"); });
+  const cleanup = contribute({ handle() {}, on() { return () => {}; }, before() { return () => {}; } } as unknown as PluginServerContext);
+  const stopping = cleanup();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(order, ["close admission", "drain"], "the lease waits for the drain");
+  drained();
+  await stopping;
+  assert.deepEqual(order, ["close admission", "drain", "drained", "journal stop"]);
 });
 
 function mockFetch(t: TestContext, makeResponse: () => Response): void {
