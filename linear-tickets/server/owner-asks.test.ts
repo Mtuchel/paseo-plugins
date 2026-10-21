@@ -723,6 +723,17 @@ test("a manual label alone does not make unresolved extraction urgent human work
     [{ kind: "manual", attention: "info", extracted: false, source: "Use the existing scoped staging role." }]);
 });
 
+test("a manual issue label cannot turn an extracted business choice or report into a personal step", async t => {
+  for (const kind of ["decision", "manual", "info"] as const) {
+    const h = await setup({ issues: [issue({ labels: ["paseo-manual"] })],
+      extraction: async () => ({ ok: true, value: { kind, summary: "Current source", questions: kind === "decision" ? [{ key: "q1", question: "Choose the commercial rate?", options: [], multiSelect: false }] : [] } }) });
+    t.after(() => h.ownerAsks.stop());
+    const current = await untilAsk(h, ask => ask.extracted);
+    assert.equal(current.kind, kind);
+    assert.deepEqual(current.questions.map(question => question.question), kind === "decision" ? ["Choose the commercial rate?"] : []);
+  }
+});
+
 test("overlapping menu reads share work but explicit refresh and owner-action invalidation read current sources", async t => {
   const h = await setup({ issues: [issue({ title: "Original scope" })] });
   h.ownerAsks.stop();

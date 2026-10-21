@@ -204,6 +204,35 @@ test("partial peer coverage is republished before the normal snapshot cache expi
   }, { refreshMs: 30_000, probeDeadlineMs: 10_000, snapshotDeadlineMs: 10_000 });
 });
 
+test("a live frontdoor cannot renew an old decision count merely by capturing another snapshot", async () => {
+  let clock = Date.parse("2026-10-21T15:00:00Z");
+  const evidenceAt = new Date(clock).toISOString();
+  const fake = await fakeBackend();
+  fake.settings.hold = (request, response) => {
+    if (request.path !== "/_inbox/snapshot") return false;
+    response.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({
+      protocolVersion: 1, instanceId: fake.settings.instance, capturedAt: new Date(clock).toISOString(),
+      inbox: inboxView(), decisions: { ...decisionView(),
+        hosts: [{ host: "laptop", asks: [], live: [], history: [], updatedAt: evidenceAt, error: null }],
+        summary: { decisions: 0, actions: 0, unverified: 0, complete: true, checkedAt: evidenceAt, reasons: [] } },
+    }));
+    return true;
+  };
+  await withFrontdoor(fake, async frontdoor => {
+    const first = jsonBody((await call(frontdoor.port, "GET", "/api/decisions")).text);
+    assert.equal(jsonBody(JSON.stringify(first.summary)).complete, true);
+    clock += 930_001;
+    const expired = jsonBody((await call(frontdoor.port, "GET", "/api/decisions")).text);
+    assert.equal((expired.availability as InboxAvailability).stale, false, "transport is healthy, not evidence freshness");
+    const summary = jsonBody(JSON.stringify(expired.summary));
+    assert.equal(summary.complete, false);
+    assert.match(JSON.stringify(summary.reasons), /collection is stale/);
+    fake.settings.state = "starting";
+    const unavailable = jsonBody((await call(frontdoor.port, "GET", "/api/decisions")).text);
+    assert.equal(jsonBody(JSON.stringify(unavailable.summary)).complete, false);
+  }, { now: () => new Date(clock), probeMs: 60_000, refreshMs: 30_000 });
+});
+
 test("close drains an admitted snapshot read before its cache can be removed", async () => {
   const fake = await fakeBackend();
   let captured!: (response: ServerResponse) => void;

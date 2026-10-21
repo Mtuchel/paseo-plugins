@@ -1,6 +1,7 @@
 import type { InboxAvailability } from "./inbox-transport";
 import type { DecisionView } from "../shared/decision-inbox";
 import { groupRowsByTicket } from "./decision-groups";
+import { decisionBucket, questionBundle, summarizeDecisions } from "../shared/decision-summary";
 
 // Scoped extension of the review inbox: Apple system light/dark, Operate mode.
 // The browser owns transient drafts only; the API owns revisions and delivery receipts.
@@ -226,6 +227,7 @@ const CLIENT = String.raw`
     if (unavailable()) return availabilityReason();
     if (refreshError) return 'Refresh failed. This source has not been checked. Refresh before sending.';
     if (view.curation?.error) return 'Collection failed. Displayed tasks may be stale; wait for a successful collection before sending.';
+    if (row.target === 'owner' && row.data.mirrorsLiveRequest && bucket(row) === 'review') return 'This source no longer matches an exact current live question. Inspect the original ticket or agent before answering; a newer question is not this round.';
     if (row.data.deliveryUnknown) return 'Delivery for this source is unconfirmed. Inspect the original ticket or agent; do not send another answer.';
     if (!host || view.unreachable.includes(row.host)) return 'This host is unavailable. Its displayed source may be stale; actions are paused.';
     if (row.target === 'owner' && row.host !== view.canonicalHost) return 'The canonical owner-ask host changed. Select the current canonical ask before acting.';
@@ -347,6 +349,7 @@ const CLIENT = String.raw`
     const unresolved = retained.filter(row => row.target === 'owner' && !row.data.extracted).length;
     const expanded = element.querySelector('#source-coverage')?.open;
     element.innerHTML = (warnings.length ? '<b>Incomplete or stale coverage</b>' + warnings.map(text => '<p>' + escape(text) + '</p>').join('') : '') + status +
+      (summarizeDecisions(view).unverified ? '<p>Some current requests still need question or delivery verification; they are in source review, not the decision badge.</p>' : '') +
       '<details id="source-coverage"' + (expanded ? ' open' : '') + '><summary>' + retained.length + ' source tasks · ' + unresolved + ' unresolved' + (withheld ? ' · ' + withheld + ' sources to review' : '') + ' · coverage</summary>' + sources +
       '<p>Collected every 15 minutes, even with this page closed. Retained after exact-source deduplication and confirmed answers; includes waits and unresolved extraction, not just immediately actionable decisions.</p>' +
       (view.canonicalHost ? '<p>Canonical Linear source: ' + escape(view.canonicalHost) + '</p>' : '') +
@@ -371,6 +374,10 @@ const CLIENT = String.raw`
   // rows. A single-member group renders exactly like an ungrouped row. The function is embedded
   // from server/decision-groups.ts, which keeps its source self-contained for this.
   const groupRowsByTicket = ${groupRowsByTicket.toString()};
+  const decisionBucket = ${decisionBucket.toString()};
+  const questionBundle = ${questionBundle.toString()};
+  const summarizeDecisions = ${summarizeDecisions.toString()};
+  const bucket = row => decisionBucket({...row, live:view.hosts.find(host => host.host === row.host)?.live || []});
   function groupRow(group, open) {
     if (group.rows.length === 1) return queueRow(group.rows[0]);
     const first = group.rows[0];
@@ -383,9 +390,15 @@ const CLIENT = String.raw`
     const terms = search.value.trim().toLocaleLowerCase().split(/\s+/).filter(Boolean);
     const matches = row => terms.every(term => JSON.stringify([row.host, row.data]).toLocaleLowerCase().includes(term));
     const all = rows();
+    // Canonical counting and source rendering are separate. Filtering never changes the
+    // global badge, and local confirmations cannot leave an already answered round in it.
+    const active = new Set(all.filter(row => !row.paged).map(row => JSON.stringify([row.host, row.target, row.id, row.revision])));
+    const summary = summarizeDecisions({...view, tasks:(view.tasks || all.filter(row => !row.paged).map(row => ({host:row.host,target:row.target,id:row.id,revision:row.revision,priority:priority(row)}))).filter(task => active.has(JSON.stringify([task.host,task.target,task.id,task.revision])))});
+    const countCurrent = summary.coverageComplete && !unavailable() && !refreshError;
     const groups = [
-      ['Needs your decision', all.filter(row => priority(row) === 'owner'), true],
-      ['Needs source review', all.filter(row => priority(row) === 'review'), false],
+      ['Needs your decision', all.filter(row => !row.paged && bucket(row) === 'decisions'), true],
+      ['Personal actions', all.filter(row => !row.paged && bucket(row) === 'actions'), true],
+      ['Needs source review', all.filter(row => row.paged || bucket(row) === 'review'), false],
       ['Research, delegated & other waits', all.filter(other), true],
       ['Recent receipts', receipts(), false]
     ];
@@ -413,11 +426,12 @@ const CLIENT = String.raw`
       }
       if (grouped) {
         const tickets = groupRowsByTicket(filtered);
-        // The count is tickets, not sources; the source count appears only when a ticket carries
-        // more than one source. With a search, "of N" stays the unfiltered ticket count.
-        return '<section class="queue-section"><h2>' + title + '<span class="count">' + tickets.length +
-          (terms.length ? ' of ' + groupRowsByTicket(items).length : '') +
-          (tickets.length < filtered.length ? ' · ' + filtered.length + ' sources' : '') + '</span></h2>' +
+        const counted = title === 'Needs your decision' ? summary.decisions : title === 'Personal actions' ? summary.actions : null;
+        const label = counted === null ? tickets.length + ' tickets' : !countCurrent ?
+          view.hosts.length ? '? · ' + counted + ' in last snapshot' : '? · not yet collected' :
+          title === 'Needs your decision' && summary.unverified ? counted + ' verified · ' + summary.unverified + ' to verify' : String(counted);
+        return '<section class="queue-section"><h2>' + title + '<span class="count">' + label +
+          (terms.length ? ' · ' + filtered.length + ' matching sources' : '') + '</span></h2>' +
           (tickets.length ? '<ul class="list">' + tickets.map(group => groupRow(group, group.rows.some(row => (selectedKey && key(row) === selectedKey) || (focused && key(row) === focused)))).join('') + '</ul>' : '<p class="empty">' + empty + '</p>') + '</section>';
       }
       return '<section class="queue-section"><h2>' + title + '<span class="count">' + filtered.length + (terms.length ? ' of ' + items.length : '') + '</span></h2>' +

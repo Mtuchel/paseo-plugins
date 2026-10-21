@@ -7,6 +7,7 @@ import type { AgentPermissionRequest, AgentPermissionResponse } from "@getpaseo/
 import { z } from "zod";
 import { askQuestionSchema, decisionReceiptSchema, type DecisionReceipt } from "../shared/contracts";
 import { browserOwnerAskSchema, decisionHostSchema, isSourceReview, liveDecisionSchema, recoveryTicketPageSchema, recoveryTicketSchema, SOURCE_REVIEW_PAGE_LIMIT, SOURCE_REVIEW_PAGE_MAX, sourceReviewPageSchema, type BrowserDecisionAction, type DecisionHost, type DecisionView, type LiveDecision, type RecoveryTicketPage, type StewardFlow } from "../shared/decision-inbox";
+import { summarizeDecisions } from "../shared/decision-summary";
 import type { ActivationRoute } from "./activation";
 import { decisionPage } from "./decision-page";
 import type { OwnerAsks, OwnerAskSnapshot } from "./owner-asks";
@@ -364,7 +365,8 @@ export class BrowserDecisionInbox {
               seenRequests.add(key);
               const currentRevision = revision(request);
               const deferred = deferrals.deferrals[key];
-              const activity = Object.values(records).filter(record => record.ref.startsWith(PREFIX) && record.agentId === agent.id
+              // Checked replies from Linear, native and browser bind the same exact round.
+              const activity = Object.values(records).filter(record => record.agentId === agent.id
                 && record.requestId === request.id && record.request && revision(record.request) === currentRevision);
               if (activity.some(record => record.status === "applied")) continue;
               const deliveryUnknown = activity.some(record => ["reserved", "submitted", "unconfirmed", "sent", "unchecked"].includes(record.status));
@@ -386,7 +388,7 @@ export class BrowserDecisionInbox {
         } while (cursor);
       } catch (error) { errors.push(`Live agents incomplete: ${reasonOf(error)}`); }
     }
-    const receipts = Object.values(records).filter((record) => record.ref.startsWith(PREFIX) && record.request).map((record): DecisionReceipt => ({
+    const receipts = Object.values(records).filter((record) => record.request && (record.ref.startsWith(PREFIX) || record.responder.kind === "owner")).map((record): DecisionReceipt => ({
       id: record.ref, issueId: record.issueId ?? `agent:${record.agentId}`, identifier: record.agentId, revision: revision(record.request!),
       action: record.intent ? (record.text.startsWith("Research only:") ? "research" : "delegate") : "answer",
       text: record.text, at: record.at, delivery: record.status,
@@ -546,7 +548,8 @@ export class BrowserDecisionInbox {
       view = await this.transportFlight;
     }
     if (generation !== this.ownerGeneration) return this.view();
-    return { ...view, tasks: curateDecisions(view, this.now()), curation: this.curation.current().curation };
+    const current = { ...view, tasks: curateDecisions(view, this.now()), curation: this.curation.current().curation };
+    return { ...current, summary: summarizeDecisions(current, this.now()) };
   }
 
   private async collectView(collectOwners = true): Promise<DecisionView> {
@@ -680,8 +683,8 @@ export class BrowserDecisionInbox {
     const agent = (await paseo.agents.ref(input.agentId!).refresh())?.agent;
     const request = agent?.archivedAt ? undefined : agent?.pendingPermissions?.find((pending) => pending.id === input.requestId);
     if (!request || revision(request) !== input.revision) throw new InboxError(409, "This live request changed or is no longer waiting. Refresh the inbox; nothing was delivered.");
-    const prior = Object.values(await this.deps.replies.records()).filter(record => record.ref.startsWith(PREFIX)
-      && record.agentId === input.agentId && record.requestId === input.requestId && record.request && revision(record.request) === input.revision);
+    const prior = Object.values(await this.deps.replies.records()).filter(record => record.agentId === input.agentId
+      && record.requestId === input.requestId && record.request && revision(record.request) === input.revision);
     if (prior.some(record => record.status === "applied")) throw new InboxError(409, "This exact request already has a confirmed response. Refresh for the next round; nothing was delivered.");
     if (prior.some(record => ["reserved", "submitted", "unconfirmed", "sent", "unchecked"].includes(record.status))) throw new InboxError(502, "Delivery for this exact request is unconfirmed. Inspect the agent before taking another action; nothing was retried.", true);
     if (input.operation === "triage" && (input.action === "defer" || input.action === "reopen")) {

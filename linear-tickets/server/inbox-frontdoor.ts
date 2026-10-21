@@ -8,6 +8,7 @@ import { backendSecretPath, headerValue, INBOX_AUTH_HEADER, INBOX_BACKEND_PORT, 
 import { closedPage, inboxPage, MANIFEST, SERVICE_WORKER, type InboxView } from "./review-page";
 import { REVIEW_ICON_PNG } from "./review-icon";
 import type { DecisionView } from "../shared/decision-inbox";
+import { summarizeDecisions } from "../shared/decision-summary";
 import { mergeStatusSchema } from "../shared/merge-status";
 
 // The persistent inbox frontdoor (README, "Inbox transport"): a stand-alone process, supervised by
@@ -362,7 +363,14 @@ class Frontdoor implements InboxFrontdoor {
       const view: DecisionView = this.cache?.snapshot.decisions ?? { hosts: [], canonicalHost: null, unreachable: [] };
       // Availability metadata sits beside the view's own fields, never inside a host object: the
       // existing clients and the strict peer schemas keep their shape.
-      return json(200, { ...view, availability: this.availability() });
+      const availability = this.availability();
+      const summary = summarizeDecisions(view, this.now().getTime());
+      if (availability.stale || availability.readOnly || availability.backendState !== "ready") {
+        summary.complete = false;
+        summary.coverageComplete = false;
+        summary.reasons.push(availability.reason || "The inbox backend is not ready.");
+      }
+      return json(200, { ...view, summary, availability });
     }
     // Source review pages and recovery evidence are read live from the backend with their query,
     // never from the snapshot: only the owning host can answer them (decision-inbox.ts).
