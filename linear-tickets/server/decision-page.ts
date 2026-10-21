@@ -14,6 +14,9 @@ const STYLE = `
 @media(max-width:899px){.shell{display:block;min-height:100dvh}.queue{border-right:0}.detail{padding:20px max(18px,env(safe-area-inset-right)) 48px max(18px,env(safe-area-inset-left));min-height:100dvh}.detail:not(.show){display:none}.shell.detail-open .queue{display:none}.back{display:inline-block}.queue-header{padding-top:calc(20px + env(safe-area-inset-top))}.detail-nav{margin-bottom:20px}.context{grid-template-columns:1fr;gap:4px}.context dd{margin-bottom:10px}}
 @media(prefers-reduced-motion:no-preference){.row{transition:background-color 160ms ease-out}.notice{animation:notice-in 180ms ease-out}@keyframes notice-in{from{background-color:var(--chip)}to{}}}
 @media(prefers-color-scheme:dark){button.primary{color:#001b38}}
+.merge-status{width:100%;max-width:1440px;margin:0 auto;padding:16px 24px;border-bottom:1px solid var(--line);background:var(--card);overflow-wrap:anywhere}.merge-status.warning{background:var(--warn-bg)}.merge-status h2{margin:0;font-size:1.0625rem;line-height:1.4}.merge-status .merge-meta{margin:6px 0 0;font-size:.8125rem;color:var(--sub)}.merge-status ul{list-style:none;padding:0;margin:12px 0 0}.merge-blocker{padding:12px 0;border-top:1px solid var(--line);font-size:.875rem}.merge-blocker p{margin:4px 0}.merge-blocker .links{margin-top:4px;gap:8px 18px}.merge-blocker a{display:inline-flex;align-items:center;min-height:44px}.merge-phase{font-weight:600;color:var(--sub)}.merge-status a:focus-visible{outline:3px solid var(--tint);outline-offset:3px;border-radius:2px}
+@media(min-width:900px){body{height:100dvh;display:flex;flex-direction:column}.merge-status{flex-shrink:0;max-height:45dvh;overflow-y:auto}.shell{width:100%;height:auto;min-height:0;flex:1}}
+@media(max-width:899px){.merge-status{padding:calc(16px + env(safe-area-inset-top)) max(18px,env(safe-area-inset-right)) 12px max(18px,env(safe-area-inset-left))}.shell{min-height:0}}
 `;
 
 const CLIENT = String.raw`
@@ -23,6 +26,8 @@ const CLIENT = String.raw`
   let availabilityError = '', recoveryPending = false;
   let selected = null, selectedSnapshot = null, stale = false, busy = false, refreshing = false;
   let refreshError = '', lastUpdated = Date.now(), readingTimer = 0;
+  let retainedMerge = null;
+  let renderedMerge = null;
   const drafts = new Map(), results = new Map(), completed = new Set(), uncertain = new Set();
   // Withheld nonurgent source reviews never ship in the feed: they arrive here in server pages,
   // browsed, searched and answered like any owner ask. reviewQuery is the query the loaded
@@ -274,7 +279,43 @@ const CLIENT = String.raw`
         : tickets.length < total ? '<p class="empty">The remaining tickets are read from their host when this section is open.</p>' : '') +
       '</details>';
   }
+  function mergeStatus() {
+    const source = view.hosts.find(host => host.host === view.canonicalHost);
+    if (retainedMerge && view.canonicalHost && retainedMerge.host !== view.canonicalHost) retainedMerge = null;
+    const received = source?.mergeStatus;
+    // A restarted collector may have no successful read yet. Retain the last complete inventory
+    // until another successful snapshot arrives; still show the current collection error below.
+    if (received && Number.isFinite(Date.parse(received.checkedAt || '')) && (!received.error || !retainedMerge)) {
+      retainedMerge = {host: source.host, status: received};
+    }
+    const status = retainedMerge?.status;
+    const blockers = status?.blockers || [];
+    const warnings = [];
+    if (!source?.mergeStatus) warnings.push('Canonical merge status unavailable. The tickets host may be unreachable or need an upgrade.');
+    if (received?.error) warnings.push(received.error);
+    if (received && !Number.isFinite(Date.parse(received.checkedAt || '')) && status) warnings.push('The current collector has not completed a successful check.');
+    const at = status?.checkedAt ? Date.parse(status.checkedAt) : NaN;
+    if (!Number.isFinite(at)) warnings.push('No successful queue blocker check has completed.');
+    else if (Date.now() - at > 300000) warnings.push('Queue blocker evidence is over five minutes old.');
+    if (refreshError) warnings.push(refreshError);
+    if (unavailable()) warnings.push(availabilityReason());
+    const heading = blockers.length ? 'Merges paused — ' + blockers[0].title + (blockers.length > 1 ? ' (+' + (blockers.length - 1) + ' more)' : '') :
+      warnings.length ? 'Merge status unavailable' : 'No open queue blockers';
+    const phases = {'waiting-approval':'Waiting for approval', queued:'Queued', working:'Implementing repair', 'waiting-input':'Waiting for input', review:'In review', failed:'Repair failed', unknown:'Repair activity unconfirmed'};
+    const element = document.getElementById('merge-status');
+    element.classList.toggle('warning', blockers.length > 0 || warnings.length > 0);
+    const html = '<h2 id="merge-status-title">' + escape(heading) + '</h2>' +
+      (warnings.length ? '<p class="merge-meta">' + warnings.map(escape).join(' ') + (blockers.length ? ' Showing the last received blocker evidence.' : '') + '</p>' : '') +
+      '<p class="merge-meta">' + (Number.isFinite(at) ? 'Last checked ' + escape(date(status.checkedAt)) : 'Last checked: unavailable') +
+      (source?.host || retainedMerge?.host ? ' · ' + escape(source?.host || retainedMerge.host) : '') + '</p>' +
+      (blockers.length ? '<ul>' + blockers.map(row => '<li class="merge-blocker" data-merge-blocker="' + escape(row.identifier) + '"><b>' + escape(row.identifier) + ' · ' + escape(row.title) + '</b>' +
+        '<p class="merge-phase">' + escape(phases[row.phase] || phases.unknown) + ' · ' + escape(row.status) + '</p><p>' + escape(row.nextAction) + '</p>' +
+        '<div class="links">' + safeLink(row.issueUrl, 'Open blocker').replace('<a ', '<a data-merge-open="blocker" ') + safeLink(row.agentUrl, 'Open agent').replace('<a ', '<a data-merge-open="agent" ') + '</div></li>').join('') + '</ul>' : '');
+    // Do not replace focused links during a search/re-render when their evidence did not change.
+    if (renderedMerge !== html) { element.innerHTML = html; renderedMerge = html; }
+  }
   function coverage() {
+    mergeStatus();
     const warnings = [];
     // A host whose first read is still under way is shown as being read, not as failed, and the
     // page asks again shortly instead of on the 30-second cycle; a failed read is a warning.
@@ -774,6 +815,7 @@ export function decisionPage(view: DecisionView, availability?: InboxAvailabilit
   return `<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><title>Decision inbox</title><style>${STYLE}</style></head>
 <body><a class="skip" href="#detail">Skip to selected decision</a>
+<section id="merge-status" class="merge-status" aria-labelledby="merge-status-title" role="region" aria-live="polite"><h2 id="merge-status-title">Checking merge status…</h2></section>
 <div class="shell"><aside class="queue" aria-label="Decision queue">
 <header class="queue-header"><div class="top"><h1>Decision tasks</h1><button id="refresh" type="button">Check updates</button></div><p id="refresh-state" class="muted" role="status" aria-live="polite"></p><p class="muted">Original choices, explicit answers. Research or delegate first when it is already within scope.</p><label class="search" for="search">Search decisions &amp; history</label><input id="search" type="search" maxlength="200" placeholder="Ticket, title, host, or source" autocomplete="off"></header>
 <div id="coverage" class="coverage" role="status" aria-live="polite"></div><div id="queue-list"></div>

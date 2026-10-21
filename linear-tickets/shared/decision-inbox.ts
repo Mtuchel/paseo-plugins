@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { ownerAskSchema, decisionReceiptSchema, askQuestionSchema } from "./contracts";
+import { mergeStatusSchema } from "./merge-status";
 
 // Browser and menu-bar clients share source identity and revision-bound owner asks.
 export const browserOwnerAskSchema = ownerAskSchema.extend({
@@ -58,6 +59,8 @@ export type RecoveryTicketPage = z.infer<typeof recoveryTicketPageSchema>;
 export const decisionHostSchema = z.object({
   host: z.string(), asks: z.array(browserOwnerAskSchema), live: z.array(liveDecisionSchema),
   backendInstanceId: z.string().uuid().optional(),
+  // Read independently of decision curation; only the canonical host supplies this inventory.
+  mergeStatus: mergeStatusSchema.optional(),
   // How many of this host's canonical owner sources are withheld from `asks` as source reviews
   // (isSourceReview). Optional: a peer from before the split answers without it, and a host
   // without an owner snapshot yet has nothing to count.

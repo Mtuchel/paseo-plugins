@@ -599,6 +599,9 @@ test("a lost cursor after answer, approval or message delivery cannot replay int
       return result;
     });
     await assert.rejects(h.relay.poll(h.paseo));
+    // The lost cursor is not a crash: finish receipt bookkeeping before replacing the instance.
+    await h.replies.recoverEffects();
+    await h.replies.stop();
     assert.equal(h.events.filter(event => /^(respond|send) /.test(event)).length, 1);
     assert.equal(h.answers.length, kind === "answer" ? 1 : 0);
     rmSync(h.path, { recursive: true });
@@ -607,6 +610,7 @@ test("a lost cursor after answer, approval or message delivery cannot replay int
     await replay.relay.poll(replay.paseo);
     assert.deepEqual(replay.events, ["react c1 eyes"]);
     assert.deepEqual(replay.answers, []);
+    await replay.replies.stop();
     // Lose the cursor once more with no pending request: replay must not become a message.
     rmSync(h.path);
     agent.pending = [];

@@ -1611,16 +1611,21 @@ export class LinearService {
   private async focusPages(teamKeys: string[], filter: Record<string, unknown>): Promise<FocusNode[]> {
     if (!teamKeys.length) return [];
     const scoped = { team: { key: { in: [...new Set(teamKeys)].sort() } }, state: { type: { nin: ["completed", "canceled", "duplicate"] } }, ...filter };
-    const found: FocusNode[] = [];
+    const found = new Map<string, FocusNode>();
+    const seen = new Set<string>();
     let after: string | null = null;
     do {
       const data = record(await this.read(FOCUS_SEED_QUERY, { first: FOCUS_TICKETS_BATCH, after, filter: scoped }));
       const page = record(data.issues ?? {});
-      found.push(...connection(page).nodes.map((item) => focusNode(record(item))).filter((node) => node.id));
+      if (!Array.isArray(page.nodes)) throw new Error("Linear returned no focus ticket nodes.");
+      for (const node of connection(page).nodes.map((item) => focusNode(record(item)))) if (node.id) found.set(node.id, node);
       const info = record(page.pageInfo ?? {});
-      after = info.hasNextPage === true && label(info.endCursor) ? label(info.endCursor) : null;
+      if (typeof info.hasNextPage !== "boolean") throw new Error("Linear returned incomplete focus pagination metadata.");
+      after = info.hasNextPage ? label(info.endCursor) || null : null;
+      if (info.hasNextPage && (!after || seen.has(after))) throw new Error("Linear returned an incomplete or repeated focus ticket cursor.");
+      if (after) seen.add(after);
     } while (after);
-    return found;
+    return [...found.values()];
   }
 
   async issueMetadata(id: string): Promise<IssueMetadata> {

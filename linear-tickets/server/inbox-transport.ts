@@ -57,6 +57,8 @@ export type InboxAvailability = {
 
 // One coherent read of the checked backend: the review inbox view (review-links.ts) and the
 // browser decision view (decision-inbox.ts), with each source's own coverage errors intact.
+// DecisionHost.mergeStatus travels inside decisions unchanged, including last-success checkedAt
+// and collection errors. The standalone frontdoor validates it and bundles the banner renderer.
 export type InboxSnapshot = {
   protocolVersion: number;
   instanceId: string;

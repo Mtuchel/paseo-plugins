@@ -15,6 +15,7 @@ import { answerableQuestions, matchOption, questionAnswer, questionKey, question
 import { paseoHome } from "./ticket-mcp";
 import { INBOX_DISPLAYED_HEADER } from "./inbox-transport";
 import { CURATION_INTERVAL_MS, DecisionCuration, curateDecisions } from "./decision-curation";
+import type { MergeStatusSnapshot } from "../shared/merge-status";
 
 export type BrowserDecisionInboxDeps = {
   ownerAsks: Pick<OwnerAsks, "snapshot" | "answer" | "triage">;
@@ -28,6 +29,7 @@ export type BrowserDecisionInboxDeps = {
   // The ticket steward's flow summary for the page's Flow section (Steward.snapshot, steward.ts).
   // Absent: the page shows no flow.
   flow?: () => Promise<StewardFlow>;
+  mergeStatus?: () => Promise<MergeStatusSnapshot>;
   directory?: string;
   now?: () => number;
 };
@@ -263,7 +265,13 @@ export class BrowserDecisionInbox {
       try { canonical = await this.deps.canonicalPeer() === null; }
       catch (error) { canonical = false; errors.push(`Canonical source unavailable: ${reasonOf(error)}`); }
     }
-    const withErrors = (host: DecisionHost): DecisionHost => errors.length ? { ...host, error: [host.error, ...errors].filter(Boolean).join("\n") } : host;
+    const withErrors = async (host: DecisionHost): Promise<DecisionHost> => ({
+      ...host,
+      // Overlay the live service even when the decision snapshot is cached. A source-review scan
+      // or the fifteen-minute curator must never determine merge-status freshness.
+      ...(canonical && this.deps.mergeStatus ? { mergeStatus: await this.deps.mergeStatus() } : {}),
+      error: errors.length ? [host.error, ...errors].filter(Boolean).join("\n") : host.error,
+    });
     const entry = this.localCache;
     const ownerNow = this.ownerCache?.checkedAt ?? null;
     if (entry && entry.generation === this.ownerGeneration && entry.canonical === canonical) {
@@ -597,6 +605,7 @@ export class BrowserDecisionInbox {
         // The count, like the asks it counts, belongs to the canonical owner's inbox only: a
         // non-canonical peer's reviews are not this page's to summarize.
         sourceReviews: canonical ? source.snapshot.sourceReviews : undefined,
+        mergeStatus: canonical ? source.snapshot.mergeStatus : undefined,
         history: canonical ? source.snapshot.history : source.snapshot.history.filter((receipt) => receipt.id.startsWith(PREFIX)) });
     }
     // A canonical host whose first read is still under way is named by canonicalReading; the

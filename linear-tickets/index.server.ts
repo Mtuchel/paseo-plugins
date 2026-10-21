@@ -36,6 +36,8 @@ import { ResponsibilityCheck, ResponsibilityStore } from "./server/responsibilit
 import { ensureBackendSecret } from "./server/inbox-transport";
 import { tailnetOrigin } from "./server/tailscale";
 import { BrowserDecisionInbox } from "./server/decision-inbox";
+import { MergeStatus } from "./server/merge-status";
+import { mergeStatusRpc } from "./shared/merge-status";
 import { closeInternalDaemon, internalDaemon, modelSetter, ownConnection } from "./server/connection";
 import { ModelGuard } from "./server/model-guard";
 import { recordStart, TIER_AGENT_LABEL, tierModel, TierStore } from "./server/model-tiers";
@@ -351,8 +353,18 @@ export default function contribute(server: PluginServerContext) {
     },
     admitted: () => starter.scheduler.admittedIds(),
   });
+  const mergeStatus = new MergeStatus({
+    linear, teamKeys: async () => (await settings.read()).dispatch.teamKeys,
+    paseo: () => attachedPaseo, handover, parked: { all: () => parking.plans.all() }, sessions: sessionStore,
+    waiting: () => starter.scheduler.waitingIds(),
+    agentUrl: async (agentId) => {
+      const serverId = await daemonServerId();
+      return serverId ? paseoAgentUrl(serverId, agentId) : null;
+    },
+  });
   const browserDecisions = new BrowserDecisionInbox({
     ownerAsks,
+    mergeStatus: async () => asCaller("merge-status", () => mergeStatus.feed()),
     paseo: () => attachedPaseo,
     replies,
     host: hostName,
@@ -742,6 +754,7 @@ export default function contribute(server: PluginServerContext) {
   // The owner's asks (README, "Owner asks"): read from cache at once (never waiting for the
   // model), answered through the same paths an "@paseo" reply takes.
   server.handle(ownerAsksRpc, async (_input, { paseo }) => { attach(paseo); return ownerAsksPage(await ownerAsks.snapshot(paseo)); });
+  server.handle(mergeStatusRpc, async (_input, { paseo }) => { attach(paseo); return asCaller("merge-status", () => mergeStatus.snapshot()); });
   server.handle(answerAskRpc, async (input, { paseo }) => { attach(paseo); return asCaller("owner-asks", () => ownerAsks.answer(input, paseo)); });
   server.handle(triageAskRpc, async (input, { paseo }) => { attach(paseo); return asCaller("owner-asks", () => ownerAsks.triage(input, paseo)); });
   server.handle(connectRpc, ({ apiKey }) => asCaller("sidebar", () => linear.authenticate(apiKey)));
