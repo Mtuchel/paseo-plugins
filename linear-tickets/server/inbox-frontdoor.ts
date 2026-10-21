@@ -8,6 +8,7 @@ import { backendSecretPath, headerValue, INBOX_AUTH_HEADER, INBOX_BACKEND_PORT, 
 import { closedPage, inboxPage, MANIFEST, SERVICE_WORKER, type InboxView } from "./review-page";
 import { REVIEW_ICON_PNG } from "./review-icon";
 import type { DecisionView } from "../shared/decision-inbox";
+import { mergeStatusSchema } from "../shared/merge-status";
 
 // The persistent inbox frontdoor (README, "Inbox transport"): a stand-alone process, supervised by
 // launchd or systemd --user (tools/inbox-service-install.mjs), that owns the browser-facing
@@ -78,7 +79,7 @@ const reasonOf = (error: unknown) => (error instanceof Error ? error.message : S
 const rowSchema = z.object({ agentId: z.string(), name: z.string(), link: z.string(), since: z.string(), host: z.string() }).loose();
 const inboxViewSchema = z.object({ open: z.array(rowSchema), decided: z.array(rowSchema), applying: z.array(rowSchema), unreachable: z.array(z.string()), hosts: z.array(z.string()), push: z.boolean(), pipeline: z.unknown().optional() }).loose();
 const decisionViewSchema = z.object({
-  hosts: z.array(z.object({ host: z.string(), asks: z.array(z.unknown()), live: z.array(z.unknown()), history: z.array(z.unknown()), updatedAt: z.string(), error: z.string().nullable() }).loose()),
+  hosts: z.array(z.object({ host: z.string(), asks: z.array(z.unknown()), live: z.array(z.unknown()), history: z.array(z.unknown()), updatedAt: z.string(), error: z.string().nullable(), mergeStatus: mergeStatusSchema.optional() }).loose()),
   canonicalHost: z.string().nullable(), unreachable: z.array(z.string()),
 }).loose();
 const snapshotSchema = z.object({ protocolVersion: z.literal(INBOX_PROTOCOL_VERSION), instanceId: z.string().min(1), capturedAt: z.string().min(1), inbox: inboxViewSchema, decisions: decisionViewSchema }).loose();

@@ -5056,6 +5056,31 @@ The canonical Linear host is local in activation `local` mode, or `activation.pe
 mode. An unavailable canonical host is reported, never silently replaced by another host's asks.
 The generated ask summary is the existing extraction, not a separate issue-impact or Haiku briefing.
 
+**Live merge status.** The top banner in the browser and Paseo Agents menu-bar inbox reads
+`linear.merge-status` from the canonical tickets host (server087 by default), independently of
+owner asks, search, dispatch enablement, and the trigger label. It inventories every open queue
+blocker in the configured dispatch teams using the existing `Queue blocker:` title or
+`Queue blocker id:` description marker. It shows every blocker, its current repair phase and
+next action, with **Open blocker** and, when known, **Open agent** links. Plan review means
+waiting for approval; Plan approved means queued for implementation, not already working.
+Only a current implementing agent's actual turn/running state establishes working; stale parked
+plans, old planner sessions and the `paseo-running` label do not override the newer handoff.
+
+The RPC returns `{ checkedAt, error, blockers }`. It and the optional canonical
+`DecisionHost.mergeStatus` field share one single-flight collection cached for about sixty
+seconds, not the fifteen-minute decision-curation interval. Browser feeds start that collection
+without waiting for Linear admission; their existing thirty-second transport/page refresh carries
+the result. The native inbox polls while open and treats evidence older than five minutes as
+stale; the browser also marks that age explicitly. Failed or incomplete paginated reads retain
+the last successful blockers and `checkedAt`, alongside the error. A successful empty inventory
+says **No open queue blockers**, never that main or the merge queue is healthy. A missing RPC,
+missing canonical feed field, or unreachable source is unavailable, not a healthy empty result.
+
+The standalone inbox frontdoor retains the merge-status snapshot and renders the same banner
+from its own bundled `decision-page.ts`. Publishing this change requires upgrading its bundles
+on each host with the documented `tools/inbox-service-install.mjs` install-then-start procedure
+after plugin rollout; reloading only the plugin does not upgrade that browser renderer.
+
 Linear owner sources collect immediately and every fifteen minutes even with no browser open.
 Background canonical collection awaits the full owner scan before publishing. Local and peer
 HTTP reads never await that scan: they return the collected owner sources, or an explicit
