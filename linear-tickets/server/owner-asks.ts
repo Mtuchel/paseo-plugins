@@ -349,7 +349,7 @@ export class OwnerAsks {
         url: draft.issue.url,
         parentIdentifier: draft.issue.parentIdentifier,
         ticketIdentifier: draft.ticketIdentifier,
-        kind: draft.manual ? "manual" : value?.kind ?? "info",
+        kind: value?.kind ?? (draft.manual ? "manual" : "info"),
         summary: value?.summary ?? draft.issue.title,
         questions: value?.questions ?? [],
         source: draft.text.slice(0, MAX_SOURCE_CHARS),

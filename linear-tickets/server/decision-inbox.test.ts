@@ -732,6 +732,30 @@ test("confirmed answers disappear from curated tasks immediately without waiting
   assert.equal(h.sent.length, 1);
 });
 
+test("checked Linear replies settle only the exact round and prevent a second browser delivery", async t => {
+  const h = await harness(t, "laptop", []);
+  const original = await h.action();
+  // A stale daemon listing can still contain Q1 after checked submission.
+  h.onSubmit(async () => {});
+  await h.replies.deliver(h.sdk, "a", "Node", { ref: "comment:owner-answer", issueId: "i1", responder: { kind: "owner", via: "linear-comment", activityId: "owner-answer", userId: "owner" } });
+  h.agents[0].pendingPermissions.push({ ...question, id: "q2", title: "Next round" });
+  assert.deepEqual((await h.inbox.local()).live.map(request => request.requestId), ["q2"]);
+  assert.equal((await h.post(original)).status, 409);
+  assert.equal(h.sent.length, 1);
+  h.agents[0].pendingPermissions[0] = { ...question, title: "Changed authority boundary" };
+  assert.deepEqual((await h.inbox.local()).live.map(request => request.requestId), ["q1", "q2"]);
+});
+
+test("unconfirmed Linear replies stay in source review and cannot be retried through the browser", async t => {
+  const h = await harness(t, "laptop", []);
+  const original = await h.action();
+  h.onSubmit(async () => { throw new Error("lost connection after submit"); });
+  await h.replies.deliver(h.sdk, "a", "Node", { ref: "comment:unknown-answer", issueId: "i1", responder: { kind: "owner", via: "linear-comment", activityId: "unknown-answer", userId: "owner" } });
+  assert.equal((await h.inbox.local()).live[0].deliveryUnknown, true);
+  assert.equal((await h.post(original)).status, 502);
+  assert.equal(h.sent.length, 1);
+});
+
 test("unknown live delivery stays visible and cannot be retried with a different choice", async t => {
   const h = await harness(t);
   const input = await h.action();

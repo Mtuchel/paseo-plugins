@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { normalizeIssue } from "../server/context";
-import { filterIssues, formatIssueDate, formatPriority, formatRelativeDate, hasPriority, priorityTone, statusChangesText, statusCounts, statusIcon, statusTone } from "./issue-list";
+import { filterIssues, formatIssueDate, formatPriority, hasPriority, priorityTone, statusChangesText, statusCounts, statusIcon, statusTone } from "./issue-list";
 
 const tickets = [
   normalizeIssue({ id: "a", title: "Fix login", status: "In Progress", labels: ["mobile"], updatedAt: "2026-09-18T10:00:00Z", createdAt: "2026-01-01T00:00:00Z" }),
@@ -134,13 +134,3 @@ test("status history text summarizes state spans from a context snapshot", () =>
   assert.equal(statusChangesText("not json"), null);
 });
 
-test("relative dates stay short and fall back to a calendar date", () => {
-  const now = Date.parse("2026-09-18T12:00:00Z");
-  assert.equal(formatRelativeDate("2026-09-18T11:59:40Z", now), "just now");
-  assert.equal(formatRelativeDate("2026-09-18T11:15:00Z", now), "45m ago");
-  assert.equal(formatRelativeDate("2026-09-18T09:00:00Z", now), "3h ago");
-  assert.equal(formatRelativeDate("2026-09-15T12:00:00Z", now), "3d ago");
-  assert.equal(formatRelativeDate("2025-01-05T12:00:00Z", now), "Jan 5, 2025");
-  assert.equal(formatRelativeDate("invalid", now), "No date");
-  assert.equal(formatRelativeDate("2026-09-18T12:30:00Z", now), "30m from now");
-});

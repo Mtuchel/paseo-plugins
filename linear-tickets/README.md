@@ -5114,13 +5114,35 @@ that peer's cached rows while retaining the target backend and review-generation
 The frontdoor rechecks incomplete coverage after its two-second minimum snapshot gap, rather
 than holding a cold partial snapshot until the next thirty-second expiry. Notification collection
 still waits for peer coverage, so a routine refresh does not forget and re-announce waiting reviews.
-The task list groups owner decisions, unresolved source review, research/delegated waits and receipts.
-The owner and other-wait sections group displayed sources by ticket for presentation only: one
-expandable entry per ticket (`ticketIdentifier` for owner asks, `identifier` for live questions)
-whose members are the unchanged per-source rows. Sources without a ticket stay separate, and
-grouping never merges source identity or actions: each member keeps its own selection, draft and
-answer controls. The section count reports tickets and adds the source count when a ticket carries
-more than one source.
+The task list separates **Needs your decision**, **Personal actions**, unresolved source review,
+research/delegated waits and receipts. `GET /api/decisions` supplies the canonical `summary`
+(`decisions`, `actions`, `unverified`, `complete`, `coverageComplete`, `checkedAt`, `reasons`)
+consumed by the browser and native menu-bar badge. The badge counts verified question rounds,
+not tickets or source records. Fresh coverage with unresolved sources shows `N?` / “N verified ·
+U to verify”; stale or missing coverage shows `?` with explicit last-snapshot counts.
+Exact source duplicates and confirmed revisions are excluded by source admission and curation;
+an explicit current Linear/live mirror counts once only when its routing agent, ticket and whole
+question/options bundle match. An older mirror that no longer matches is unverified, not another
+decision. Independent source identities, different issues, changed options, and different live
+request IDs remain independent: a routing agent is not evidence of a historical comment's author.
+No grouping grants permission to answer multiple sources. IDs, revisions, drafts and routes remain
+unchanged.
+
+Extracted manual steps are personal actions, not decisions; a manual issue label cannot override
+an extracted business choice or report. Unextracted current requests and unknown delivery go to
+source review, never an exact decision badge. Historical nonurgent reading is not a decision.
+Stale/missing/failed host coverage, overdue collection or an unready frontdoor makes the count
+uncertain (`?`, with last-snapshot counts), not zero or an exact-looking backlog. Cached snapshots
+are age-checked again when served. A checked answer delivered through Linear's `@paseo` path
+settles the same exact live request as a browser answer; unconfirmed delivery remains visible and
+cannot be retried from another surface. A new request or changed payload remains a new round.
+Ordinary comments without a durable request binding are still reconciled by the source-specific
+timeline/admission checks; a newer reply never silently settles every ask on its ticket.
+
+The decision, action and other-wait sections group their displayed sources by ticket for
+presentation only: one expandable entry per ticket (`ticketIdentifier` for owner asks,
+`identifier` for live questions). Every member retains its own original choices and answer
+controls; all source and ticket counts are separate from the canonical decision-round badge.
 Source counts are separate from steward ticket-state counts: `waiting-owner` is not a count of
 actionable questions. Per-host collection timestamps and incomplete/stale coverage stay visible.
 Standalone live questions without a Linear identifier remain included. Original lettered choices,

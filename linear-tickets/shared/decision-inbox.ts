@@ -102,6 +102,15 @@ export type CurationStatus = {
   nextRefreshAt: string | null;
   error: string | null;
 };
+export type DecisionSummary = {
+  decisions: number;
+  actions: number;
+  unverified: number;
+  complete: boolean;
+  coverageComplete?: boolean;
+  checkedAt: string | null;
+  reasons: string[];
+};
 export type DecisionView = {
   hosts: DecisionHost[];
   canonicalHost: string | null;
@@ -112,6 +121,7 @@ export type DecisionView = {
   canonicalReading?: boolean;
   tasks?: CuratedDecision[];
   curation?: CurationStatus;
+  summary?: DecisionSummary;
 };
 export type BrowserDecisionAction = {
   host: string;
