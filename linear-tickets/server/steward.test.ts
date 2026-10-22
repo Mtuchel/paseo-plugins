@@ -313,6 +313,7 @@ async function passFixture(t: any, over: {
   roots?: Map<string, any>;
   records?: any[];
   pullStates?: Map<string, any>;
+  freshOpenPulls?: (urls: string[]) => Promise<{ open: string[]; unreadable: boolean }>;
   cap?: number;
   clockNow?: number;
   verdicts?: (issueId: string) => Promise<any[]>;
@@ -460,6 +461,9 @@ async function passFixture(t: any, over: {
     planned: { has: async () => { if (over.gateReadError === "planned") throw new Error("parked plan store unreadable"); return over.planned ?? false; } },
     owner: async (issueId: string) => (typeof over.owner === "function" ? over.owner(issueId) : over.owner ?? "here"),
     pulls: async () => over.pullStates ?? new Map(),
+    // The fresh read a successor start makes: every recorded open pull request still open unless
+    // the test says otherwise.
+    freshOpenPulls: over.freshOpenPulls ?? (async (urls: string[]) => ({ open: urls, unreadable: false })),
     completionPulls: async (issueId: string, _identifier: string, urls: string[]) => { calls.completionUrls.push(urls); return typeof over.completionPulls === "function" ? over.completionPulls(issueId) : over.completionPulls ?? "settled"; },
     recoveryWait: over.recoveryWait ?? (async () => null),
     intake: { claimsReady: async () => true } as any,
@@ -826,6 +830,57 @@ test("a resumed verdict honors the restart budget and the steward switch", async
   await off.build().tick(off.paseo, { ...stewardSettings(), steward: { ...stewardSettings().steward, enabled: false } });
   assert.deepEqual(off.calls.completed, [], "a disabled steward completes nothing");
   assert.equal((await off.ticket("i1"))?.verifier?.marker, "m1", "the verdict waits for the switch");
+});
+
+// TUC-1131: the watch recorded #3868 as open long after it closed when the branch below it landed,
+// and the steward started a successor on that claim four times. The recorded open set is a claim
+// from the watch's own last read; the start reads it fresh and spends nothing on a dead one.
+test("a successor is never started on a pull request that closed since the watch recorded it", async (t) => {
+  const stale = "https://github.com/o/r/pull/3868";
+  const f = await passFixture(t, {
+    issues: [ticketIssue()],
+    records: [recordFor("i1", "ENG-1", [stale])],
+    pullStates: new Map([[stale, pull(stale)]]),
+    freshOpenPulls: async () => ({ open: [], unreadable: false }),
+  });
+  await f.seed("i1", "ENG-1", { situation: "open-pr", since: at(60) });
+  await f.pass();
+  assert.deepEqual(f.calls.successions, [], "the stale claim starts no successor");
+  assert.deepEqual((await f.ticket("i1"))?.restarts, [], "and the start is not even attempted, so no budget is spent");
+  assert.match((await f.ticket("i1"))?.log.at(-1)?.action ?? "", /^succeed: failed \(the open pull request it recorded has closed or landed/);
+  // A read that failed claims nothing either: a refusal, not a dispatch on a guess.
+  const blind = await passFixture(t, {
+    issues: [ticketIssue()],
+    records: [recordFor("i1", "ENG-1", [stale])],
+    pullStates: new Map([[stale, pull(stale)]]),
+    freshOpenPulls: async () => ({ open: [], unreadable: true }),
+  });
+  await blind.seed("i1", "ENG-1", { situation: "open-pr", since: at(60) });
+  await blind.pass();
+  assert.deepEqual(blind.calls.successions, [], "an unreadable pull request is no license to start");
+  assert.match((await blind.ticket("i1"))?.log.at(-1)?.action ?? "", /the open pull requests cannot be read now/);
+});
+
+test("a successor continues the pull request that is still open, not a stale one beside it", async (t) => {
+  const gone = "https://github.com/o/r/pull/3868";
+  const open = "https://github.com/o/r/pull/3869";
+  const leads: string[] = [];
+  const f = await passFixture(t, {
+    issues: [ticketIssue()],
+    records: [recordFor("i1", "ENG-1", [gone, open])],
+    pullStates: new Map([[gone, pull(gone)], [open, pull(open)]]),
+    freshOpenPulls: async (urls) => ({ open: urls.filter((url) => url === open), unreadable: false }),
+    succeed: async (...args: Parameters<SessionRouter["succeed"]>) => {
+      leads.push(args[3]);
+      return { kind: "started", agent: { id: "a10", title: null, cwd: "" } };
+    },
+  });
+  await f.seed("i1", "ENG-1", { situation: "open-pr", since: at(60) });
+  await f.pass();
+  assert.deepEqual(f.calls.successions, ["i1"], "the ticket still gets its successor");
+  assert.equal(leads.length, 1);
+  assert.match(leads[0], /open pull request https:\/\/github\.com\/o\/r\/pull\/3869/);
+  assert.doesNotMatch(leads[0], /3868/, "the closed pull request is not the successor's work");
 });
 
 test("a verdict never starts a successor beside a deliberate wait", async (t) => {

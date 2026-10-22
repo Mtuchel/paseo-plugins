@@ -2200,7 +2200,15 @@ requests is open. The ticket's pull requests are the ones whose title names it a
 another ticket and not this one (a title copied from another pull request): it is skipped with
 one log line ``[linear-tickets] TUC-34: <url> is not followed: its `Linear:` line names TUC-35``.
 A lookup or link move that fails, or a poll that ends before it (a rate limit), is retried on
-the next poll, also across restarts.
+the next poll, also across restarts. The watch reads the link it follows; the ticket's other
+pull requests keep the state of the last time that URL was read, and one that closes or lands
+later stays recorded as open until something reads it. No successor starts on that record: the
+ticket steward reads a ticket's recorded open pull requests from GitHub before it spends one
+(see **Ticket steward**), records what it finds — a landing, a closure and the replay it is due —
+and reports a landing on the ticket as the poll would. A start is never spent on a pull request
+that closed or landed since the watch last saw it (`pr-watch.json`'s entry for TUC-1131's
+#3868 kept it open after the queue closed it on 9 October, and four successor starts were
+attempted on that claim on 18 October; the fresh read finds it closed by the queue).
 
 **Replacement pull requests.** When the queue lands part of a stack, Graphite deletes the
 landed branch, and GitHub closes the pull request based on it for good (it cannot be reopened
@@ -3153,7 +3161,9 @@ and PR fences are checked again immediately before creating the helper.
 **Anything else is a defect**, and the steward repairs it with at most one action per ticket and
 pass: a verifier for a landed stack (including a group parent whose sub-issues all finished —
 its own live agent, wait for you, blocker or open pull request comes first; only unfinished
-members stay with the deterministic coordinator), a successor for an open pull request nobody works on, the
+members stay with the deterministic coordinator), a successor for an open pull request nobody works on (its recorded open pull requests are read from GitHub
+right before the start, so one that closed or landed since the watch read it starts nothing and
+the next pass acts on the healed state), the
 replay instruction for a closed-unmerged pull request, a restart for a ticket whose agent vanished,
 a start for an unblocked ticket that never started, one resume for a silent agent, the clearing of
 a stale owner wait, the archive of a finished ticket's agents, or an escalation. Restarts are capped at three per ticket within 24 hours and at `steward.maxActionsPerPass`

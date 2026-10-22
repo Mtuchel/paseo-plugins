@@ -3543,6 +3543,68 @@ export class PullRequestWatch {
     return states;
   }
 
+  // Which of a ticket's recorded open pull requests GitHub still has open, read fresh right before
+  // the steward spends a successor on one (steward.ts `succeed`). The watch's state is a claim from
+  // the last time it read the URL, and it only reads its records' watched link: a pull request the
+  // ticket merely attaches, or its record's link after the record moved to another (see advance),
+  // keeps the state of its one read. #3868 of TUC-1131 closed when the branch below it landed and
+  // stayed recorded open; the successor that started on that claim was re-dispatched four times.
+  // What this read sees is recorded the way the poll's own step records it (merged, closed without
+  // merging, the replay a new closure is due), so the next pass classifies the ticket by what
+  // GitHub says, and a merge it is first to see is reported on the ticket as the poll would. The
+  // successor then continues only a pull request that is still open. `unreadable`: GitHub failed
+  // for at least one of them, so an empty `open` is no claim that they all closed; every readable
+  // one is still recorded. A rate limit ends the poll as everywhere else.
+  async freshOpenPulls(urls: string[]): Promise<{ open: string[]; unreadable: boolean }> {
+    const seenByUrl = this.currentSeen ?? await this.load();
+    const running = this.currentSeen !== null;
+    const open: string[] = [];
+    const changes: { url: string; change: Change }[] = [];
+    let unreadable = false;
+    for (const url of urls) {
+      let view: PullRequestView;
+      try {
+        view = await this.view(url);
+      } catch (error) {
+        if (error instanceof RateLimitedError) throw error;
+        console.error(`[linear-tickets] reading ${url} before a successor start failed: ${error instanceof Error ? error.message : error}`);
+        unreadable = true;
+        continue;
+      }
+      const result = reviewChange(view, entry(seenByUrl, url));
+      const closed = view.state === "CLOSED" && !result.seen.merged;
+      seenByUrl[url] = {
+        ...result.seen,
+        closed,
+        ...(closed && !result.seen.closed ? { replay: "due" as const } : {}),
+        ...(result.change ? { activeAt: new Date().toISOString() } : {}),
+      };
+      if (view.state.toUpperCase() === "OPEN") open.push(url);
+      // Only a landing is reported from here: a review decision stored with the URL is old news by
+      // the time a successor considers it, and the poll's own step reports those for its watched
+      // link. A merge found first by this read must reach the ticket as the poll would.
+      else if (result.change?.review === "merged") changes.push({ url, change: result.change });
+    }
+    // Outside a poll run (the file was only read here) the recording has to be saved now; a run
+    // saves its own view at the end.
+    if (!running) {
+      await this.save(seenByUrl).catch((error: unknown) => {
+        console.error(`[linear-tickets] saving the pull requests read before a successor start failed: ${error instanceof Error ? error.message : error}`);
+      });
+    }
+    if (changes.length) {
+      const all = await this.deps.handover.all().catch(() => [] as HandoverRecord[]);
+      for (const { url, change } of changes) {
+        const record = all.find((item) => item.links["Pull request"] === url);
+        if (!record) continue;
+        await this.apply(record, change).catch((error: unknown) => {
+          console.error(`[linear-tickets] ${record.identifier}: reporting ${url} after a fresh read failed: ${error instanceof Error ? error.message : error}`);
+        });
+      }
+    }
+    return { open, unreadable };
+  }
+
   // Completion is stricter than retirement policy: owner-vetoed and fork PRs are still
   // unfinished work. Check fresh attachment/record URLs and every known repository,
   // never the persisted watch state or the policy's deliberate exclusions.

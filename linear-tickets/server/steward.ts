@@ -114,6 +114,10 @@ export type StewardDeps = {
   // repositories, read from GitHub now — not the retirement policy's cached set, not a veto list.
   pulls: (urls: string[]) => Promise<Map<string, PullState>>;
   completionPulls: (issueId: string, identifier: string, urls: string[]) => Promise<StackState>;
+  // Which of a ticket's recorded open pull requests GitHub still has open, read fresh right before a
+  // successor starts on one (pr-watch.ts `freshOpenPulls`): the recorded state is a claim from the
+  // watch's last read of that URL, and a pull request that closed or landed since it starts nothing.
+  freshOpenPulls: (urls: string[]) => Promise<{ open: string[]; unreadable: boolean }>;
   intake: Pick<ActivationIntake, "claimsReady">;
   doneTickets: DoneTickets;
   // The `<trigger>-running` labels still to remove after an archive (retired-labels.json).
@@ -1812,11 +1816,30 @@ export class Steward {
   // when it is spent), and an admission wait refunds it and stays queued.
   private async succeed(names: DispatchLabels & { trigger: string }, candidate: Candidate): Promise<StewardOutcome> {
     const { issue, facts } = candidate;
-    const pull = facts.openPulls[0] ?? facts.closedPulls[0];
+    // The facts' open pull requests are what the watch last recorded. That is a claim, not a read:
+    // a pull request the ticket only attaches is never refreshed by a poll, and one whose record
+    // moved on keeps the state of its last read. TUC-1131 was re-dispatched four times over #3868,
+    // which had closed when the branch below it landed. Read the claim fresh before spending a
+    // start on it, record what it says (see pr-watch.ts `freshOpenPulls`) and continue only a pull
+    // request that is still open: a stale claim retries nothing, the healed state classifies the
+    // ticket next pass (a landing is verified, a closure is replayed).
+    let pull: StewardPullFacts | null = null;
+    if (facts.openPulls.length) {
+      const recorded = facts.openPulls;
+      const fresh = await this.deps.freshOpenPulls(recorded.map((entry) => entry.url)).catch((error: unknown) => {
+        if (error instanceof RateLimitedError) throw error;
+        return { open: [] as string[], unreadable: true };
+      });
+      pull = recorded.find((entry) => fresh.open.includes(entry.url)) ?? null;
+      if (!pull) {
+        return { state: "failed", reason: fresh.unreadable ? "the open pull requests cannot be read now" : "the open pull request it recorded has closed or landed since the watch read it; nothing is started on it", permanent: false };
+      }
+    }
+    pull ??= facts.closedPulls[0] ?? null;
     if (!pull) return { state: "failed", reason: "no pull request to continue", permanent: true };
     const now = this.clock();
     const record = (await this.deps.handover.all()).find((item) => item.issueId === issue.id) ?? null;
-    const lead = facts.openPulls.length > 0 ? successorText(issue.identifier, pull) : replayText(issue.identifier, pull, record?.worktreePath ?? null);
+    const lead = facts.openPulls.some((entry) => entry.url === pull!.url) ? successorText(issue.identifier, pull) : replayText(issue.identifier, pull, record?.worktreePath ?? null);
     const attempt = facts.restarts + 1;
     await this.deps.store.update((file) => {
       const ticket = this.deps.store.ticket(file, issue.id, issue.identifier, this.iso(now));
