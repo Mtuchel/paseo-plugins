@@ -1047,7 +1047,7 @@ export class Steward {
       this.deps.sessions.watchdogRoots(),
       this.deps.handover.all(),
       this.deps.watchdog.read().catch(() => null),
-      this.deps.needsYou.all().catch(() => [] as { parentId: string }[]),
+      this.deps.needsYou.all().catch(() => [] as { id: string; parentId: string }[]),
       this.deps.watchdog.handedOver().catch(() => new Map<string, string>()),
       this.deps.sessions.parentProgresses(),
     ]);
@@ -1133,7 +1133,7 @@ export class Steward {
     record: HandoverRecord | null;
     parent: ParentProgress | null;
     watchdog: WatchdogFile | null;
-    needsYou: { parentId: string }[];
+    needsYou: { id: string; parentId: string }[];
     handed: Map<string, string>;
     pulls: Map<string, PullState>;
     now: number;
