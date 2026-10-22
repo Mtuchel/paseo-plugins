@@ -140,6 +140,15 @@ test("a stale owner wait is repaired, a live one is a state", () => {
   assert.equal(STEWARD_ACTION["wait-stale"], "clear-wait", "the stale wait is cleared, not commented on");
 });
 
+test("Needs input with no recorded wait is a stale wait, not a state to sit in", () => {
+  const waiting = { status: "Needs input", statusType: "started" };
+  assert.equal(classifyTicket(facts({ ...waiting, live: false, ownerWait: "none" })), "wait-stale", "a status call or a lost record leaves nothing to end it");
+  assert.equal(classifyTicket(facts({ ...waiting, live: false, ownerWait: "stale" })), "wait-stale");
+  assert.equal(classifyTicket(facts({ ...waiting, live: false, ownerWait: "live" })), "waiting-owner", "a recorded wait is still a state");
+  assert.equal(classifyTicket(facts({ ...waiting, live: true, ownerWait: "none" })), "moving", "a live agent can move it itself");
+  assert.equal(classifyTicket(facts({ live: false, ownerWait: "none", started: false })), "unstarted", "the same facts in Todo are ordinary work");
+});
+
 test("a recovering watchdog cycle counts as moving; its exhaustion is a defect", () => {
   assert.equal(classifyTicket(facts({ live: false, watchdog: "active" })), "moving", "the watchdog is already recovering it");
   const exhausted = classifyTicket(facts({ live: false, watchdog: "exhausted" }));
@@ -310,6 +319,9 @@ const merged = (url: string) => new Map([[url, pull(url, { merged: true })]]);
 // The steward's own calls, one fake per dependency it was built to use.
 async function passFixture(t: any, over: {
   issues?: any[];
+  // The issues the pass's state read returns (the configured teams' Needs-input tickets): a ticket
+  // with no label, record or root the label and id reads cannot reach.
+  stateIssues?: any[];
   roots?: Map<string, any>;
   records?: any[];
   pullStates?: Map<string, any>;
@@ -356,6 +368,7 @@ async function passFixture(t: any, over: {
     dueDates: [] as string[], moves: [] as string[], labels: [] as string[], archives: [] as string[],
     completionUrls: [] as string[][],
     comments: [] as string[], cards: [] as string[],
+    issueReads: [] as { states?: string[]; labels?: string[]; ids?: string[] }[],
     continuations: [] as { issueId: string; agentId: string; operationId: string; text: string }[],
     admissions: [] as unknown[][], startOptions: [] as Parameters<TicketStarter["start"]>[3][],
     // The pass's agent registry reads (`sessions.watchdogRoots`): one per pass after the fix,
@@ -385,7 +398,10 @@ async function passFixture(t: any, over: {
     store,
     linear: {
       trustedAppIds: async () => ["app1"],
-      stewardIssues: async () => over.issues ?? [],
+      stewardIssues: async (input: { states?: string[] } = {}) => {
+        calls.issueReads.push(input);
+        return input.states?.length ? over.stateIssues ?? [] : over.issues ?? [];
+      },
       issueGroup: async (issueId: string): Promise<IssueGroup> => {
         if (over.issueGroup) return over.issueGroup(issueId);
         const issue: StewardIssue | undefined = over.issues?.find((entry) => entry.id === issueId);
@@ -644,6 +660,41 @@ test("an escalation the owner has not answered stands across passes and is never
   assert.deepEqual(f.calls.restarts, [], "no recovery runs beside it");
   const ticket = await f.ticket("i1");
   assert.equal(ticket?.escalated?.key, "restart-exhausted", "the escalation stays on the ticket record");
+});
+
+test("a Needs input state no wait backs is cleared, and read by state so no label or record has to reach it", async (t) => {
+  const f = await passFixture(t, {
+    issues: [],
+    stateIssues: [ticketIssue({ status: "Needs input" })],
+    records: [recordFor("i1", "ENG-1")],
+  });
+  await f.seed("i1", "ENG-1", { situation: "wait-stale", since: at(30) });
+  await f.pass();
+  assert.ok(f.calls.issueReads.some((input) => input.states?.includes("Needs input") && input.labels?.length === 0), "the configured teams' Needs input tickets are read by state, not found by a label that is gone");
+  assert.deepEqual(f.calls.clears, ["i1"], "the state nothing can end is ended");
+  assert.deepEqual(f.calls.escalates, [], "and it is not an owner ask");
+});
+
+test("a Needs-you sub-issue in Needs input is an open question, not an unrecorded state", async (t) => {
+  const f = await passFixture(t, {
+    issues: [],
+    stateIssues: [ticketIssue({ status: "Needs input", labels: [{ id: "n", name: "paseo-needs-you" }] })],
+    needsYou: [{ id: "i1", identifier: "ENG-1", parentId: "p0" }],
+    records: [],
+  });
+  await f.seed("i1", "ENG-1", { situation: "wait-stale", since: at(30) });
+  await f.pass();
+  assert.deepEqual(f.calls.clears, [], "the sub-issue's state carries the question the owner replies to");
+});
+
+test("a Needs input ticket with a recorded wait is left alone", async (t) => {
+  const f = await passFixture(t, {
+    issues: [ticketIssue({ status: "Needs input" })],
+    records: [recordFor("i1", "ENG-1", [], { kind: "request", at: at(2) })],
+  });
+  await f.seed("i1", "ENG-1", { situation: "waiting-owner", since: at(30) });
+  await f.pass();
+  assert.deepEqual(f.calls.clears, [], "a wait an answer can still end is a state, not a defect");
 });
 
 test("the per-pass cap spreads heavy actions over passes, deterministically", async (t) => {

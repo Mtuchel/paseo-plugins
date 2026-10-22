@@ -271,6 +271,10 @@ test("the MCP server reads, comments, moves and links only its own ticket over s
 
     assert.match((await mcp.call("set_status", { status: "Shipped" })).text, /Unknown status.*In Review/);
     assert.match((await mcp.call("set_status", { status: "canceled" })).text, /give the reason/);
+    const guarded = await mcp.call("set_status", { status: "Needs input" });
+    assert.equal(guarded.isError, true, "the owner-wait state is never set by a status call");
+    assert.match(guarded.text, /owner-wait state.*question to the owner/);
+    assert.equal((await mcp.call("set_status", { status: "needs input" })).isError, true, "matched case-insensitively, like every status");
     assert.equal((await mcp.call("set_status", { status: "in progress" })).text.includes("\"changed\": false"), true);
     const moved = await mcp.call("set_status", { status: "in review" });
     assert.equal(moved.isError, false);

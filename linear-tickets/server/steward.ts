@@ -26,7 +26,7 @@ import type { PluginSettings, Settings } from "./settings";
 import { classifyTicketAgents, issueAgents, WAITING_PLAN_REASON, type TicketStarter } from "./starter";
 import { paseoHome } from "./ticket-mcp";
 import { takeLease, releaseLease, type TicketRoots, type WatchedAgent, type WatchdogFile, type WatchdogStore } from "./watchdog";
-import { NEEDS_INPUT_STATE, type Writeback } from "./writeback";
+import { NEEDS_INPUT_STATE, STEWARD_WAIT_ANCHOR, type Writeback } from "./writeback";
 import { CONTROL_CHECK_MS, RECOVERY_REACTION_MS, DIAGNOSTIC_TIMEOUT_MS, DIAGNOSTIC_CAP, diagnosticBrief, recentDiagnostics, stageEvidence, stageAdvanced, type RecoveryDiagnostic, type Responsibility } from "./recovery-diagnostic";
 
 // The ticket steward (README, "Ticket steward"): one level-triggered reconciler for every in-scope
@@ -78,9 +78,6 @@ const RESTART_STARTED_STATES = new Set(["in progress"]);
 export const STEWARD_VERDICT_DIRECTORY = "steward-verdicts";
 // The label a verifier carries, so its agent is told apart from the ticket's own.
 export const STEWARD_VERIFIER_LABEL = "linear-tickets.steward";
-// The agent id a wait the steward opened for a ticket without an agent is anchored to: no agent
-// ever carries it, so the ticket does not count as started by it.
-const STEWARD_ANCHOR = "steward";
 // The reason the start gate gives when a live agent took the ticket over between the read and the
 // start: not a failure — somebody works on it.
 const LIVE_AGAIN_PREFIX = "an agent works on ";
@@ -330,6 +327,10 @@ export function classifyTicket(facts: StewardFacts): StewardSituation {
   if (facts.ownerWait === "stale") return "wait-stale";
   if (facts.blocker) return "waiting-blocker";
   if (facts.parked) return "parked";
+  // The owner-wait state with no recorded wait: an agent's status call moved the ticket there, the
+  // owner did, or the record was lost with its agent. Nothing can end it (no answer is consumed, no
+  // event clears it), so it is stale exactly like a dead wait, and the pass clears it back to work.
+  if (facts.ownerWait === "none" && facts.status.trim().toLowerCase() === NEEDS_INPUT_STATE.toLowerCase()) return "wait-stale";
   if (facts.watchdog === "active") return "moving";
   if (facts.watchdog === "queued") return "queued";
   // A start that waited for its turn stays queued and is retried; its budget is untouched.
@@ -1054,9 +1055,19 @@ export class Steward {
     const parentOf = new Map(parents.map((parent) => [parent.issueId, parent]));
     const inventory = new Set<string>([...Object.keys(file.tickets), ...records.map((record) => record.issueId), ...roots.keys(), ...needsYou.map((entry) => entry.parentId), ...parentOf.keys()]);
     const all = await this.deps.linear.stewardIssues({ teamKeys: settings.dispatch.teamKeys, labels: labelNames, appIds, ids: [...inventory], queueBlockers: options.queueBlockers === true });
+    // The owner-wait state is not a label. A ticket an agent's status call or the owner left there
+    // (or whose wait record its dead agent took with it) carries no dispatch label, no record and no
+    // root, so none of the reads above returns it -- and every consumer of the state needs a record
+    // that does not exist. Read the configured teams' Needs-input tickets by state so the pass can
+    // judge them: a state nothing live backs is a defect it clears (classifyTicket, "wait-stale").
+    const waitingStates = settings.steward.enabled && options.queueBlockers !== true
+      ? await this.deps.linear.stewardIssues({ teamKeys: settings.dispatch.teamKeys, labels: [], appIds: [], ids: [], states: [NEEDS_INPUT_STATE] })
+      : [];
+    const reachable = new Map(all.map((issue) => [issue.id, issue]));
+    for (const issue of waitingStates) if (!reachable.has(issue.id)) reachable.set(issue.id, issue);
     const teams = new Set(settings.dispatch.teamKeys.map((key) => key.trim().toLowerCase()).filter(Boolean));
     const inTeam = (issue: StewardIssue) => teams.has(issue.teamKey.trim().toLowerCase());
-    const issues = options.queueBlockers ? all.filter((issue) => inTeam(issue) && hasLabel(issue.labels, names.failed)) : all;
+    const issues = options.queueBlockers ? all.filter((issue) => inTeam(issue) && hasLabel(issue.labels, names.failed)) : [...reachable.values()];
     if (options.queueBlockers && !issues.length) return;
     const inScope = issues.filter((issue) => (options.queueBlockers ? true : (inTeam(issue) && parentOf.has(issue.id)) || this.inScope(issue, names, settings.dispatch.teamKeys, appIds, recordOf, roots, file.tickets)));
     const pulls = await this.deps.pulls([...new Set(inScope.flatMap((issue) => pullUrls(issue, recordOf.get(issue.id))))]);
@@ -1158,7 +1169,7 @@ export class Steward {
     const planned = (await this.deps.planned?.has(issue.id).catch(() => false)) === true;
     const focused = Boolean(await this.deps.focus?.admits(issue.id, paseo).catch(() => null));
     const cycle = input.watchdog?.tickets[issue.id] ?? null;
-    const stripAnchor = (record?.agentId ?? "").startsWith(STEWARD_ANCHOR);
+    const stripAnchor = (record?.agentId ?? "").startsWith(STEWARD_WAIT_ANCHOR);
     const started = Boolean(record && record.agentId && !stripAnchor) || roots.length > 0 || pullFacts.length > 0;
     const permissions = live && liveRoots.some((agent) => (agent.pendingPermissions?.length ?? 0) > 0);
     const offer = activeThread?.offer && ["split", "later", "parked"].includes(activeThread.offer) ? activeThread.offer : null;
@@ -1172,7 +1183,7 @@ export class Steward {
               : input.watchdog?.holds[issue.id] ? "stopped"
                 : activeThread?.remote ? "remote"
                   : permissions ? "permissions"
-                    : input.needsYou.some((entry) => entry.parentId === issue.id) ? "needs-you"
+                    : input.needsYou.some((entry) => entry.id === issue.id || entry.parentId === issue.id) ? "needs-you"
                       : focused ? "focus"
                         : null;
     // A Planning ticket whose review the responsibility check is restoring (README, "Responsibility

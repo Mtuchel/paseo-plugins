@@ -66,6 +66,7 @@ class FakeLinear {
     return { changed: true };
   }
   async moveToState(_id: string, stateId: string) { this.writes.push(`restore ${stateId}`); }
+  async moveToReady(id: string) { this.writes.push(`ready ${id}`); return { changed: true }; }
   async comment(_id: string, body: string) { this.writes.push(`comment: ${body}`); }
   // The bodies the plugin wrote for waiting periods, by comment id (reconcile's kind lookup).
   readonly bodies = new Map<string, string>();
@@ -550,6 +551,18 @@ test("the previous state is not restored when someone moved the ticket out of Ne
   await writeback.turnEnded({ agent: root, turnId: "t", outcome: { kind: "failed", error: { message: "boom" } }, timeline: [] }, linked);
   // Errors, not questions, get the blocked label.
   assert.deepEqual(linear.writes, ["state", "-paseo-needs-you", "comment: **ENG-1: Fix sign-in** (Paseo) stopped with an error: boom", "+paseo-blocked"]);
+});
+
+test("a stale wait cleared with nothing recorded returns a never-started ticket to Todo and a started one to work", async () => {
+  const never = new FakeLinear();
+  never.state = { ...never.state, status: "Needs input", statusId: "ni", statusType: "started" };
+  await new Writeback(never, { read: async () => allOn }, undefined, 0).clearWait("issue-1", "ENG-1");
+  assert.deepEqual(never.writes, ["state", "-paseo-needs-you", "ready issue-1"], "no record and no pull request: planned work waits in Todo, not In Progress");
+
+  const started = new FakeLinear();
+  started.state = { ...started.state, status: "Needs input", statusId: "ni", statusType: "started", attachmentUrls: ["https://github.com/o/r/pull/9"] };
+  await new Writeback(started, { read: async () => allOn }, undefined, 0).clearWait("issue-1", "ENG-1");
+  assert.deepEqual(started.writes, ["state", "-paseo-needs-you", "in-progress issue-1"], "a ticket with work behind it goes back to work");
 });
 
 test("archiving clears the running marker and reports only when no pull request was linked", async () => {

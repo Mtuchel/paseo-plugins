@@ -1238,7 +1238,7 @@ test("a permission shows in the agent panel only while still pending, and the ti
     const calls: string[] = [];
     const linear = {
       issueCore: async () => ({ id: "i1", identifier: "TUC-1", status: "In Progress", statusId: "ip", statusType: "started", teamId: "t", projectId: null, creatorId: "customer", labels: [], attachmentUrls: [] }),
-      markInProgress: async () => ({ changed: false }), moveToReview: async () => ({ changed: false }), linkUrl: async () => {}, moveToState: async () => {},
+      markInProgress: async () => ({ changed: false }), moveToReview: async () => ({ changed: false }), linkUrl: async () => {}, moveToState: async () => {}, moveToReady: async () => ({ changed: false }),
       moveToStateNamed: async (_i: string, name: string) => { calls.push(`move ${name}`); return { changed: true }; },
       comment: async (_i: string, body: string) => { calls.push(`comment ${body.slice(0, 30)}`); },
       upsertComment: async (_i: string, body: string, id: string | null) => { calls.push(`app comment ${id ?? "new"} ${body.split("\n")[0]}`); return "c1"; },
