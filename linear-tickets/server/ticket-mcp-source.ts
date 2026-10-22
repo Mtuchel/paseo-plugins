@@ -284,6 +284,11 @@ async function relate(from, to, type) {
 }
 
 const RELATION_TYPES = ["related", "blocks", "blocked_by", "duplicate_of"];
+// Plan review and Plan approved are the plan pipeline's states, not an agent's: Paseo opens the
+// review and records the owner's decision. An agent setting either leaves a ticket whose status
+// promises a review page that does not exist (the responsibility check then reports it).
+const PLAN_STAGES = { "plan review": true, "plan approved": true };
+const PLAN_STAGE_REFUSAL = "Only a plan review moves a ticket to Plan review, and only the owner's plan decision moves it to Plan approved; an agent setting either leaves a status with no review for the owner to decide. Submit the plan through the plan review flow instead (in omp write the plan file, then write its slug to xd://propose; elsewhere call plannotator_submit_plan), or leave an issue you created to its own planner.";
 const ISSUE_PROPERTY = { type: "string", minLength: 1, maxLength: 100, description: "Identifier such as ENG-123. Omit for this agent's own ticket." };
 
 const tools = [
@@ -368,7 +373,7 @@ const tools = [
   },
   {
     name: "set_status",
-    description: "Move this agent's Linear ticket, or an issue it created (issue), to another workflow state of its team, by exact state name (see get_ticket/get_issue). A canceled or duplicate state needs a reason, which is posted on the issue first. \"" + NEEDS_INPUT_STATE + "\" is Paseo's owner-wait state: it is set only with a question to the owner and cleared when the answer arrives, so it cannot be set here.",
+    description: "Move this agent's Linear ticket, or an issue it created (issue), to another workflow state of its team, by exact state name (see get_ticket/get_issue). Plan review and Plan approved are refused: Paseo opens the plan review and records the owner's plan decision; submit the plan instead. A canceled or duplicate state needs a reason, which is posted on the issue first. \"" + NEEDS_INPUT_STATE + "\" is Paseo's owner-wait state: it is set only with a question to the owner and cleared when the answer arrives, so it cannot be set here.",
     inputSchema: { type: "object", properties: { status: { type: "string", minLength: 1, maxLength: 200 }, reason: { type: "string", minLength: 1, maxLength: 2000 }, issue: ISSUE_PROPERTY }, required: ["status"], additionalProperties: false },
     async run(input) {
       const wanted = text(input.status, "status", 200).toLowerCase();
@@ -380,6 +385,7 @@ const tools = [
       const all = states(issue);
       const target = all.find((s) => s.name.trim().toLowerCase() === wanted);
       if (!target) throw new Error("Unknown status. Choose one of: " + all.map((s) => s.name).join(", "));
+      if (PLAN_STAGES[target.name.trim().toLowerCase()]) throw new Error(PLAN_STAGE_REFUSAL);
       if (issue.state && issue.state.name === target.name) return { changed: false, status: target.name };
       if (REASON_TYPES.includes(target.type)) {
         if (input.reason === undefined) throw new Error("Moving the issue to " + target.name + " closes it without its work: give the reason.");

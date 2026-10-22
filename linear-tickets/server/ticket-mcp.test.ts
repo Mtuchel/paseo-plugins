@@ -294,6 +294,36 @@ test("the MCP server reads, comments, moves and links only its own ticket over s
   } finally { mcp.stop(); await broker.stop(); await linear.close(); await rm(home, { recursive: true, force: true }); }
 });
 
+test("set_status refuses Plan review and Plan approved: only the review and the plan decision move a ticket there", async () => {
+  const home = await mkdtemp(join(tmpdir(), "paseo-linear-mcp-plan-stages-"));
+  const withPlanStages = [...states,
+    { id: "s-plan-review", name: "Plan review", type: "started", position: 4 },
+    { id: "s-plan-approved", name: "Plan approved", type: "started", position: 5 }];
+  const linear = await fakeLinear((call) => {
+    if (call.query.includes("query ticket")) return { issue: { ...issue, team: { id: "team-1", name: "Eng", states: { nodes: withPlanStages } } } };
+    if (call.query.includes("issueUpdate")) return { issueUpdate: { success: true, issue: { state: { name: "In Review" } } } };
+    return {};
+  });
+  await mkdir(join(home, "linear-tickets"), { recursive: true });
+  await writeFile(join(home, "linear-tickets", "credentials.json"), JSON.stringify({ apiKey: "saved-key" }));
+  const script = await writeTicketMcpScript(home);
+  const { broker, budget } = await brokerOn(home, linear);
+  samples(budget);
+  const mcp = startOn(home, script);
+  try {
+    for (const status of ["Plan review", "plan approved"]) {
+      const refused = await mcp.call("set_status", { status });
+      assert.equal(refused.isError, true, `${status} is not an agent's to set`);
+      assert.match(refused.text, /Only a plan review moves a ticket to Plan review/);
+      assert.match(refused.text, /write its slug to xd:\/\/propose/, "the refusal names the submission path");
+    }
+    assert.equal(linear.calls.filter((call) => call.query.includes("issueUpdate")).length, 0, "nothing moved");
+    // Every other state stays writable.
+    assert.equal((await mcp.call("set_status", { status: "In Review" })).isError, false);
+    assert.deepEqual(linear.calls.filter((call) => call.query.includes("issueUpdate")).map((call) => call.variables), [{ id: ISSUE_ID, stateId: "s-review" }]);
+  } finally { mcp.stop(); await broker.stop(); await linear.close(); await rm(home, { recursive: true, force: true }); }
+});
+
 test("get_comments pages through the whole comment history, past what get_ticket shows", async () => {
   const home = await mkdtemp(join(tmpdir(), "paseo-linear-mcp-comments-"));
   // 120 comments, newest first as Linear lists them; the oldest is on the third page.
