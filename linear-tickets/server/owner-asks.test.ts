@@ -221,6 +221,53 @@ test("a failing extraction leaves the ask unextracted without blocking the read,
   h.ownerAsks.stop();
 });
 
+test("a current ask keeps slow extraction retries after the fast attempts instead of staying unextracted", async (t) => {
+  const failure: Extraction = { ok: false, reason: "an option or tradeoff is not quoted from the original source" };
+  const h = await setup({
+    issues: [
+      issue(),
+      issue({ id: "i9", identifier: "TUC-1900", title: "Rotate the token", description: "Use the staging role.", parentId: null, parentIdentifier: null, labels: ["paseo-manual"] }),
+    ],
+    needsYou: [{ id: "i1", identifier: "TUC-1616", parentId: "p1", agentId: "a1" }],
+    extraction: async () => failure,
+  });
+  t.after(() => h.ownerAsks.stop());
+  const stored = async (file: string): Promise<{ attempts?: number; nextAt?: string | null; lastError?: string }> =>
+    JSON.parse(await readFile(join(h.directory, "extract", file), "utf8").catch(() => "{}"));
+  const calls = (identifier: string): number => h.extractedWith.filter((entry) => entry.identifier === identifier).length;
+  // Repeated snapshots until the attempt lands on disk at this clock. A snapshot mid-write is
+  // harmless: the queue entry is released after the attempt finishes.
+  const collect = async (file: string, expected: number): Promise<void> => {
+    await untilAsync(async () => { await h.ownerAsks.snapshot(h.paseo); return (await stored(file)).attempts === expected; });
+  };
+  assert.equal((await h.ownerAsks.snapshot(h.paseo)).asks.length, 2);
+  await collect("i1.json", 1);
+  await collect("i9.json", 1);
+  assert.equal((await stored("i1.json")).nextAt, "2026-10-09T12:00:15.000Z", "the fast ladder starts as before");
+  h.state.now += 15_000;
+  await collect("i1.json", 2);
+  await collect("i9.json", 2);
+  h.state.now += 60_000;
+  await collect("i1.json", 3);
+  await collect("i9.json", 3);
+  const current = await stored("i1.json");
+  assert.equal(current.attempts, 3);
+  assert.equal(current.lastError, failure.reason, "the last refusal stays diagnosable in the cache file");
+  assert.equal(current.nextAt, new Date(h.state.now + 60 * 60_000).toISOString(), "the blocking ask keeps a slow retry");
+  const historical = await stored("i9.json");
+  assert.equal(historical.attempts, 3);
+  assert.equal(historical.nextAt, null, "a source that does not block an agent stops after the fast attempts");
+  h.state.now += 60 * 60_000;
+  await collect("i1.json", 4);
+  assert.equal(calls("TUC-1900"), 3, "the historical source pays no further model call");
+  assert.equal((await stored("i1.json")).nextAt, new Date(h.state.now + 6 * 60 * 60_000).toISOString());
+  h.state.now += 6 * 60 * 60_000;
+  await collect("i1.json", 5);
+  h.state.now += 6 * 60 * 60_000;
+  await collect("i1.json", 6);
+  assert.equal(calls("TUC-1900"), 3, "the historical bound stays after the current source retried again");
+});
+
 test("exact answer retries deliver once, persist full scope and survive restart and a new question", async (t) => {
   const h = await setup({
     issues: [issue()],

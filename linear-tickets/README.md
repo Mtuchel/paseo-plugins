@@ -5277,9 +5277,16 @@ marks a ledger entry completed, or deletes the original history.
 
 One isolated, tool-less OMP call per source/context uses thinking `low`, `deputy.model` when set,
 else the cheap tier's `cheapModels.omp` model; no MCP, extensions, skills, rules or memory.
-Strict JSON includes kind `decision`/`manual`/`info` and the source-grounded assessment. Invalid,
-oversized or tool-event responses stay unextracted and retry with backoff before giving up.
-Two calls run at a time. Private `owner-asks/extract/` cache files (`0700` directory, `0600`
+Strict JSON includes kind `decision`/`manual`/`info` and the source-grounded assessment. An
+unshowable choice set is asked as a free-text question, never shortened: an option label is the
+owner's authorization and must be quoted in full (at most the display limit), an over-long
+tradeoff description is omitted, and a shown label or description must quote the source; the
+question and its source survive either way.
+Invalid or tool-event responses stay unextracted and retry with backoff: three fast attempts for
+every source, then a slow retry (hourly, then every six hours) while the source is the current
+blocking wait, so a transient failure or one formatting refusal cannot hide a question the agent
+is waiting on. Historical sources stop after the fast attempts; the last refusal's reason stays in
+the cache file. Two calls run at a time. Private `owner-asks/extract/` cache files (`0700` directory, `0600`
 files) bind source text, current timeline/wait context and `owner-ask-4-source-currentness`;
 old extraction labels cannot silently restore urgency after this policy change.
 
