@@ -3,7 +3,7 @@ import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { askHash, checkExtraction, extractionPrompt, extractWithOmp, MAX_OPTIONS, MAX_QUESTIONS, MAX_SOURCE_CHARS, type ExtractInput } from "./owner-ask-extract";
+import { askHash, checkExtraction, extractionPrompt, extractWithOmp, MAX_DESCRIPTION_CHARS, MAX_LABEL_CHARS, MAX_OPTIONS, MAX_QUESTIONS, MAX_SOURCE_CHARS, SYSTEM_PROMPT, type ExtractInput } from "./owner-ask-extract";
 import type { OmpRun } from "./omp-runner";
 
 const answer = (value: unknown): string => JSON.stringify({ type: "message_end", message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: JSON.stringify(value) }] } });
@@ -68,16 +68,50 @@ test("junk is rejected: not an object, an unknown kind, no summary, a question w
     [payload({ kind: "decision", summary: "Pick one", questions: [{ question: "Which?", options: [{ label: 3 }] }] }), "an option has no label"],
     [payload({ kind: "decision", summary: "Pick one", questions: [{ question: "Which?", options: "yes" }] }), "a question's options are not a list"],
     [payload({ kind: "decision", summary: "Pick one", questions: Array.from({ length: MAX_QUESTIONS + 1 }, (_, index) => ({ question: `Q${index}?`, options: [] })) }), `the extraction returned ${MAX_QUESTIONS + 1} questions (at most ${MAX_QUESTIONS})`],
-    [payload({ kind: "decision", summary: "Pick one", questions: [{ question: "Which?", options: Array.from({ length: MAX_OPTIONS + 1 }, (_, index) => ({ label: `Option ${index}` })) }] }), `the extraction returned ${MAX_OPTIONS + 1} options (at most ${MAX_OPTIONS})`],
   ];
   for (const [raw, reason] of cases) assert.deepEqual(checkExtraction(raw), { ok: false, reason }, raw.slice(0, 60));
 });
 
-test("long choices are rejected rather than truncating a final authority boundary", () => {
+test("an unshowable choice set keeps the question and its source instead of dropping the ask", () => {
+  // The label is the owner's authorization: it is never shortened. The question still reaches the
+  // owner (free text) instead of the whole ask staying unextracted, which was the 2026-10-22 drop.
   const label = "Approve " + "the reversible staging step ".repeat(12) + "but never production";
+  assert.ok(label.length > MAX_LABEL_CHARS);
+  const long = checkExtraction(payload({ kind: "decision", summary: "Choose scope",
+    questions: [{ question: "Which scope?", options: [{ label, description: "" }, { label: "B. Wait", description: "" }] }] }), `Which scope?\nA. ${label}\nB. Wait`);
+  assert.ok(long.ok, long.ok ? "" : long.reason);
+  assert.deepEqual(long.value.questions, [{ key: "q1", question: "Which scope?", options: [], multiSelect: false }]);
+  const many = checkExtraction(payload({ kind: "decision", summary: "Choose scope",
+    questions: [{ question: "Which scope?", options: Array.from({ length: MAX_OPTIONS + 1 }, (_, index) => ({ label: `Option ${index}` })) }] }), "Which scope?");
+  assert.ok(many.ok, many.ok ? "" : many.reason);
+  assert.deepEqual(many.value.questions[0].options, []);
+});
+
+test("an over-long tradeoff is omitted, not the question, so the ask still reaches the owner", () => {
+  const tradeoff = "limits exposure to staging and never touches production ".repeat(8).trim();
+  assert.ok(tradeoff.length > MAX_DESCRIPTION_CHARS);
+  const source = `Which scope?\nA. Stage only — ${tradeoff}\nB. Wait — No release today.`;
   const checked = checkExtraction(payload({ kind: "decision", summary: "Choose scope",
-    questions: [{ question: "Which scope?", options: [{ label, description: "" }] }] }), label);
-  assert.equal(checked.ok, false);
+    questions: [{ question: "Which scope?", options: [
+      { label: "A. Stage only", description: tradeoff },
+      { label: "B. Wait", description: "No release today." },
+    ] }] }), source);
+  assert.ok(checked.ok, checked.ok ? "" : checked.reason);
+  assert.deepEqual(checked.value.questions[0].options, [
+    { label: "A. Stage only", description: "" },
+    { label: "B. Wait", description: "No release today." },
+  ]);
+  // A short description that is not quoted is still a refusal: the option would misrepresent it.
+  assert.equal(checkExtraction(payload({ kind: "decision", summary: "Choose scope",
+    questions: [{ question: "Which scope?", options: [{ label: "B. Wait", description: "Owner already approved it." }] }] }), source).ok, false);
+});
+
+test("rendered text of a source link or entity still counts as the exact quote", () => {
+  const source = "**Choose:** [Plan](https://linear.app/x) &amp; the [ADR](https://example.com/adr) — stage only.";
+  const checked = checkExtraction(payload({ kind: "decision", summary: "Choose",
+    questions: [{ question: "Stage only?", options: [{ label: "Choose: Plan & the ADR", description: "" }] }] }), source);
+  assert.ok(checked.ok, checked.ok ? "" : checked.reason);
+  assert.deepEqual(checked.value.questions[0].options, [{ label: "Choose: Plan & the ADR", description: "" }]);
 });
 
 test("the prompt carries the ask as data and is capped at the source limit", () => {
@@ -85,6 +119,9 @@ test("the prompt carries the ask as data and is capped at the source limit", () 
   const prompt = extractionPrompt(input);
   assert.match(prompt, /ASK — the "Needs you" sub-issue TUC-1616 of the closed ticket TUC-1453/);
   assert.match(prompt, /Title: Needs you: who takes TUC-1562\?/);
+  assert.match(SYSTEM_PROMPT, /at most 200 characters/);
+  assert.match(SYSTEM_PROMPT, /at most 300 characters/);
+  assert.match(SYSTEM_PROMPT, /return that question with options empty/);
   assert.ok(prompt.length < MAX_SOURCE_CHARS + 500);
   assert.ok(!prompt.includes("x".repeat(MAX_SOURCE_CHARS + 1)));
   assert.match(extractionPrompt({ ...input, kind: "manual" }), /manual task TUC-1616/);

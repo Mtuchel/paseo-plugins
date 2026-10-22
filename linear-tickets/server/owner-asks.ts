@@ -22,10 +22,16 @@ import { DecisionLedger, type DecisionRecord } from "./decision-ledger";
 // explicit owner actions still use exact source/revision freshness and durable reservations.
 
 export const OWNER_ASK_DIRECTORY = () => join(paseoHome(), "linear-tickets", "owner-asks");
-// One model call at a time or two; a failure is retried with backoff and then left unextracted.
+// One model call at a time or two; a failure is retried with backoff and then left unextracted
+// unless the source is the owner's current blocking question.
 const EXTRACT_CONCURRENCY = 2;
 const MAX_ATTEMPTS = 3;
 const RETRY_DELAYS_MS = [15_000, 60_000, 300_000];
+// A current owner ask keeps a slow retry after the fast attempts: a transient model or network
+// failure, or one formatting refusal, must not hide the question for as long as the agent waits
+// (2026-10-22: TUC-2254's steward ask and four TUC-607 sources were stuck at three attempts).
+// Historical sources still stop after the fast attempts.
+const CURRENT_RETRY_DELAYS_MS = [60 * 60_000, 6 * 60 * 60_000];
 const CALLER = "owner-asks";
 const SNAPSHOT_READ_CONCURRENCY = 16;
 const AGENT_PAGE = 200;
@@ -118,10 +124,13 @@ type Draft = { issue: OwnerAskIssue; manual: boolean; text: string; sourceId: st
 // `stale`: a stored pre-policy owner/owner-hold result. Its value stays displayed (fail-open)
 // until one re-extraction replaces it; it never suppresses the queued replacement.
 type ExtractionState = { hash: string; value: ExtractedAsk | null; attempts: number; nextAt: number; running: boolean; stale: boolean };
-type ExtractionJob = { issueId: string; hash: string; input: ExtractInput };
+// `current`: the source is the owner's current blocking question, so its extraction is retried
+// slowly instead of being given up after the fast attempts.
+type ExtractionJob = { issueId: string; hash: string; input: ExtractInput; current: boolean };
 // `policyAttempts`: failed re-extraction attempts of a stale pre-policy result. The original
-// `attempts` count belongs to the extraction that produced the stale result.
-type StoredExtraction = { hash: string; version: string; policy?: string; model: string; result: ExtractedAsk | null; attempts: number; policyAttempts?: number; nextAt: string | null; at: string };
+// `attempts` count belongs to the extraction that produced the stale result. `lastError` keeps
+// the last refusal's reason, so a source that stays unextracted is diagnosable from its file.
+type StoredExtraction = { hash: string; version: string; policy?: string; model: string; result: ExtractedAsk | null; attempts: number; policyAttempts?: number; lastError?: string; nextAt: string | null; at: string };
 
 // Discover sources across every status without interpreting punctuation, labels or old wait
 // envelopes as current owner attention. Delivery receipts are timeline evidence, not new asks.
@@ -395,8 +404,11 @@ export class OwnerAsks {
           state = { hash, value: null, attempts: 0, nextAt: 0, running: false, stale: false };
           this.extractions.set(key, state);
         }
-        if ((!state.value || state.stale) && !state.running && state.attempts < MAX_ATTEMPTS && state.nextAt <= this.now()) {
-          this.enqueue({ issueId: key, hash, input });
+        // A current wait retries without the fast-attempt cap: the question blocks the agent, so
+        // giving up on it is the drop. Every other source keeps the bounded budget.
+        const waiting = Boolean(draft.context.currentWait);
+        if ((!state.value || state.stale) && !state.running && state.nextAt <= this.now() && (state.attempts < MAX_ATTEMPTS || waiting)) {
+          this.enqueue({ issueId: key, hash, input, current: waiting });
         }
         const value = state.value;
         consume({ draft, scope, value, derived: deriveAsk(draft, value, parts, scope) }, index);
@@ -888,13 +900,17 @@ export class OwnerAsks {
     if (outcome.ok) {
       state.nextAt = 0;
     } else {
-      state.nextAt = attempts < MAX_ATTEMPTS ? this.now() + RETRY_DELAYS_MS[attempts - 1] : 0;
-      console.error(`[linear-tickets] extracting the ask on ${job.input.identifier} failed (attempt ${attempts} of ${MAX_ATTEMPTS}): ${outcome.reason}`);
-      if (attempts < MAX_ATTEMPTS) this.retryAfter(RETRY_DELAYS_MS[attempts - 1]);
+      // Fast attempts first; a current source then keeps a slow retry instead of stopping. Its
+      // attempt count still grows, so the log and file show how often it was tried.
+      const delay = attempts < MAX_ATTEMPTS ? RETRY_DELAYS_MS[attempts - 1]
+        : job.current ? CURRENT_RETRY_DELAYS_MS[Math.min(attempts - MAX_ATTEMPTS, CURRENT_RETRY_DELAYS_MS.length - 1)] : 0;
+      state.nextAt = delay ? this.now() + delay : 0;
+      console.error(`[linear-tickets] extracting the ask on ${job.input.identifier} failed (attempt ${attempts}${attempts <= MAX_ATTEMPTS ? ` of ${MAX_ATTEMPTS}` : ""}): ${outcome.reason}${delay ? "" : "; the source stays unextracted"}`);
+      if (delay) this.retryAfter(delay);
     }
     // A failed attempt keeps the stale card visible. It writes no policy marker, so the record
     // stays stale across a restart; `policyAttempts` keeps the attempt/backoff cap across restarts.
-    const stored: StoredExtraction = { hash: job.hash, version: EXTRACTION_VERSION, ...(outcome.ok ? { policy: EXTRACTION_POLICY } : {}), model, result: outcome.ok ? outcome.value : state.value, attempts, ...(!outcome.ok && state.stale ? { policyAttempts: attempts } : {}), nextAt: state.nextAt ? new Date(state.nextAt).toISOString() : null, at: new Date(this.now()).toISOString() };
+    const stored: StoredExtraction = { hash: job.hash, version: EXTRACTION_VERSION, ...(outcome.ok ? { policy: EXTRACTION_POLICY } : {}), model, result: outcome.ok ? outcome.value : state.value, attempts, ...(!outcome.ok && state.stale ? { policyAttempts: attempts } : {}), ...(outcome.ok ? {} : { lastError: outcome.reason }), nextAt: state.nextAt ? new Date(state.nextAt).toISOString() : null, at: new Date(this.now()).toISOString() };
     await this.write(this.extractionPath(job.issueId), JSON.stringify(stored));
     // Publish only durable extraction payloads; the revision seen by the owner survives restart.
     state.value = stored.result;
