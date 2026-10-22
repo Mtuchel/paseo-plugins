@@ -354,7 +354,10 @@ agent's own ticket):
   as `cursor`), including the comments a long ticket's snapshot left out;
 - `add_comment` — post a Markdown comment, on any issue;
 - `set_status` — move the ticket (or an issue the agent created) to another state of its team by
-  name; a canceled or duplicate state needs a `reason`, posted on the issue before the move;
+  name; a canceled or duplicate state needs a `reason`, posted on the issue before the move. The
+  team's **Needs input** state cannot be set: it is Paseo's owner-wait state, opened only together
+  with the question comment and closed when the answer arrives, so the call fails and the agent
+  asks you (question request, or `add_comment` and the end of its turn) instead;
 - `link_url` — attach an https link, such as the pull request;
 - `add_relation` — relate the ticket (or an issue the agent created) to any issue: related,
   blocks, blocked by or duplicate of;
@@ -3010,11 +3013,13 @@ independently of the agent's own `linear_ticket` tools:
     opened the agent's Linear session, else the ticket's creator when a person wrote it, else you.
   Further questions in the same wait edit that comment. Once nothing is pending (a follow-up
   question arriving within seconds keeps the wait open), and when the turn ends or the agent
-  is archived, the label comes off and the ticket returns to its previous state — or to its
-  team's In Progress state when the plugin has no record of it, which happens when the wait
-  opened while the ticket already waited for you (an earlier wait, the other host, a wait
-  whose end was lost) — unless someone moved it out of Needs input meanwhile. A ticket whose
-  team has no In Progress state, or that is closed, is left where it is. The next wait gets a fresh comment. A
+  is archived, the label comes off and the ticket returns to its previous state — or, when the
+  plugin has no record of it (an earlier wait, the other host, a wait whose end was lost, a state
+  set outside the plugin), to its team's In Progress state if anything shows the ticket started (an
+  agent record or a linked pull request) and to its team's **Todo** state if it did not, so a
+  ticket nothing worked on never claims to be in progress — unless someone moved it out of Needs
+  input meanwhile. A ticket whose
+  team has neither an In Progress nor a Todo state, or that is closed, is left where it is. The next wait gets a fresh comment. A
   failed turn adds `<label>-blocked`, which marks errors only; the next completed turn
   removes it, and so does the **Ticket steward** (see **Ticket steward** under Projects)
   once the ticket closed or its agent is in a turn again. A message that reaches an agent
@@ -3031,6 +3036,12 @@ independently of the agent's own `linear_ticket` tools:
   more, ends like a normal one. A wait that just opened is left alone until the daemon has
   listed its agents again, and a ticket this host handed to the other host keeps its wait,
   which the other host's plugin ends.
+  A Needs input state can also have no wait record at all — an agent's status call moved the
+  ticket there (now refused), you did, or the record went with an archived agent — and no poll
+  above can see it. So the **Ticket steward** reads its configured teams' Needs input tickets by
+  state on every pass (the state is not a label) and judges them like any other ticket: one that no
+  recorded wait and no live agent back is a stale wait, and the pass clears it the same way, back
+  to work or to Todo (see above).
   As a fallback, a completed turn whose final reply ends by asking you (a question, or a
   phrase such as "needs your OK", "once you decide" or "reply "yes" and I'll") opens a
   wait too; the comment quotes that part of the reply. It lasts until the agent's next turn
@@ -3166,7 +3177,8 @@ right before the start, so one that closed or landed since the watch read it sta
 the next pass acts on the healed state), the
 replay instruction for a closed-unmerged pull request, a restart for a ticket whose agent vanished,
 a start for an unblocked ticket that never started, one resume for a silent agent, the clearing of
-a stale owner wait, the archive of a finished ticket's agents, or an escalation. Restarts are capped at three per ticket within 24 hours and at `steward.maxActionsPerPass`
+a stale owner wait (a ticket in Needs input that no recorded wait and no live agent back, however
+it got there), the archive of a finished ticket's agents, or an escalation. Restarts are capped at three per ticket within 24 hours and at `steward.maxActionsPerPass`
 starts, successors, verifiers and resumes per pass, so a backlog never floods the capacity; closes,
 archives and escalations are not capped. A deliberate wait — the `hold`/`manual`/`do-not-merge`
 labels, a plan under review or a parked plan, the watchdog's owner Stop, a pending permission, a

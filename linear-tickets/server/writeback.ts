@@ -24,6 +24,9 @@ import { paseoHome } from "./ticket-mcp";
 export const MAX_SUMMARY_LENGTH = 4_000;
 // The workflow state (type started) a ticket waits in while its agent needs the owner.
 export const NEEDS_INPUT_STATE = "Needs input";
+// The id a wait opened without an agent is anchored to (anchor below): no agent carries it, and a
+// ticket that has one is one the plugin holds no agent record for.
+export const STEWARD_WAIT_ANCHOR = "steward-";
 const NEEDS_YOU_COLOR = "#eb5757";
 const CLOSED_TYPES = ["completed", "canceled", "duplicate"];
 const MAX_NEEDS_YOU_TITLE = 80;
@@ -58,7 +61,7 @@ export type AgentBridge = {
   sessions: Pick<SessionRouter, "sessionFor" | "say" | "action" | "ask" | "askQuestion" | "link" | "offerResume" | "resumeNow" | "scheduleLimitResume" | "holdIfStopped" | "follow" | "unfollow">;
   handover: Pick<Handover, "read" | "all" | "update" | "remember" | "finish" | "handOff" | "waiting" | "setWaiting">;
 };
-type Linear = Pick<LinearService, "issueCore" | "markInProgress" | "moveToStateNamed" | "moveToState" | "comment" | "upsertComment" | "commentBody" | "addLabel" | "removeLabel" | "linkUrl" | "moveToReview" | "viewerId" | "isPerson" | "userUrl" | "createIssue" | "complete">;
+type Linear = Pick<LinearService, "issueCore" | "markInProgress" | "moveToStateNamed" | "moveToState" | "moveToReady" | "comment" | "upsertComment" | "commentBody" | "addLabel" | "removeLabel" | "linkUrl" | "moveToReview" | "viewerId" | "isPerson" | "userUrl" | "createIssue" | "complete">;
 // What a waiting period needs of its agent: enough to write the record back without a hook event.
 type WaitingAgent = { id: string; title: string | null; cwd: string };
 
@@ -357,7 +360,7 @@ export class Writeback {
   private async anchor(issueId: string, identifier: string): Promise<WaitingAgent> {
     const record = await this.agentBridge?.handover?.read(issueId).catch(() => null) ?? null;
     if (record?.agentId) return { id: record.agentId, title: record.agentTitle, cwd: record.worktreePath ?? "" };
-    return { id: `steward-${issueId.slice(0, 8)}`, title: `Paseo's ticket steward on ${identifier}`, cwd: "" };
+    return { id: `${STEWARD_WAIT_ANCHOR}${issueId.slice(0, 8)}`, title: `Paseo's ticket steward on ${identifier}`, cwd: "" };
   }
 
   // The steward's escalation (steward.ts): one owner-visible decision item on the ticket — the
@@ -460,11 +463,14 @@ export class Writeback {
       if (state.status.trim().toLowerCase() === NEEDS_INPUT_STATE.toLowerCase()) {
         if (waiting?.previousStateId) await this.linear.moveToState(issue.id, waiting.previousStateId);
         // The period opened while the ticket was already in Needs input (an earlier wait here or on
-        // the other host, or one whose end was lost), so nothing recorded the state it left: it goes
-        // back to work instead of sitting in Needs input for good. A ticket whose team has no work
-        // state, or that is closed, is left where it is.
+        // the other host, one whose end was lost, or a status call that never opened a wait), so
+        // nothing recorded the state it left. A ticket nothing shows ever started -- the wait is
+        // anchored to the steward, not to an agent, and no pull request is linked -- goes back to its
+        // team's Todo, where planned work waits: In Progress would claim work no agent is doing.
+        // One that started goes back to work. A closed ticket, or a team without that state, is left.
         else if (!CLOSED_TYPES.includes(state.statusType.trim().toLowerCase())) {
-          const moved = await this.linear.markInProgress(state, state.teamId, { fromStarted: true });
+          const started = !agent.id.startsWith(STEWARD_WAIT_ANCHOR) || state.attachmentUrls.some((url) => /^https:\/\/github\.com\/[^/]+\/[^/]+\/pull\/\d+/.test(url));
+          const moved = started ? await this.linear.markInProgress(state, state.teamId, { fromStarted: true }) : await this.linear.moveToReady(issue.id);
           if (moved.note) console.error(`[linear-tickets] ${issue.identifier}: the wait ended but the ticket stayed in ${state.status}: ${moved.note}`);
         }
       }

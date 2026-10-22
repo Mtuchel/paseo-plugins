@@ -39,6 +39,9 @@ const socketPath = join(paseoHome, "linear-tickets", "linear-broker.sock");
 const toolContext = new AsyncLocalStorage();
 // Closing a ticket without its work needs a reason, posted on the ticket before the move.
 const REASON_TYPES = ["canceled", "duplicate"];
+// Paseo's owner-wait state (writeback.ts NEEDS_INPUT_STATE): it is set only with the comment that
+// asks the owner and cleared when the answer arrives, so the status tool never moves a ticket there.
+const NEEDS_INPUT_STATE = "Needs input";
 const MAX_LINE_BYTES = 1024 * 1024;
 const MAX_IN_FLIGHT = 4;
 let inFlight = 0;
@@ -365,10 +368,14 @@ const tools = [
   },
   {
     name: "set_status",
-    description: "Move this agent's Linear ticket, or an issue it created (issue), to another workflow state of its team, by exact state name (see get_ticket/get_issue). A canceled or duplicate state needs a reason, which is posted on the issue first.",
+    description: "Move this agent's Linear ticket, or an issue it created (issue), to another workflow state of its team, by exact state name (see get_ticket/get_issue). A canceled or duplicate state needs a reason, which is posted on the issue first. \"" + NEEDS_INPUT_STATE + "\" is Paseo's owner-wait state: it is set only with a question to the owner and cleared when the answer arrives, so it cannot be set here.",
     inputSchema: { type: "object", properties: { status: { type: "string", minLength: 1, maxLength: 200 }, reason: { type: "string", minLength: 1, maxLength: 2000 }, issue: ISSUE_PROPERTY }, required: ["status"], additionalProperties: false },
     async run(input) {
       const wanted = text(input.status, "status", 200).toLowerCase();
+      // Moving the ticket there by hand would park it in a wait nothing can end: no comment asks the
+      // owner, no record says what it waits for, and no event clears it when the owner answers. The
+      // plugin opens that state with the question (README, "Statuses and labels").
+      if (wanted === NEEDS_INPUT_STATE.toLowerCase()) throw new Error(NEEDS_INPUT_STATE + " is Paseo's owner-wait state: it is set only together with a question to the owner and cleared when the answer arrives, so it cannot be set here. Ask the owner through your session's question tool, or post the question with add_comment and end your turn, instead of moving the ticket.");
       const { issue } = await writable(input.issue, "changing its status");
       const all = states(issue);
       const target = all.find((s) => s.name.trim().toLowerCase() === wanted);
