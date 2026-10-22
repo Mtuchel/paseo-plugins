@@ -266,6 +266,27 @@ test("omp's local plan proposals are checked against the text the bridge would s
   assert.equal(await h.call("write", { path: "xd://propose", content: "rework" }), undefined);
 });
 
+test("a plan whose local images would not show in Plannotator is refused at the record and again at submission", async () => {
+  const h = load();
+  const record = () => h.record({ filePath: "PLAN.md", verdict: "agreed", advisorAgentId: "astra" });
+  const mock = join(h.cwd, "order-mock.png");
+  const withMock = (src: string) => PLAN.replace("Do the thing.", `Do the thing.\n\n![Mock: order page, before and after](${src})`);
+  writeFileSync(join(h.cwd, "PLAN.md"), withMock(mock));
+  const missing = await record();
+  assert.match(missing, /would not show in Plannotator/);
+  assert.ok(missing.includes(`"${mock}" does not exist`), "the refusal names the missing file");
+  writeFileSync(join(h.cwd, "PLAN.md"), withMock("order-mock.png"));
+  assert.match(await record(), /"order-mock\.png" is not an absolute path/);
+  writeFileSync(mock, "png");
+  writeFileSync(join(h.cwd, "PLAN.md"), withMock(mock));
+  assert.match(await record(), /recorded/);
+  assert.equal(await h.submit("PLAN.md"), undefined);
+  rmSync(mock);
+  const gone = await h.submit("PLAN.md");
+  assert.equal(gone?.block, true, "an image deleted after the record stops the submission");
+  assert.ok(gone.reason.includes(`"${mock}" does not exist`));
+});
+
 test("a record and a submission in the same message count in that order: omp runs every call's handler before any tool", async () => {
   const h = load();
   const astra = { filePath: "PLAN.md", verdict: "agreed", advisorAgentId: "astra" };
