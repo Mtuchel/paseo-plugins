@@ -1135,6 +1135,32 @@ having received the instructions: on 2026-10-07 omp dropped them for some sessio
 returning `systemPrompt` made it re-run the start hooks after Plannotator had marked them
 delivered), and their plans reached the owner in the wrong layout for hours.
 
+**Visual mocks.** The planning instructions in `plannotator.json` (section `### Visual mock`) ask a
+plan that changes what users see to show the change as screenshots: a throwaway HTML page rendered
+with omp's eval browser, saved under `~/.plannotator/mocks/<plan-name>/` and linked by absolute
+path, which Plannotator shows in the review. Two guards keep those images visible:
+
+- **Plannotator review.** `record_plan_advice` and the submission refuse a plan whose local image
+  (`![…](…)` or `<img src>`, outside code) is not an absolute path, not an image type Plannotator
+  shows, or a file that does not exist ([`shared/plan-images.ts`](shared/plan-images.ts)): "The
+  plan's images would not show in Plannotator: …". Web, `data:` and `blob:` images are not checked.
+- **Linear plan document.** Linear cannot read the host's files, so each mock under
+  `~/.plannotator/mocks/` (real path, so no symlink out of it; at most 25 MB) is uploaded to
+  Linear's file storage with the app's token (the key when the app is not usable) and linked by
+  its `uploads.linear.app` URL in the document. The storage upload carries only the headers Linear
+  returns, never a credential. A file is uploaded once per daemon run (by content hash), so a
+  resubmitted plan reuses it. Other local images, and a mock whose upload fails, keep their local
+  link and the document is written anyway; the failure is logged as
+  `[linear-tickets] plan image <path> keeps its local link: …`.
+
+omp's own plan mode (`write xd://propose`) does not get Plannotator's planning instructions, but
+its proposals reach you in Plannotator through the bridge extension
+(`~/.omp/agent/extensions/plannotator-omp-plan.ts`, outside this repository). The bridge sends the
+same `### Visual mock` section, read live from `plannotator.json`, as a hidden message once per
+stay in plan mode (again after a compaction; never to subagents), with the one exception to plan
+mode's read-only rule it needs: writing the mock files under `~/.plannotator/mocks/`. With
+`--plan-yolo`, which records no mode change, it arrives from the second prompt on.
+
 When the review opens, the plugin approves it on your behalf only if all of these hold:
 
 - impact at or below `maxImpact` (default 1), or `maxImpactWithFlag` (default 2) behind a feature flag;
