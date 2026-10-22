@@ -337,8 +337,8 @@ a write. Multi-request tools can still partly complete before a later hold.
 
 | Scope | Write (as Paseo) |
 | --- | --- |
-| The agent's own ticket | comment, status, links, relations, manual tasks |
-| Issues the agent created with `create_issue` | comment, status, links, relations, title and description |
+| The agent's own ticket | comment, status (not Plan review or Plan approved), links, relations, manual tasks |
+| Issues the agent created with `create_issue` | comment, status (not Plan review or Plan approved), links, relations, title and description |
 | Any other issue | comment and relations only |
 
 Deleting or archiving issues, changing another issue's status, assignee or priority, and project,
@@ -357,7 +357,11 @@ agent's own ticket):
   name; a canceled or duplicate state needs a `reason`, posted on the issue before the move. The
   team's **Needs input** state cannot be set: it is Paseo's owner-wait state, opened only together
   with the question comment and closed when the answer arrives, so the call fails and the agent
-  asks you (question request, or `add_comment` and the end of its turn) instead;
+  asks you (question request, or `add_comment` and the end of its turn) instead.
+  **Plan review** and **Plan approved** are refused: Paseo opens the plan review and records the
+  plan decision, and an agent setting either would leave a status whose review page does not
+  exist. Submit the plan through its review flow instead (in omp, write the plan file and then
+  write its slug to `xd://propose`); an issue the agent created waits for its own planner;
 - `link_url` — attach an https link, such as the pull request;
 - `add_relation` — relate the ticket (or an issue the agent created) to any issue: related,
   blocks, blocked by or duplicate of;
@@ -1082,9 +1086,14 @@ the review record and plan structure, not the semantic truth of that verdict.
 
 omp planners cannot skip this. Every ticket agent carries its ticket in `LINEAR_TICKETS_ISSUE`,
 also in a session Paseo resumes after a daemon restart or reload (see "The omp extension" below),
-and for those agents the extension blocks `plannotator_submit_plan`, its `xd://` device and omp's
-`xd://propose` until `record_plan_advice` has recorded the review for exactly the plan text being
-submitted; a plan the gate cannot read is blocked too. The tool checks with `paseo inspect` that
+and for those agents the extension blocks `plannotator_submit_plan`, a `write` to
+`xd://plannotator_submit_plan` and omp's `xd://propose` until `record_plan_advice` has recorded
+the review for exactly the plan text being
+submitted; a plan the gate cannot read is blocked too. omp agents submit with Plannotator's
+`plannotator_submit_plan` tool, which its planning phase mounts, or natively by writing the plan to
+`local://<slug>-plan.md` and then writing `<slug>` to `xd://propose`. `xd://plannotator_submit_plan`
+is not a device: a `read` there answers "No such tool" even while the tool is mounted, so that
+answer alone does not mean submission is unavailable. The tool checks with `paseo inspect` that
 the advisor runs GPT-6 Astra at medium, was created by this agent and has finished its latest
 turn; any later edit to the plan needs a new record, and the record follows the session branch
 (resume, `/tree` and branch switches rebuild it). The record also needs readable `## Reach` and
