@@ -3212,7 +3212,10 @@ from Linear, the handover records, the agent listing and the pull request watch'
 **Cadence and cost.** Independent, non-overlapping one-minute watchdog and steward ticks run
 alongside the slower PR and dispatch passes. They retain cross-instance leases and stop admitting
 effects on unload. The steward reads paginated in-scope tickets and respects the Linear budget,
-deletion pause, focus mode, presence and peer ownership. Diagnostic helpers consume real capacity
+deletion pause, focus mode, presence and peer ownership. One agent-listing snapshot serves the whole
+pass: each ticket's classification and its recorded responsibility read the same roots, so a pass
+over N tickets lists the agent registry once, not once per ticket; only an action's own fresh
+re-read before its effect lists it again. Diagnostic helpers consume real capacity
 through the control lane; they do not become implementation roots.
 
 **Where to see it.** The flow summary — the counts per state, the oldest ticket of each state and

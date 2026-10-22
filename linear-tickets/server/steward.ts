@@ -780,7 +780,10 @@ function responsibilityView(ticket: StewardTicket): ResponsibilityView {
   };
 }
 
-type Candidate = { issue: StewardIssue; facts: StewardFacts; situation: StewardSituation; ticket: StewardTicket; check: ResponsibilityTicket };
+// `roots`: the ticket's agent snapshot from the pass's one registry read. Classification already
+// decides on it; recording the responsibility uses the same agents instead of listing the registry
+// again for every ticket of the pass.
+type Candidate = { issue: StewardIssue; facts: StewardFacts; situation: StewardSituation; ticket: StewardTicket; check: ResponsibilityTicket; roots: WatchedAgent[] };
 type Pass = { actions: number; cap: number };
 // What one action came to: `done` (the effect went out), `deferred` (nothing was attempted —
 // admission waits; the ticket stays queued and the pass retries, no budget spent), `failed` (it did
@@ -1059,7 +1062,7 @@ export class Steward {
       if (await this.deps.owner(issue.id).catch(() => "unknown" as HostOwnership) !== "here") continue;
       const ticket = file.tickets[issue.id] ?? null;
       const { facts, check } = await this.facts(issue, paseo, { names, roots, record: recordOf.get(issue.id) ?? null, parent: parentOf.get(issue.id) ?? null, watchdog, needsYou, handed, pulls, now, ticket, settings });
-      candidates.push({ issue, facts, situation: classifyTicket(facts), ticket: ticket ?? newTicket(issue.identifier, this.iso(now)), check });
+      candidates.push({ issue, facts, situation: classifyTicket(facts), ticket: ticket ?? newTicket(issue.identifier, this.iso(now)), check, roots: roots.get(issue.id)?.roots ?? [] });
     }
     // The responsibility check (README, "Responsibility check"), every ten minutes on this host's
     // own tickets: before this pass's effects, so a repair it makes is what the next pass reads.
@@ -1267,7 +1270,7 @@ export class Steward {
     // The situation's age: kept while it does not change, so the grace and the flow view can tell a
     // ticket that just got stuck from one that has been for hours.
     const since = previous.situation === situation ? previous.since : this.iso(now);
-    const root = await this.liveRoot(paseo, issue.id);
+    const root = newestLiveRoot(candidate.roots);
     await this.deps.store.update((file) => {
       const ticket = this.deps.store.ticket(file, issue.id, issue.identifier, this.iso(now));
       ticket.situation = situation;
@@ -2480,8 +2483,7 @@ export class Steward {
   }
 
   private async liveRoot(paseo: PaseoApi, issueId: string): Promise<WatchedAgent | null> {
-    const roots = await this.rootsOf(paseo, issueId);
-    return roots.filter((agent) => LIVE_AGENT[agent.status] && !agent.labels?.[STEWARD_VERIFIER_LABEL] && !agent.labels?.["paseo.parent-agent-id"]).sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0] ?? null;
+    return newestLiveRoot(await this.rootsOf(paseo, issueId));
   }
 
   // ESCALATE: one owner-visible decision item on the ticket — the Needs input state, the needs-you
@@ -2573,6 +2575,15 @@ function queueWait(reason: string): boolean {
     || reason === FOCUS_REASON || reason === WAITING_PLAN_REASON || reason === AWAY_REASON
     || reason === REPAIR_BUSY_MESSAGE || reason === EXCLUSION_CLOSED_MESSAGE
     || reason.startsWith(LIVE_AGAIN_PREFIX);
+}
+
+// The ticket's own root among a set of its agents: live, not a verifier generation or a sub-agent,
+// newest first — a retried start leaves the older agent behind. `liveRoot` selects it fresh before
+// an effect; a pass selects it from the registry snapshot it already read.
+function newestLiveRoot(roots: WatchedAgent[]): WatchedAgent | null {
+  return roots
+    .filter((agent) => LIVE_AGENT[agent.status] && !agent.labels?.[STEWARD_VERIFIER_LABEL] && !agent.labels?.["paseo.parent-agent-id"])
+    .sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0] ?? null;
 }
 
 // How long the live roots have been quiet: null while one of them has an open turn, else the

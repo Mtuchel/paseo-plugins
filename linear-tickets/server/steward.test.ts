@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
 import {
-  calendarDate, classifyTicket, DEFECT_GRACE_MS, DoneTickets, isDefect, parseVerdict, Steward, StewardStateError, StewardStore, STEWARD_ACTION, STEWARD_SITUATIONS, STEWARD_STATES,
+  calendarDate, classifyTicket, DEFECT_GRACE_MS, DoneTickets, isDefect, parseVerdict, Steward, StewardStateError, StewardStore, STEWARD_ACTION, STEWARD_SITUATIONS, STEWARD_STATES, STEWARD_VERIFIER_LABEL,
   RESTART_CAP, type StewardDeps, type StewardFacts, type StewardSituation,
 } from "./steward";
 import type { ParentProgress } from "./parents";
@@ -357,6 +357,9 @@ async function passFixture(t: any, over: {
     comments: [] as string[], cards: [] as string[],
     continuations: [] as { issueId: string; agentId: string; operationId: string; text: string }[],
     admissions: [] as unknown[][], startOptions: [] as Parameters<TicketStarter["start"]>[3][],
+    // The pass's agent registry reads (`sessions.watchdogRoots`): one per pass after the fix,
+    // one per classified ticket before it.
+    rootReads: 0,
   };
   const clock = { now: over.clockNow ?? T0 + 5 * 60_000 };
   const admission = { value: over.admission ?? { ok: true as boolean, reason: undefined as string | undefined } };
@@ -414,7 +417,7 @@ async function passFixture(t: any, over: {
       setDueDate: async (_id: string, date: string) => { calls.dueDates.push(date); },
     } as any,
     sessions: {
-      watchdogRoots: async () => roots,
+      watchdogRoots: async () => { calls.rootReads++; return roots; },
       restartFor: async (issueId: string) => { calls.restarts.push(issueId); return over.restart ? await over.restart() : { kind: "started", agentId: "a9" }; },
       succeed: async (...args: Parameters<SessionRouter["succeed"]>) => { calls.successions.push(args[0]); return over.succeed ? over.succeed(...args) : over.succession ? await over.succession() : { kind: "started", agent: { id: "a10", title: null, cwd: "" } }; },
       resumeVerifiedParent: async (...args: Parameters<SessionRouter["resumeVerifiedParent"]>) => {
@@ -656,6 +659,43 @@ test("the per-pass cap spreads heavy actions over passes, deterministically", as
   f.clock.now += 30 * 60_000;
   await f.pass(1);
   assert.deepEqual(f.calls.restarts, ["i1", "i2"], "the next pass takes the ticket the cap deferred");
+});
+
+// The registry read is the pass's, not each ticket's: every candidate carries the agent snapshot
+// the pass already read for classification, so N tickets cost the same read as one. The snapshot's
+// roots still pick the ticket's own newest live agent — not a verifier, not a sub-agent, not a
+// stopped generation — for the recorded responsibility.
+test("one pass reads the agent registry a bounded number of times, however many tickets it classifies", async (t) => {
+  const snapshotRoots = (count: number) => {
+    const map = new Map<string, any>();
+    for (let index = 1; index <= count; index++) {
+      map.set(`i${index}`, {
+        roots: [
+          { id: `gone-${index}`, status: "completed", createdAt: at(120), updatedAt: at(120), labels: {} },
+          { id: `root-${index}`, status: "running", createdAt: at(10), updatedAt: at(1), labels: {} },
+          { id: `verifier-${index}`, status: "running", createdAt: at(5), updatedAt: at(1), labels: { [STEWARD_VERIFIER_LABEL]: `generation-${index}` } },
+          { id: `sub-${index}`, status: "running", createdAt: at(3), updatedAt: at(1), labels: { "paseo.parent-agent-id": `root-${index}` } },
+        ],
+        ghosts: new Set<string>(),
+      });
+    }
+    return map;
+  };
+  const run = async (count: number) => {
+    const issues = Array.from({ length: count }, (_, index) => ticketIssue({ id: `i${index + 1}`, identifier: `ENG-${index + 1}` }));
+    const f = await passFixture(t, { issues, records: issues.map((issue) => recordFor(issue.id, issue.identifier)), roots: snapshotRoots(count) });
+    await f.pass();
+    return f;
+  };
+  const few = await run(4);
+  const many = await run(16);
+  assert.equal(few.calls.rootReads, many.calls.rootReads, `the pass's registry reads do not grow with the ticket count (${few.calls.rootReads} reads for 4 tickets, ${many.calls.rootReads} for 16)`);
+  assert.ok(many.calls.rootReads <= 2, `a pass lists the agent registry a bounded number of times, not once per ticket (${many.calls.rootReads} reads for 16 tickets)`);
+  for (const [name, f, count] of [["4-ticket", few, 4], ["16-ticket", many, 16]] as const) {
+    for (let index = 1; index <= count; index++) {
+      assert.equal((await f.ticket(`i${index}`))?.responsibility?.agentId, `root-${index}`, `${name} pass: ENG-${index} records its newest live root`);
+    }
+  }
 });
 
 test("deliberate waits are untouched by a whole pass", async (t) => {
