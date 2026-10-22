@@ -80,6 +80,7 @@ import { ESCALATE_TOOL, parsePlanModel, PLANNING_RESEARCH_NOTE, sessionRouting, 
 import { blockedTestWrite, STRONG_MODEL_ENV, writtenPaths, type AcceptanceTests } from "../shared/acceptance-tests";
 import type { FallbackChains } from "../shared/model-fallbacks";
 import { layoutProblem, requiredParts } from "../shared/plan-layout";
+import { planImageProblem } from "../shared/plan-images";
 import { decisionText, parseDecision, parseRouteFacts, routeRefusals, SMALL_ROUTE_ENV, SMALL_ROUTE_TOOL, SMALL_ROUTE_WAIT_MS, smallRouteNote, type RouteDecision } from "../shared/small-route";
 
 type Phase = "idle" | "planning" | "executing";
@@ -442,6 +443,9 @@ export default function linearTicketsPlanFirst(pi: ExtensionApi): void {
     // built-in ones, which name no parts, so nothing to check.
     const layout = model ? layoutProblem(content, planningParts()) : null;
     if (layout) return text(`${file}: ${layout}\n\nLay the plan out as the planning instructions in ${PLANNOTATOR_CONFIG} (phases.planning.instructions, "Plan File Structure") say, then record again.`);
+    // A mock the owner could not see (Plannotator shows local images by absolute path only).
+    const images = planImageProblem(content, existsSync);
+    if (images) return text(`${file}: ${images}\n\nFix the image links, then record again.`);
     if (verdict === "unavailable") {
       const reason = params.reason?.trim();
       if (!reason) return text("Give the reason the advisor could not be created.");
@@ -635,6 +639,9 @@ export default function linearTicketsPlanFirst(pi: ExtensionApi): void {
       if (event.toolName === SUBMIT_TOOL) return undefined;
       return { block: true, reason: `Stopped by the linear-tickets plugin: ${file} could not be read, so its advisor review cannot be checked. Write the plan with the write tool, then submit it again.` };
     }
+    // Checked again here: an image deleted after the record would reach the owner as a broken link.
+    const images = planImageProblem(content, existsSync);
+    if (images) return { block: true, reason: `Stopped by the linear-tickets plugin: ${file}: ${images} Fix the image links, then submit again.` };
     const recorded = advised.get(key);
     if (!queuedEdits.has(key) && recorded === createHash("sha256").update(content).digest("hex")) return undefined;
     return {
