@@ -5040,3 +5040,57 @@ test("steward PR evidence persists head and CI transitions without timestamp, UR
   assert.equal(pushed.headSha, "new-head");
   assert.equal(pushed.ci, null, "old-head success is not evidence about the new head");
 });
+
+// TUC-1131: the watch recorded #3868 as open (its one read, before the branch below it landed) and
+// the state never changed, because a ticket's attached pull request is not the record's watched
+// link. The steward's successor start reads the claim fresh first; these pin that read and its
+// recording — the fix's regression test is the steward's, which starts nothing on a stale claim.
+test("a recorded open pull request that landed is read fresh and recorded as landed", async (t) => {
+  const h = harness(t);
+  await h.state({ [OTHER]: { reviewedAt: null, decision: null, merged: false, headSha: "stale-head", ci: "[[\"Core\",\"passed\",\"success\"]]" } });
+  h.github.views[OTHER] = { ...READY, state: "CLOSED", labels: ["externally-merged"] };
+  const watch = await h.watch();
+  assert.equal((await watch.pullStates([OTHER])).get(OTHER)?.merged, false, "the watch's state still claims it open");
+  assert.deepEqual(await watch.freshOpenPulls([OTHER]), { open: [], unreadable: false });
+  assert.deepEqual(h.github.reads, [OTHER], "the recorded pull request was read from GitHub");
+  const after = (await watch.pullStates([OTHER])).get(OTHER)!;
+  assert.equal(after.merged, true, "the landing is recorded instead of the stale open claim");
+  assert.equal(after.closed, false, "a queue-landed closure is not a closed-unmerged replay");
+  assert.deepEqual(await watch.freshOpenPulls([OTHER]), { open: [], unreadable: false }, "another start reads it fresh again and still starts nothing");
+  assert.deepEqual((await watch.pullStates([OTHER])).get(OTHER), after, "and the recorded evidence is stable");
+});
+
+test("a recorded open pull request that closed without merging is recorded closed and due for its replay", async (t) => {
+  const h = harness(t);
+  await h.state({ [OTHER]: { reviewedAt: null, decision: null, merged: false } });
+  h.github.views[OTHER] = { ...READY, state: "CLOSED", labels: [] };
+  const watch = await h.watch();
+  assert.deepEqual(await watch.freshOpenPulls([OTHER]), { open: [], unreadable: false });
+  const after = (await watch.pullStates([OTHER])).get(OTHER)!;
+  assert.equal(after.closed, true);
+  assert.equal(after.merged, false);
+  assert.equal(after.replay, "due", "the poll's own rule for a closure nobody looked at yet");
+});
+
+test("a landing first seen by a starting successor is reported on the ticket as the poll would", async (t) => {
+  const h = harness(t);
+  h.records[0].links["Pull request"] = OTHER;
+  await h.state({ [OTHER]: { reviewedAt: null, decision: null, merged: false } });
+  h.github.views[OTHER] = { ...READY, state: "MERGED" };
+  const watch = await h.watch();
+  assert.deepEqual(await watch.freshOpenPulls([OTHER]), { open: [], unreadable: false });
+  assert.ok(h.calls.includes("review merged"), "the handover record learns it landed");
+  assert.ok(h.calls.includes("say thought The pull request was merged."), "so does the agent's session panel");
+});
+
+test("a failed fresh read is no claim that the pull request closed, and records nothing", async (t) => {
+  t.mock.method(console, "error", () => {});
+  const h = harness(t);
+  const stale = { reviewedAt: null, decision: null, merged: false };
+  await h.state({ [OTHER]: stale });
+  h.github.broken = [OTHER];
+  const watch = await h.watch();
+  assert.deepEqual(await watch.freshOpenPulls([OTHER]), { open: [], unreadable: true });
+  assert.deepEqual((await watch.pullStates([OTHER])).get(OTHER)?.merged, false, "the old claim is not overwritten by a failure");
+  assert.deepEqual(JSON.parse(await readFile(join(await h.home(), "pr-watch.json"), "utf8"))[OTHER], stale, "and the file is unchanged");
+});

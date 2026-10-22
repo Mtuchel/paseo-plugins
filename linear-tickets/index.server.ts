@@ -274,6 +274,9 @@ export default function contribute(server: PluginServerContext) {
     // full PR inventory across every attached, recorded and worktree repository.
     pulls: (urls) => pullRequests.pullStates(urls),
     completionPulls: (issueId, identifier, urls) => pullRequests.completionPulls(issueId, identifier, urls),
+    // A successor start reads its open pull requests fresh, so a closed or landed one starts
+    // nothing (pr-watch.ts freshOpenPulls).
+    freshOpenPulls: (urls) => pullRequests.freshOpenPulls(urls),
     recoveryWait: (issueId, identifier, urls) => pullRequests.recoveryWait(issueId, identifier, urls),
     intake, doneTickets, labels: new RetiredLabels(), deletions, focus, planned: waitingPlans,
     // The responsibility check (README, "Responsibility check"), built below with the review stores.
