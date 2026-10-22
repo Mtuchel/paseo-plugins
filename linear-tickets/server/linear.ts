@@ -1,3 +1,8 @@
+import { createHash } from "node:crypto";
+import { readFile, realpath } from "node:fs/promises";
+import { homedir } from "node:os";
+import { basename, join, sep } from "node:path";
+import { imageType, localPlanImages, replacePlanImages } from "../shared/plan-images";
 import { MAX_ATTACHMENT_BYTES } from "./attachments";
 import type { Issue, TicketDetail } from "../shared/contracts";
 import { boundedContext, normalizeIssue, issuePage, connection, record, stateHistorySpans, label, ticketRelations, type FinishedBlocker } from "./context";
@@ -1044,6 +1049,11 @@ export const CREATE_DOCUMENT_QUERY = `mutation documentCreate($input: DocumentCr
 export const UPDATE_DOCUMENT_QUERY = `mutation documentUpdate($id: String!, $input: DocumentUpdateInput!) {
   documentUpdate(id: $id, input: $input) { success document { id url } }
 }`;
+// Linear's file storage: an upload URL to PUT the bytes to (with the headers it names) and the
+// asset URL that links the stored file.
+export const FILE_UPLOAD_QUERY = `mutation fileUpload($contentType: String!, $filename: String!, $size: Int!) {
+  fileUpload(contentType: $contentType, filename: $filename, size: $size) { success uploadFile { uploadUrl assetUrl headers { key value } } }
+}`;
 
 function labelNodes(value: unknown): { id: string; name: string }[] {
   return connection(value ?? { nodes: [] }).nodes.map((node) => record(node)).map((node) => ({ id: label(node.id), name: label(node.name) })).filter((node) => node.id && node.name);
@@ -1147,6 +1157,8 @@ function issueLink(value: unknown): IssueLink | null {
 
 export class LinearService {
   private readonly stateWritten: ((issueId: string, state: WrittenState) => void)[] = [];
+  // Asset URL of each plan mock uploaded by this process, by the sha256 of its bytes.
+  private readonly uploadedMocks = new Map<string, string>();
 
   constructor(readonly credentials = new Credentials(), private readonly post: Post = postGraphQL, private readonly app?: App, private readonly budget: RateBudget = rateBudget) {}
 
@@ -2548,12 +2560,63 @@ export class LinearService {
     const data = record(await this.withKey((key) => this.post(key, ISSUE_DOCUMENTS_QUERY, { id: issueId })));
     const issue = record(data.issue ?? {});
     const existing = connection(issue.documents ?? { nodes: [] }).nodes.map((node) => record(node)).find((node) => label(node.title) === title);
+    content = await this.linkedMocks(content);
     const result = existing
       ? record(await this.write(UPDATE_DOCUMENT_QUERY, { id: label(existing.id), input: { title, content } }))
       : record(await this.write(CREATE_DOCUMENT_QUERY, { input: { title, content, issueId: label(issue.id) || issueId } }));
     const field = existing ? "documentUpdate" : "documentCreate";
     succeeded(result, field, existing ? "update the plan document" : "create the plan document");
     return label(record(record(result[field]).document ?? {}).url);
+  }
+
+  // A plan's visual mocks (README, "Plan-first") are files on this host under
+  // ~/.plannotator/mocks, linked by absolute path, which Linear cannot show: each is uploaded to
+  // Linear's file storage once and linked by its asset URL. The plan's author picks the paths, so
+  // nothing outside that folder is uploaded, symlinks included. Any other image, and a mock that
+  // fails to upload, keeps its local link: the document is the record, Plannotator the review.
+  private async linkedMocks(content: string): Promise<string> {
+    const images = localPlanImages(content);
+    if (images.length === 0) return content;
+    const root = await realpath(join(homedir(), ".plannotator", "mocks")).catch(() => null);
+    if (!root) return content;
+    const urls = new Map<string, string>();
+    for (const path of new Set(images.map((image) => image.src.trim()))) {
+      try {
+        const file = await realpath(path);
+        const type = imageType(file);
+        if (!file.startsWith(root + sep) || !type) continue;
+        const bytes = await readFile(file);
+        if (bytes.byteLength > MAX_ATTACHMENT_BYTES) throw new Error(`it is larger than ${Math.round(MAX_ATTACHMENT_BYTES / 1024 / 1024)} MB`);
+        const hash = createHash("sha256").update(bytes).digest("hex");
+        const url = this.uploadedMocks.get(hash) ?? await this.uploadFile(bytes, basename(path), type);
+        this.uploadedMocks.set(hash, url);
+        urls.set(path, url);
+      } catch (error) {
+        console.error(`[linear-tickets] plan image ${path} keeps its local link: ${error instanceof Error ? error.message : error}`);
+      }
+    }
+    return replacePlanImages(content, urls);
+  }
+
+  // Stores the bytes in Linear's file storage and returns their asset URL. The storage PUT carries
+  // only the headers Linear names, never a Linear credential.
+  private async uploadFile(bytes: Buffer<ArrayBuffer>, filename: string, contentType: string): Promise<string> {
+    const data = record(await this.write(FILE_UPLOAD_QUERY, { contentType, filename, size: bytes.byteLength }));
+    succeeded(data, "fileUpload", "accept the upload");
+    const file = record(record(data.fileUpload).uploadFile ?? {});
+    const uploadUrl = label(file.uploadUrl);
+    const assetUrl = label(file.assetUrl);
+    if (!uploadUrl.startsWith("https://") || !assetUrl.startsWith("https://")) throw new Error("Linear returned no upload address.");
+    const headers = new Headers({ "content-type": contentType, "cache-control": "public, max-age=31536000" });
+    for (const header of Array.isArray(file.headers) ? file.headers.map((entry) => record(entry)) : []) if (label(header.key)) headers.set(label(header.key), label(header.value));
+    let response: Response;
+    try {
+      response = await fetch(uploadUrl, { method: "PUT", headers, body: bytes, redirect: "error", signal: AbortSignal.timeout(60_000) });
+    } catch {
+      throw new Error("Could not reach Linear's file storage.");
+    }
+    if (!response.ok) throw new Error(`Linear's file storage answered HTTP ${response.status}.`);
+    return assetUrl;
   }
 
   // Moves the ticket into its team's "started" state with this name (for example Planning or

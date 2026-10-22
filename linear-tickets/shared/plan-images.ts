@@ -7,8 +7,13 @@
 
 export type PlanImage = { src: string; start: number; end: number };
 
-// Plannotator's /api/image extensions (pi-extension server/handlers.ts).
-const EXTENSIONS: Record<string, true> = { png: true, jpg: true, jpeg: true, gif: true, webp: true, svg: true, bmp: true, ico: true, tiff: true, tif: true, avif: true };
+// Plannotator's /api/image extensions (pi-extension server/handlers.ts), with their content types.
+export const IMAGE_TYPES: Record<string, string> = {
+  png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", webp: "image/webp", svg: "image/svg+xml",
+  bmp: "image/bmp", ico: "image/x-icon", tiff: "image/tiff", tif: "image/tiff", avif: "image/avif",
+};
+// The content type of an image path by its extension, or null when Plannotator would not show it.
+export const imageType = (path: string): string | null => IMAGE_TYPES[/\.([a-z0-9]+)$/i.exec(path)?.[1].toLowerCase() ?? ""] ?? null;
 const NOT_LOCAL = /^(https?:|data:|blob:)/i;
 const MARKDOWN = /!\[[^\]]*\]\(([^)]+)\)/g;
 const HTML = /<img\b[^>]*?\bsrc\s*=\s*(["'])(.*?)\1/gi;
@@ -49,9 +54,8 @@ export function planImageProblem(plan: string, isFile: (path: string) => boolean
   const problems = new Set<string>();
   for (const { src } of localPlanImages(plan)) {
     const path = src.trim();
-    const extension = /\.([a-z0-9]+)$/i.exec(path)?.[1].toLowerCase() ?? "";
     if (!path.startsWith("/")) problems.add(`"${path}" is not an absolute path`);
-    else if (!EXTENSIONS[extension]) problems.add(`"${path}" is not a PNG, JPEG, GIF, WebP, SVG or other image file`);
+    else if (!imageType(path)) problems.add(`"${path}" is not a PNG, JPEG, GIF, WebP, SVG or other image file`);
     else if (!isFile(path)) problems.add(`"${path}" does not exist`);
   }
   if (problems.size === 0) return null;
