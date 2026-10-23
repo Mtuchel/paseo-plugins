@@ -721,6 +721,23 @@ test("the per-pass cap spreads heavy actions over passes, deterministically", as
   assert.deepEqual(f.calls.restarts, ["i1", "i2"], "the next pass takes the ticket the cap deferred");
 });
 
+test("a ticket whose action keeps deferring does not take the per-pass cap from the tickets behind it", async (t) => {
+  const ids = ["i1", "i2", "i3"];
+  const f = await passFixture(t, {
+    issues: ids.map((id, index) => ticketIssue({ id, identifier: `ENG-${index + 1}` })),
+    records: ids.map((id, index) => recordFor(id, `ENG-${index + 1}`)),
+    restart: async () => ({ kind: "deferred", reason: "Queued: 50 of 50 agents are running." }),
+    cap: 1,
+    clockNow: T0,
+  });
+  for (const [index, id] of ids.entries()) await f.seed(id, `ENG-${index + 1}`, { situation: "stalled", since: at(120) });
+  for (let pass = 0; pass < 3; pass++) {
+    await f.pass(1);
+    f.clock.now += 5 * 60_000;
+  }
+  assert.deepEqual(f.calls.restarts, ["i1", "i2", "i3"], "each pass's one slot goes to the ticket the steward acted on longest ago");
+});
+
 // The registry read is the pass's, not each ticket's: every candidate carries the agent snapshot
 // the pass already read for classification, so N tickets cost the same read as one. The snapshot's
 // roots still pick the ticket's own newest live agent — not a verifier, not a sub-agent, not a

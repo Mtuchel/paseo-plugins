@@ -1095,6 +1095,10 @@ export class Steward {
     // reading, before this pass's effects add new debt.
     await this.settleLabels(paseo, names, roots);
     const pass: Pass = { actions: 0, cap: settings.steward.maxActionsPerPass };
+    // Longest-unacted first, so the per-pass cap rotates: a ticket whose action keeps deferring
+    // (its claim is new each pass) moves behind the others instead of taking the same slots in
+    // Linear's order every pass.
+    candidates.sort((a, b) => (stewardActionAt(a.ticket) ?? 0) - (stewardActionAt(b.ticket) ?? 0) || a.issue.identifier.localeCompare(b.issue.identifier));
     for (const candidate of candidates) {
       if (!this.alive()) return;
       try {
