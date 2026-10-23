@@ -5581,10 +5581,14 @@ manual work—not just "Needs input"—are read with the owner's credential. Iss
 paginated to completion. An issue's comments are read to completion when it joins that inventory;
 after that the plugin keeps them in memory and each collection reads only the comments created or
 edited since the previous one (`updatedAt`, with five minutes' overlap), one request for up to 500
-issues. Every 30 minutes every history is read again, which drops deleted comments; a reload
-resumes an unexpired complete store. An answer reads its own issue's whole history. Re-reading every history on each
-collection took 74 requests on server087 (568 open issues, 13,363 comments on 2026-10-16), about
-1,300 an hour, and made owner asks the largest Linear caller on both pools.
+issues. Each issue's history is read again once its last whole read is two hours old, which drops
+deleted comments; a collection re-reads at most 100 of those, the oldest first, so the re-reads
+roll instead of arriving together. An answer reads its own issue's whole history. Re-reading every
+history on each collection took 74 requests on server087 (568 open issues, 13,363 comments on
+2026-10-16), about 1,300 an hour, and made owner asks the largest Linear caller on both pools;
+re-reading all of them every 30 minutes still cost about 100 requests each time (576 issues,
+18,594 comments on 2026-10-23), and a read refused partway by the paused background budget
+started over at the next collection.
 Failed or incomplete collection is reported as
 incomplete coverage, not an empty successful inbox. Descriptions, source comments, this host's
 `needs-you/` records and handover records provide distinct revision-bound decision sources.
@@ -5599,15 +5603,19 @@ still its own ticket). Each ask carries its route from this host's view: `agent`
 agent), `continue` (the ticket's agent is gone: an answer starts a continuation agent through the
 starter's handover path), or `comment`.
 
-Private `owner-asks/comments.json` preserves complete collected histories across reloads
-(`0700` directory, `0600` file). Within the existing thirty-minute full-history window, the
-next collection reads changes with the same overlap rather than fetching every history again.
-Expired, missing or invalid stores require a full read; deletions remain bounded by that window.
+Private `owner-asks/comments.json` preserves collected histories across reloads (`0700`
+directory, `0600` file), each with the time of its last whole read. A reload resumes the store
+whatever its age: the next collection reads changes with the same overlap and re-reads only the
+histories that are due, 100 at a time, so deletions stay bounded by the same two hours. A missing
+or invalid store requires a full read. Version 1 stores resume with their one whole-read time for
+every history.
 Failed persistence is retried even when the history has not changed. Explicit owner actions
 still fetch current source history and strict registration authority rather than trusting this cache.
 Full-history reads use at most four independent issue batches at once, with each batch's cursor
 walk kept serial. The request count, per-request size, rate-budget checks and completeness checks
-are unchanged. A failure drains active reads and refuses the inventory; it never persists partial
+are unchanged. Histories are read in slices of 100 issues; a failure drains active reads and
+refuses the inventory, but keeps the slices that finished before it (each a complete history),
+and the next collection reads only the issues it did not reach. It never persists a partial
 history. Source preparation refills sixteen individual read slots rather than waiting for a whole
 batch behind one slow file. Snapshot source order and source/revision/attention calculations stay
 unchanged. This bounds work without increasing the RPC timeout or serving cached authority.

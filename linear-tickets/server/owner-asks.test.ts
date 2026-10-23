@@ -859,7 +859,7 @@ test("owner inbox shows new Linear questions within a minute without rescanning 
   assert.deepEqual([inventoryReads, historyReads, changeReads.length], [3, 1, 1], "the explicit collection's comment read serves the menu for a minute");
 });
 
-test("owner-ask comments: changes merge into the kept history, a new issue reads its own, deletions leave on the half-hourly whole read", async t => {
+test("owner-ask comments: changes merge into the kept history, a new issue reads its own, deletions leave when the history is read again", async t => {
   const h = await setup({ issues: [issue({ title: "Rollout policy", labels: [], parentId: null, status: "In Progress", description: "" })],
     comments: new Map([["i1", [comment("c1", "Which rollout policy?"), comment("c0", "Which region first?", "2026-10-09T09:00:00.000Z")]]]) });
   t.after(() => h.ownerAsks.stop());
@@ -889,9 +889,44 @@ test("owner-ask comments: changes merge into the kept history, a new issue reads
   h.state.comments.set("i1", [comment("c2", "Which approver?", "2026-10-09T11:00:00.000Z")]);
   h.state.now += 10 * 60_000;
   assert.ok((await sources()).has("c0"), "a change read cannot see a deletion");
-  h.state.now += 20 * 60_000;
-  assert.deepEqual([...(await sources()).keys()].filter(id => id?.startsWith("c")), ["c2"], "the whole read half an hour later drops deleted comments");
-  assert.deepEqual(historiesRead.at(-1), ["i1", "i2"]);
+  h.state.now += 110 * 60_000;
+  assert.deepEqual([...(await sources()).keys()].filter(id => id?.startsWith("c")), ["c2"], "the whole read two hours later drops deleted comments");
+  assert.deepEqual(historiesRead.at(-1), ["i1", "i2"], "the oldest whole read first");
+});
+
+test("owner-ask histories: a refused read keeps its finished slices, re-reads roll, and a reload resumes an old store", async t => {
+  const ids = Array.from({ length: 250 }, (_, index) => `i${index}`);
+  const h = await setup({ issues: ids.map(id => issue({ id, identifier: `TUC-${id}`, title: "Rollout", labels: [], parentId: null, status: "In Progress", description: "" })) });
+  t.after(() => h.ownerAsks.stop());
+  const historiesRead: string[][] = [];
+  let refuseAfter = Infinity;
+  const reader = async (list: string[]) => {
+    if (historiesRead.length >= refuseAfter) throw new Error("Background Linear work is paused");
+    historiesRead.push(list);
+    return new Map(list.map(id => [id, h.state.comments.get(id) ?? []]));
+  };
+  h.deps.linear.ownerAskComments = reader;
+  h.deps.linear.ownerAskCommentChanges = async () => new Map();
+  const collect = () => h.ownerAsks.snapshot(null, true);
+
+  refuseAfter = 2;
+  await assert.rejects(collect(), /paused/);
+  assert.deepEqual(historiesRead.map(list => list.length), [100, 100], "histories are read a slice at a time");
+  refuseAfter = Infinity;
+  h.state.now += 61_000;
+  await collect();
+  assert.deepEqual(historiesRead.slice(2), [ids.slice(200)], "the next collection reads only the issues the refused one did not reach");
+  await collect();
+  assert.equal(historiesRead.length, 3, "a complete store reads no history");
+
+  h.state.now += 2 * 60 * 60_000;
+  await collect();
+  assert.deepEqual(historiesRead.slice(3), [ids.slice(0, 100)], "an expired collection re-reads one slice, the oldest first");
+  h.ownerAsks.stop();
+  const reloaded = new OwnerAsks(h.deps);
+  t.after(() => reloaded.stop());
+  await reloaded.snapshot(null, true);
+  assert.deepEqual(historiesRead.slice(4), [ids.slice(100, 200)], "a reload resumes the stored histories and continues the rolling re-read");
 });
 
 test("all-status snapshot separates historical discovery from source-evidenced owner urgency", async t => {
