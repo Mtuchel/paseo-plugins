@@ -60,6 +60,8 @@ const WAITING_MS = 3 * 60_000;
 const RESERVED_MS = 3 * 60_000;
 // The working agents are read once per burst of asks.
 const RUNNING_CACHE_MS = 5_000;
+// Capacity reads accept an observation up to this old; admissions never do.
+const OBSERVED_REFRESH_MS = 30_000;
 
 type RunningTicket = { issueId: string; control?: boolean };
 
@@ -208,29 +210,33 @@ export class Scheduler {
   }
 
   // Control-plane reads must not wait behind the daemon's full agent/process listing.
-  // Admissions still use refresh() and never use an old observation to authorize a start.
+  // Capacity reads accept a 30 s old observation; admissions never do (refresh()).
   async observedCounts(paseo: PaseoApi): Promise<{ running: number; reserved: number; waiting: number; observedAt: string; stale: boolean; observationError: string | null }> {
-    const refresh = this.refresh(paseo).catch((error: unknown) => {
-      this.observationError = error instanceof Error ? error.message : String(error);
-      throw error;
-    });
-    // Keep rejection handled even when a cached observation lets this request return immediately.
-    void refresh.catch(() => {});
-    if (!this.runningCache) {
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      try {
-        await Promise.race([refresh, new Promise<never>((_, reject) => {
-          timer = setTimeout(() => reject(new Error("Agent counts are not observed yet; refresh continues in the background.")), 1_000);
-        })]);
-      } finally { clearTimeout(timer); }
+    const now = (this.deps.now ?? Date.now)();
+    if (!this.runningCache || now - this.runningCache.at > OBSERVED_REFRESH_MS) {
+      const refresh = this.refresh(paseo).catch((error: unknown) => {
+        this.observationError = error instanceof Error ? error.message : String(error);
+        throw error;
+      });
+      // Keep rejection handled even when a cached observation lets this request return immediately.
+      void refresh.catch(() => {});
+      if (!this.runningCache) {
+        // Executor form: the plugin's TypeScript lib predates Promise.withResolvers.
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        try {
+          await Promise.race([refresh, new Promise<never>((_, reject) => {
+            timer = setTimeout(() => reject(new Error("Agent counts are not observed yet; refresh continues in the background.")), 1_000);
+          })]);
+        } finally { clearTimeout(timer); }
+      }
     }
     const observed = this.runningCache;
     if (!observed) throw new Error("Agent counts are unavailable.");
-    const now = (this.deps.now ?? Date.now)();
-    this.prune(now);
+    const at = (this.deps.now ?? Date.now)();
+    this.prune(at);
     return {
       running: observed.agents.length, reserved: this.reserved.size, waiting: this.waiting.size,
-      observedAt: new Date(observed.at).toISOString(), stale: now - observed.at > RUNNING_CACHE_MS,
+      observedAt: new Date(observed.at).toISOString(), stale: at - observed.at > OBSERVED_REFRESH_MS,
       observationError: this.observationError,
     };
   }

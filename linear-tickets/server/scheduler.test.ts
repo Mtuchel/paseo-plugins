@@ -258,7 +258,7 @@ test("capacity observation returns stale counts while admission waits for a fres
     },
   });
   assert.equal((await instance.observedCounts(paseo)).running, 1);
-  now = 6_000;
+  now = 31_000;
   const observation = await instance.observedCounts(paseo);
   assert.equal(observation.running, 1);
   assert.equal(observation.stale, true);
