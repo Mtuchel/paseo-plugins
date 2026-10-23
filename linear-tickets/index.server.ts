@@ -61,8 +61,7 @@ import { SmallRoutes } from "./server/small-route";
 import { LimitResumeStore, UsageReader } from "./server/limit-resume";
 import { isUntrusted, planSetup, QUESTIONS_NOTE, TicketStarter } from "./server/starter";
 import { ShardAssignor } from "./server/worktree-shards";
-import { PLAN_TICKET_ENV } from "./server/plan-policy";
-import { AgentEnvs, sessionEnv } from "./server/agent-env";
+import { AgentEnvs } from "./server/agent-env";
 import { PlanRequests } from "./server/plan-requests";
 import { PlanFollowUps } from "./server/plan-follow-ups";
 import { labelDaemon, StateLabels } from "./server/state-labels";
@@ -78,7 +77,9 @@ import { activationEndpoints } from "./server/activation-endpoints";
 import { PeerAppUser } from "./server/peer-identity";
 import { ActivationIntake } from "./server/activation-intake";
 import { DrainRouter } from "./server/drain";
-import { resumeGuard, ticketOwnership, ticketOwners } from "./server/activation-guard";
+import { ticketOwnership, ticketOwners } from "./server/activation-guard";
+import { loadProbe, startLoadProbe, type LoadProbe } from "./server/load-probe";
+import { sessionOpenGuard, sessionPrepare } from "./server/session-open";
 import { ReviewDeletions } from "./server/review-deletions";
 import { ReviewIssueInfos } from "./server/review-issue-info";
 import { PlanPipeline } from "./server/plan-pipeline";
@@ -481,7 +482,10 @@ export default function contribute(server: PluginServerContext) {
     // claims rule SessionRouter reads per ticket, once for a whole poll (activation-guard.ts).
     owner: ticketOwners({ settings, drain, intake }),
     // The steward's pass, at the end of every poll (steward.ts).
-    steward: { pass: async () => { if (steward && attachedPaseo) await steward.tick(attachedPaseo, await settings.read()); }, stop: () => steward?.stop() } });
+    steward: { pass: async () => {
+      const current = steward, paseo = attachedPaseo;
+      if (current && paseo) await loadProbe.time("steward", async () => current.tick(paseo, await settings.read()));
+    }, stop: () => steward?.stop() } });
   const planRequests = new PlanRequests({ linear, prompt: (agentId, text) => sessions.prompt(agentId, text), routes: smallRoutes });
   let commentWake: NodeJS.Timeout | null = null;
   const wakeComments = () => {
@@ -619,10 +623,10 @@ export default function contribute(server: PluginServerContext) {
   const controlTick = () => {
     if (stopped || !attachedPaseo) return;
     // Separate single flights: a slow PR inventory or a diagnostic admission cannot gate liveness.
-    watchdogRun ??= asCaller("watchdog", () => pullRequests.watchdogPass())
+    watchdogRun ??= asCaller("watchdog", () => loadProbe.time("watchdog", () => pullRequests.watchdogPass()))
       .catch((error: unknown) => console.error("[linear-tickets] watchdog control pass failed:", error))
       .finally(() => { watchdogRun = null; });
-    stewardRun ??= asCaller("steward", async () => steward!.tick(attachedPaseo!, await settings.read()))
+    stewardRun ??= asCaller("steward", () => loadProbe.time("steward", async () => steward!.tick(attachedPaseo!, await settings.read())))
       .catch((error: unknown) => console.error("[linear-tickets] steward control pass failed:", error))
       .finally(() => { stewardRun = null; });
   };
@@ -635,9 +639,12 @@ export default function contribute(server: PluginServerContext) {
     return holdSeed;
   };
   let recoveredReplyEffects = false;
+  // The load probe (README, "Diagnostics"): from the first daemon connection until the unload.
+  let probe: LoadProbe | null = null;
   const attach = (paseo: PaseoApi) => {
     const first = !attached;
     attached = true;
+    if (first && !stopped) probe = startLoadProbe();
     attachedPaseo = paseo;
     replies.attach(paseo);
     const ready = restoreOwnerHolds();
@@ -688,32 +695,15 @@ export default function contribute(server: PluginServerContext) {
   // The resume guard goes first: a heartbeat, a schedule or an internal actor may not wake a
   // ticket root that this host no longer owns, and the env hook below then only ever runs for the
   // opens this one lets through.
-  server.before("agent.session_open", resumeGuard({ settings, drain, attach, ready: () => drain.readyNow(), known: (agentId) => sessionStore.agentTicket(agentId) }));
-  server.on("agent.turn_started", (event, { paseo }) => { attach(paseo); return asCaller("writeback.turn-started", () => writeback.turnStarted(event, paseo)); });
-  server.on("agent.turn_ended", (event, { paseo }) => { attach(paseo); return asCaller("writeback.turn-ended", () => writeback.turnEnded(event, paseo)); });
+  server.before("agent.session_open", sessionOpenGuard({ settings, drain, attach, ready: () => drain.readyNow(), known: (agentId) => sessionStore.agentTicket(agentId) }));
+  server.on("agent.turn_started", (event, { paseo }) => { attach(paseo); return asCaller("writeback.turn-started", () => loadProbe.time("turn_started", () => writeback.turnStarted(event, paseo), "hook")); });
+  server.on("agent.turn_ended", (event, { paseo }) => { attach(paseo); return asCaller("writeback.turn-ended", () => loadProbe.time("turn_ended", () => writeback.turnEnded(event, paseo), "hook")); });
   server.on("agent.permission_requested", (event, { paseo }) => { attach(paseo); return asCaller("writeback.permission-requested", () => writeback.permissionRequested(event, paseo)); });
   server.on("agent.permission_resolved", (event, { paseo }) => asCaller("writeback.permission-resolved", () => writeback.permissionResolved(event, paseo)));
   server.on("agent.archived", (event, { paseo }) => asCaller("writeback.archived", () => writeback.archived(event, paseo)));
   server.on("agent.created", (_event, { paseo }) => { attach(paseo); asCaller("state-labels", () => stateLabels.soon()); wakeComments(); });
   server.on("workspace.created", (_event, { paseo }) => { attach(paseo); asCaller("state-labels", () => stateLabels.soon()); wakeComments(); });
-  server.before("agent.session_open", async ({ request }, { paseo }) => {
-    attach(paseo);
-    const browser = await plannotatorHook();
-    // A new ticket agent gets its plan policy and ticket environment with its create request; a
-    // resumed one (daemon restart, reload) gets them back from its labels and its saved launch
-    // environment, so the omp extension keeps the same rules and tools (agent-env.ts).
-    const saved = await agentEnvs.read(request.agentId);
-    let labels: Record<string, string> | undefined;
-    if (request.reason === "resume") {
-      const found = await paseo.agents.ref(request.agentId).refresh();
-      if (!found) throw new Error("The resumed agent's capabilities cannot be verified; the session stays closed.");
-      labels = found.agent.labels;
-    } else if (!request.env[PLAN_TICKET_ENV]) {
-      labels = await paseo.agents.ref(request.agentId).refresh().then((found) => found?.agent.labels, () => undefined);
-    }
-    const env = { ...(browser ? { PLANNOTATOR_BROWSER: browser } : {}), ...sessionEnv(request.env, labels, saved) };
-    return Object.keys(env).length ? { ...request, env: { ...request.env, ...env } } : undefined;
-  });
+  server.before("agent.session_open", sessionPrepare({ attach, plannotator: plannotatorHook, envs: agentEnvs }));
   server.handle(statusRpc, (_input, { paseo }) => { attach(paseo); return linear.status(); });
   server.handle(dispatchStatusRpc, async (_input, { paseo }) => {
     attach(paseo);
@@ -747,11 +737,11 @@ export default function contribute(server: PluginServerContext) {
     const { maxRunning } = (await settings.read()).dispatch;
     return { maxRunning, ...starter.capacity.limit(maxRunning), ...await starter.scheduler.observedCounts(paseo) };
   };
-  server.handle(capacityRpc, (_input, { paseo }) => capacityState(paseo));
-  server.handle(setCapacityRpc, ({ lease }, { paseo }) => {
+  server.handle(capacityRpc, (_input, { paseo }) => loadProbe.time("capacity", () => capacityState(paseo), "hook"));
+  server.handle(setCapacityRpc, ({ lease }, { paseo }) => loadProbe.time("capacity.set", () => {
     starter.capacity.set(lease);
     return capacityState(paseo);
-  });
+  }, "hook"));
   server.handle(pullRequestsRpc, ({ repository }) => pullBoard.read(repository));
   server.handle(labelPullsRpc, ({ repository, label, numbers }) => pullBoard.label(repository, label, numbers));
   // The owner's asks (README, "Owner asks"): read from cache at once (never waiting for the
@@ -892,6 +882,7 @@ export default function contribute(server: PluginServerContext) {
     await replies.stop();
     clearTimeout(startSoon);
     clearInterval(usageTimer);
+    probe?.stop();
     planningSmoke.stop();
     stopKeepingFresh();
     void own?.close();

@@ -2,6 +2,7 @@ import type { PaseoAgent, PaseoApi } from "@getpaseo/client";
 import type { Tier } from "../shared/plan-model";
 import { candidates, normalizeModel, type FallbackChains } from "../shared/model-fallbacks";
 import { ompFallbackChains } from "./limit-resume";
+import { loadProbe } from "./load-probe";
 import type { PluginSettings, Settings } from "./settings";
 
 // Ticket agents run the model of their tier (README, "Model tiers"): the launch model while they
@@ -74,13 +75,13 @@ export class ModelGuard {
   attach(paseo: PaseoApi): void {
     if (this.paseo) return;
     this.paseo = paseo;
-    this.timer = setInterval(() => { void this.sweep(); }, CHECK_MS);
+    this.timer = setInterval(() => { void loadProbe.time("model-guard", () => this.sweep()); }, CHECK_MS);
     this.timer.unref?.();
     // Immediate reaction when the daemon reports a changed agent; the sweep covers missed updates.
     try {
       this.unsubscribe = paseo.agents.subscribe((update) => { if (update.kind === "upsert") void this.check(update.agent); });
     } catch { this.unsubscribe = null; }
-    void this.sweep();
+    void loadProbe.time("model-guard", () => this.sweep());
   }
 
   stop(): void {

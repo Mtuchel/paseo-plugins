@@ -5555,6 +5555,45 @@ The programs the plugin only writes down for other processes (`PLANNOTATOR_OPEN_
 `PLANNOTATOR_HOST_SOURCE`) and the standalone scripts under `scripts/` do not go through the helper:
 they are already separate processes of their own.
 
+## Diagnostics
+
+The daemon gives each plugin hook 30 seconds; an `agent.session_open` hook that takes longer fails
+the open (`before agent.session_open failed: Plugin RPC timed out`). The load probe
+(`server/load-probe.ts`) records what keeps the plugin's event loop busy, so such a timeout can be
+traced to its cause. It starts with the plugin's first daemon connection, stops on unload, and
+never changes what the work it times returns or throws. It writes four kinds of log lines:
+
+- `[linear-tickets] event loop blocked <ms> ms (heap <n> MB, rss <n> MB, in flight: <name> <ms> ms, …)`:
+  the loop ran no timer for at least 2 seconds (measured on the monotonic clock, checked every
+  250 ms, so the figure is within 250 ms of the block). The line is written once the loop runs
+  again and names up to eight timed operations that were open, oldest first.
+- `[linear-tickets] slow <name> <ms> ms (<ok|failed>), started <ISO>; steps: <step> <ms> ms, …`: a hook
+  (`session_open.guard`, `session_open.prepare`, `turn_started`, `turn_ended`, `capacity`,
+  `capacity.set`) that took at least 2 seconds, or a periodic pass (`plan-pipeline`, `steward`,
+  `watchdog`, `pr-watch`, `queue-backstop`, `model-guard`, `state-labels`, `plan-requests`,
+  `comment-relay`, `handover.all`) that took at least 10 seconds. The session_open hooks list their
+  awaited steps: the guard `settings`, `ready`, `ticket`, `holds`; the prepare hook `plannotator`,
+  `env`, `refresh`.
+- `[linear-tickets] load probe since <ISO>: session_open <n> (failed <f>, ≥2s <s>, max
+  <ms> ms), turn_ended <n>, stalls ≥2s <n> / ≥5s <n>, max stall <ms> ms, loop delay p99 <ms> ms`,
+  every ten minutes. Counts run since the probe started (the plugin's load): `session_open` counts the
+  guard's runs (every open reaches it first), failures and slow runs count both hooks, and `max` is
+  the slower hook's longest run. The loop delay p99 (`perf_hooks.monitorEventLoopDelay`, 20 ms
+  resolution) covers only the last ten minutes.
+- `[linear-tickets] profiler …`: the CPU profiler's start, stop and failures (below).
+
+The CPU profiler only runs while the owner asks for it. The switch is the file
+`$PASEO_HOME/linear-tickets/diagnostics/profile-until` holding an ISO end time, for example
+`date -u -d '+5 hours' +%Y-%m-%dT%H:%M:%SZ > ~/.paseo/linear-tickets/diagnostics/profile-until`.
+The plugin reads it once a minute and ignores, with one log line, an end time that has passed or
+lies more than 24 hours after the file was written; leaving the file in place never extends a
+recording. While the switch holds, an in-process inspector session records one-minute chunks and
+keeps a chunk as `diagnostics/<start time>.cpuprofile` only when its minute held a stall of at
+least 5 seconds; open it in Chrome DevTools or `speedscope`. At most 30 profiles and 500 MB are
+kept, the oldest are deleted first. The recording ends at the end time, when the file is deleted,
+or when the plugin unloads; any profiler failure disconnects the session and leaves the profiler
+off until the next reload.
+
 ## Validation
 
 `npm run typecheck` checks both entrypoints against Paseo's SDK. `npm test` covers

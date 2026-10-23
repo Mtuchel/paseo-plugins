@@ -1,4 +1,5 @@
 import { execFile } from "./child-processes";
+import { loadProbe } from "./load-probe";
 import { mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
@@ -475,11 +476,11 @@ export class Handover {
   }
 
   all(): Promise<HandoverRecord[]> {
-    return this.serialize(async () => {
+    return this.serialize(() => loadProbe.time("handover.all", async () => {
       const names = await readdir(this.directory).catch(() => [] as string[]);
       const records = await Promise.all(names.filter((name) => name.endsWith(".json")).map((name) => readFile(join(this.directory, name), "utf8").then((text) => JSON.parse(text) as HandoverRecord, () => null)));
       return records.filter((record): record is HandoverRecord => Boolean(record));
-    });
+    }));
   }
 
   async resumeTarget(issueId: string): Promise<ResumeTarget | null> {

@@ -5,6 +5,7 @@ import { dirname, join } from "node:path";
 import type { PaseoAgent, PaseoApi } from "@getpaseo/client";
 import { PipelineHost, PipelineRow, type PipelineStage, type PipelineStatus } from "../shared/plan-pipeline";
 import { ADVISOR_MODEL } from "../shared/plan-advisor";
+import { loadProbe } from "./load-probe";
 import type { ParkedPlan } from "./parked";
 import { ghostAgents, LIVE_AGENT, type ProcessInspector } from "./process-liveness";
 import type { SessionLink } from "./sessions";
@@ -166,7 +167,7 @@ export class PlanPipeline {
     if (this.stopped) return this.refreshing ?? this.saving ?? Promise.resolve();
     if (this.refreshing) return this.refreshing;
     this.lastRefresh = this.now().getTime();
-    this.refreshing = this.run().catch((error: unknown) => {
+    this.refreshing = loadProbe.time("plan-pipeline", () => this.run()).catch((error: unknown) => {
       this.error = diagnostic(error);
       for (const record of this.records.values()) if (!TERMINAL[record.row.stage] && record.row.stage !== "ready" && record.row.status !== "failed") {
         record.row.status = "unknown"; record.row.detail = "Source refresh failed; retaining last evidence";
