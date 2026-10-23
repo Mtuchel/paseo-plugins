@@ -49,6 +49,8 @@ export type LoadProbeOptions = {
   home?: string;
   session?: () => InspectorSessionLike;
   limits?: { files?: number; bytes?: number };
+  // Writes one kept profile into the diagnostics directory, which exists by then.
+  writeProfile?: (file: string, data: string) => Promise<void>;
 };
 export type Step = { name: string; ms: number };
 export type LoadProbe = {
@@ -61,7 +63,7 @@ export type LoadProbe = {
 };
 type Operation = { id: number; name: string; kind: ProbeKind; start: number; startedAt: number; steps: Step[]; done: boolean };
 type Stats = { count: number; failed: number; slow: number; max: number };
-type Recording = { session: InspectorSessionLike; until: number; key: string; chunkStall: number; chunkStartedAt: number; timer: Handle | null };
+type Recording = { session: InspectorSessionLike; until: number; key: string; running: boolean; chunkStall: number; chunkStartedAt: number; timer: Handle | null };
 type SwitchRead = { until: number; key: string } | { invalid: string; key: string } | null;
 
 const operations = new AsyncLocalStorage<Operation>();
@@ -88,6 +90,7 @@ export function startLoadProbe(options: LoadProbeOptions = {}): LoadProbe {
   const createSession = options.session ?? (() => new Session());
   const maxFiles = options.limits?.files ?? MAX_FILES;
   const maxBytes = options.limits?.bytes ?? MAX_BYTES;
+  const writeProfile = options.writeProfile ?? ((file: string, data: string) => writeFile(file, data));
   const log = (message: string) => { try { rawLog(`[linear-tickets] ${message}`); } catch { /* a log line never fails the work */ } };
   const unref = (handle: Handle) => { (handle as { unref?: () => void } | null)?.unref?.(); return handle; };
 
@@ -196,16 +199,21 @@ export function startLoadProbe(options: LoadProbeOptions = {}): LoadProbe {
   // Profiler: only while $PASEO_HOME/linear-tickets/diagnostics/profile-until names a future end
   // time at most 24 h after the file was written. Consecutive one-minute chunks; a chunk is kept
   // only when its minute held a stall of at least 5 s. Any profiler failure ends it until reload.
+  // Two queues: the inspector's (start, chunk ends, end times) and the files' (switch reads,
+  // profile writes, pruning), so a slow disk never delays a chunk's end or the switch's end time.
   let disabled = false;
   const reported = new Set<string>();
   const once = (key: string, message: string) => { if (!reported.has(key)) { reported.add(key); log(message); } };
-  let queue: Promise<void> = Promise.resolve();
-  const enqueue = (work: () => Promise<void>) => {
-    queue = queue.then(work).catch((error: unknown) => once(`queue:${String(error)}`, `profiler step failed: ${error instanceof Error ? error.message : error}`));
+  type Queue = { tail: Promise<void> };
+  const inspectorQueue: Queue = { tail: Promise.resolve() };
+  const fileQueue: Queue = { tail: Promise.resolve() };
+  const enqueue = (queue: Queue, work: () => Promise<void>) => {
+    queue.tail = queue.tail.then(work).catch((error: unknown) => once(`queue:${String(error)}`, `profiler step failed: ${error instanceof Error ? error.message : error}`));
   };
   const post = (session: InspectorSessionLike, method: string): Promise<object | undefined> => new Promise((resolve, reject) => {
     session.post(method, {}, (error, result) => error ? reject(error) : resolve(result));
   });
+  const profileOf = (result: object | undefined) => (result as { profile?: object } | undefined)?.profile;
   const disconnect = (session: InspectorSessionLike) => { try { session.disconnect(); } catch { /* already gone */ } };
 
   const readSwitch = async (): Promise<SwitchRead> => {
@@ -254,103 +262,92 @@ export function startLoadProbe(options: LoadProbeOptions = {}): LoadProbe {
     }
   };
 
-  const scheduleChunkEnd = (current: Recording) => {
-    current.timer = unref(after(() => enqueue(endChunk), Math.max(0, Math.min(CHUNK_MS, current.until - wallNow()))));
-  };
-
-  // Starts the next chunk on the recording's session; false when it did not start.
-  const startChunk = async (current: Recording): Promise<boolean> => {
-    try {
-      await post(current.session, "Profiler.start");
-    } catch (error) {
-      if (recording === current) fail("Profiler.start", error);
-      return false;
-    }
-    if (recording !== current) return false;
-    current.chunkStall = 0;
-    current.chunkStartedAt = wallNow();
-    scheduleChunkEnd(current);
-    return true;
-  };
-
-  // Ends the running chunk and, before anything else is awaited, starts the next one while the
-  // switch's time has not passed, so the chunks are consecutive. Then keeps the ended chunk under
-  // the stall rule, and re-reads the switch: a removed or no longer valid one ends the recording.
-  // A stop() during any await has already disconnected the session; the chunk then ends here
-  // without touching it again.
-  const endChunk = async (next = true): Promise<void> => {
-    const current = recording;
-    if (!current) return;
-    if (current.timer !== null) cancelAfter(current.timer);
-    current.timer = null;
-    // A stall that delayed this very callback has not reached the monitor yet.
-    const stalled = Math.max(current.chunkStall, now() - lastTick);
-    const startedAt = current.chunkStartedAt;
-    let profile: object | undefined;
-    try {
-      profile = ((await post(current.session, "Profiler.stop")) as { profile?: object } | undefined)?.profile;
-    } catch (error) {
-      if (recording === current) fail("Profiler.stop", error);
-      return;
-    }
-    let running = next && recording === current && current.until > wallNow() && await startChunk(current);
-    if (stalled >= PROFILE_STALL_MS && profile) {
+  // Keeps an ended chunk under the stall rule, on the files' queue: the next chunk does not wait
+  // for it. A failure ends any recording and leaves the profiler off until reload.
+  const keep = (profile: object | undefined, startedAt: number, stalled: number) => {
+    if (stalled < PROFILE_STALL_MS || !profile) return;
+    enqueue(fileQueue, async () => {
       try {
         await mkdir(directory, { recursive: true });
-        await writeFile(join(directory, `${iso(startedAt).replace(/:/g, "-")}.cpuprofile`), JSON.stringify(profile));
+        await writeProfile(join(directory, `${iso(startedAt).replace(/:/g, "-")}.cpuprofile`), JSON.stringify(profile));
       } catch (error) {
-        if (recording === current) fail("writing the profile", error);
+        fail("writing the profile", error);
         return;
       }
       try {
         await prune();
       } catch (error) {
-        if (recording === current) fail("pruning profiles", error);
-        return;
+        fail("pruning profiles", error);
       }
-    }
-    if (recording !== current) return;
-    const read = await readSwitch();
-    if (recording !== current) return;
-    if (read && !("invalid" in read)) {
-      current.key = read.key;
-      if (running && read.until < current.until && current.timer !== null) {
-        // A switch rewritten to an earlier time ends the chunk at that time.
-        cancelAfter(current.timer);
-        current.until = read.until;
-        scheduleChunkEnd(current);
-      }
-      current.until = read.until;
-      // Not running yet: the time had passed, and the rewritten switch names a new one. A start
-      // that fails or meets a stop has already ended the recording.
-      if (!running) await startChunk(current);
+    });
+  };
+
+  // The running chunk ends a minute after it started or at the switch's end time, whichever is first.
+  const scheduleChunkEnd = (current: Recording) => {
+    if (current.timer !== null) cancelAfter(current.timer);
+    const end = Math.min(current.chunkStartedAt + CHUNK_MS, current.until);
+    current.timer = unref(after(() => enqueue(inspectorQueue, () => endChunk(current)), Math.max(0, end - wallNow())));
+  };
+
+  const startChunk = async (current: Recording): Promise<void> => {
+    try {
+      await post(current.session, "Profiler.start");
+    } catch (error) {
+      if (recording === current) fail("Profiler.start", error);
       return;
     }
-    recording = null;
+    if (recording !== current) return;
+    current.running = true;
+    current.chunkStall = 0;
+    current.chunkStartedAt = wallNow();
+    scheduleChunkEnd(current);
+  };
+
+  // Stops the running chunk and hands it to keep(); false when the stop failed, which has ended the
+  // profiler until reload.
+  const stopChunk = async (current: Recording): Promise<boolean> => {
+    // A stall that delayed this very callback has not reached the monitor yet.
+    const stalled = Math.max(current.chunkStall, now() - lastTick);
+    const startedAt = current.chunkStartedAt;
+    current.running = false;
+    let result: object | undefined;
+    try {
+      result = await post(current.session, "Profiler.stop");
+    } catch (error) {
+      if (recording === current) fail("Profiler.stop", error);
+      return false;
+    }
+    keep(profileOf(result), startedAt, stalled);
+    return true;
+  };
+
+  // Ends the recording: its last chunk is kept under the stall rule. A stop() during the await has
+  // already disconnected the session.
+  const finish = async (current: Recording, reason: string): Promise<void> => {
     if (current.timer !== null) cancelAfter(current.timer);
-    // A chunk started above is discarded with the session.
-    if (running) { try { current.session.post("Profiler.stop", {}, () => undefined); } catch { /* disconnecting below */ } }
-    disconnect(current.session);
+    current.timer = null;
     // The switch this recording ran on is not reported again as ignored once it has expired.
     reported.add(current.key);
-    if (read) reported.add(read.key);
-    log(`profiler stopped (${!read ? "switch removed" : current.until <= wallNow() ? "switch expired" : `switch ignored: ${read.invalid}`})`);
+    if (current.running && !(await stopChunk(current))) return;
+    if (recording !== current) return;
+    recording = null;
+    disconnect(current.session);
+    log(`profiler stopped (${reason})`);
+  };
+
+  // A chunk's end: the next one starts at once while the switch's end time has not passed.
+  const endChunk = async (current: Recording): Promise<void> => {
+    if (recording !== current) return;
+    current.timer = null;
+    if (!(await stopChunk(current)) || recording !== current) return;
+    if (current.until <= wallNow()) { await finish(current, "switch expired"); return; }
+    await startChunk(current);
   };
 
   // The session between its connect and its first chunk: a stop() then disconnects it at once,
   // whether or not the inspector ever answers.
   let connecting: InspectorSessionLike | null = null;
-  const pollSwitch = async (): Promise<void> => {
-    if (disabled || stopped) return;
-    if (recording) {
-      // Only a removed or no longer valid switch ends the chunk early; a valid one runs on.
-      const read = await readSwitch();
-      if (!read || "invalid" in read) await endChunk(false);
-      return;
-    }
-    const read = await readSwitch();
-    if (!read || stopped) return;
-    if ("invalid" in read) { once(read.key, `profiler switch ignored: ${read.invalid}`); return; }
+  const begin = async (read: { until: number; key: string }): Promise<void> => {
     let session: InspectorSessionLike | null = null;
     try {
       session = createSession();
@@ -365,14 +362,43 @@ export function startLoadProbe(options: LoadProbeOptions = {}): LoadProbe {
       return;
     }
     connecting = null;
-    if (stopped) { disconnect(session); return; }
-    const current: Recording = { session, until: read.until, key: read.key, chunkStall: 0, chunkStartedAt: wallNow(), timer: null };
+    if (stopped || disabled) { disconnect(session); return; }
+    const current: Recording = { session, until: read.until, key: read.key, running: true, chunkStall: 0, chunkStartedAt: wallNow(), timer: null };
     recording = current;
     log(`profiler recording until ${iso(read.until)}`);
     scheduleChunkEnd(current);
   };
-  const switchTimer = unref(every(() => enqueue(pollSwitch), SWITCH_POLL_MS));
-  enqueue(pollSwitch);
+
+  // A switch read, applied on the inspector's queue. While recording, a rewritten valid switch
+  // moves the end time (an earlier one ends the running chunk then); a removed or no longer valid
+  // one ends the recording. An unchanged switch never extends it.
+  const apply = async (read: SwitchRead): Promise<void> => {
+    if (disabled || stopped) return;
+    const current = recording;
+    if (current) {
+      if (read && !("invalid" in read)) {
+        current.key = read.key;
+        if (read.until !== current.until) {
+          current.until = read.until;
+          if (current.running) scheduleChunkEnd(current);
+        }
+        return;
+      }
+      if (read) reported.add(read.key);
+      await finish(current, !read ? "switch removed" : current.until <= wallNow() ? "switch expired" : `switch ignored: ${read.invalid}`);
+      return;
+    }
+    if (!read) return;
+    if ("invalid" in read) { once(read.key, `profiler switch ignored: ${read.invalid}`); return; }
+    await begin(read);
+  };
+  const pollSwitch = async (): Promise<void> => {
+    if (disabled || stopped) return;
+    const read = await readSwitch();
+    if (!disabled && !stopped) enqueue(inspectorQueue, () => apply(read));
+  };
+  const switchTimer = unref(every(() => enqueue(fileQueue, pollSwitch), SWITCH_POLL_MS));
+  enqueue(fileQueue, pollSwitch);
 
   const probe: LoadProbe = {
     time,
@@ -388,13 +414,28 @@ export function startLoadProbe(options: LoadProbeOptions = {}): LoadProbe {
       recording = null;
       if (current) {
         if (current.timer !== null) cancelAfter(current.timer);
-        try { current.session.post("Profiler.stop", {}, () => undefined); } catch { /* disconnecting below */ }
+        // The last chunk is kept under the stall rule; an in-process inspector answers the stop
+        // before the disconnect.
+        if (current.running) {
+          const stalled = Math.max(current.chunkStall, now() - lastTick);
+          const startedAt = current.chunkStartedAt;
+          try {
+            current.session.post("Profiler.stop", {}, (error, result) => { if (!error) keep(profileOf(result), startedAt, stalled); });
+          } catch { /* disconnecting below */ }
+        }
         disconnect(current.session);
       }
       if (connecting) { disconnect(connecting); connecting = null; }
       if (active === probe) active = null;
     },
-    idle: async () => { let seen: Promise<void>; do { seen = queue; await seen; } while (seen !== queue); },
+    idle: async () => {
+      let inspector: Promise<void>, files: Promise<void>;
+      do {
+        inspector = inspectorQueue.tail;
+        files = fileQueue.tail;
+        await Promise.all([inspector, files]);
+      } while (inspector !== inspectorQueue.tail || files !== fileQueue.tail);
+    },
   };
   active = probe;
   return probe;

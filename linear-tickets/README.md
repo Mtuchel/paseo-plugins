@@ -5587,13 +5587,15 @@ The CPU profiler only runs while the owner asks for it. The switch is the file
 example `date -u -d '+5 hours' +%Y-%m-%dT%H:%M:%SZ > ~/.paseo/linear-tickets/diagnostics/profile-until`.
 The plugin reads it once a minute and ignores, with one log line, a value that is not such a time,
 an end time that has passed, or one more than 24 hours after the file was written; leaving the file
-in place never extends a recording. While the switch holds, an in-process inspector session records
-consecutive one-minute chunks (the next one starts before the last is written) and keeps a chunk
-as `diagnostics/<start time>.cpuprofile` only when its minute held a stall of at least 5 seconds;
-open it in Chrome DevTools or `speedscope`. At most 30 profiles and 500 MB are kept, the oldest are
-deleted first; a profile that cannot be deleted counts as a profiler failure. The recording ends at
-the end time, when the file is deleted, or when the plugin unloads, which also disconnects a session
-the inspector has not answered yet; any profiler failure disconnects the session and leaves the
+in place never extends a recording, and a rewritten file moves the end time from the next read.
+While the switch holds, an in-process inspector session records consecutive one-minute chunks and
+keeps a chunk as `diagnostics/<start time>.cpuprofile` only when its minute held a stall of at least
+5 seconds; open it in Chrome DevTools or `speedscope`. Profiles are written apart from the
+recording, so a slow disk delays neither the next chunk nor the end time. At most 30 profiles and
+500 MB are kept, the oldest are deleted first; a profile that cannot be deleted counts as a profiler
+failure. The recording ends at the end time, when the file is deleted, or when the plugin unloads,
+keeping its last chunk under the same stall rule; an unload also disconnects a session the
+inspector has not answered yet. Any profiler failure disconnects the session and leaves the
 profiler off until the next reload.
 
 ## Validation

@@ -73,14 +73,20 @@ class FakeSession implements InspectorSessionLike {
   // A method whose callback never comes (an inspector that does not answer).
   hang: string | null = null;
   onPost: ((method: string) => void) | null = null;
+  // A method answered only once the promise settles (an inspector that answers late).
+  gate: { method: string; open: Promise<void> } | null = null;
   connect() { this.calls.push("connect"); }
   disconnect() { this.calls.push("disconnect"); }
   post(method: string, _params: object, callback: (error: Error | null, result?: object) => void) {
     this.calls.push(method);
     this.onPost?.(method);
     if (method === this.hang) return;
-    if (method === this.fail) { setImmediate(() => callback(new Error(`${method} broke`))); return; }
-    setImmediate(() => callback(null, method === "Profiler.stop" ? { profile: { nodes: [], startTime: 0, endTime: 1 } } : {}));
+    const answer = () => {
+      if (method === this.fail) { setImmediate(() => callback(new Error(`${method} broke`))); return; }
+      setImmediate(() => callback(null, method === "Profiler.stop" ? { profile: { nodes: [], startTime: 0, endTime: 1 } } : {}));
+    };
+    if (this.gate?.method === method) { void this.gate.open.then(answer); return; }
+    answer();
   }
 }
 
@@ -554,4 +560,111 @@ test("a switch whose end time is not an ISO time is ignored and logged once", as
     assert.equal(ignored.length, 1, ignored.join("\n"));
     assert.match(ignored[0] as string, /is not an ISO time/);
   } finally { await world.cleanup(); }
+});
+
+// A recording whose first chunk starts ten seconds after the poll that found the switch, so the
+// once-a-minute polls fall inside its chunks: chunks run 70–130 s, 130–190 s, …; polls at 120 s, 180 s, ….
+type RecordingWorld = { clock: FakeClock; lines: string[]; settle: () => Promise<void>; writeSwitch: (until: number) => Promise<void> };
+async function offsetRecording(world: RecordingWorld, opened: Promise<void>, open: () => void) {
+  await world.writeSwitch(world.clock.wallNow() + 60 * MINUTE);
+  world.clock.advance(MINUTE);
+  await opened;
+  world.clock.advance(10_000);
+  open();
+  await world.settle();
+  assert.ok(world.lines.some((line) => line.includes("profiler recording until")), world.lines.join("\n"));
+}
+function gatedSessions(world: { sessions: FakeSession[] }) {
+  let open = () => {};
+  const gate = new Promise<void>((resolve) => { open = resolve; });
+  let opened = () => {};
+  const enabling = new Promise<void>((resolve) => { opened = resolve; });
+  const session = () => {
+    const created = new FakeSession();
+    if (world.sessions.length === 0) {
+      created.gate = { method: "Profiler.enable", open: gate };
+      created.onPost = (method) => { if (method === "Profiler.enable") opened(); };
+    }
+    world.sessions.push(created);
+    return created;
+  };
+  return { session, enabling, open };
+}
+
+test("a profile write that has not finished delays neither the next chunk's end nor the switch's end time", async () => {
+  const writes: string[] = [];
+  let release = () => {};
+  const released = new Promise<void>((resolve) => { release = resolve; });
+  let requested = () => {};
+  const writeRequested = new Promise<void>((resolve) => { requested = resolve; });
+  const world = await profilerWorld({ writeProfile: async (file) => { writes.push(file); requested(); await released; } });
+  try {
+    // Recording from the poll a minute in; the switch ends five seconds into the second chunk.
+    await world.writeSwitch(world.clock.wallNow() + 125_000);
+    await world.clock.run(70_000, world.settle);
+    world.clock.block(6000);
+    world.clock.advance(44_000);
+    await writeRequested;
+    for (let second = 0; second < 6; second++) { world.clock.advance(1000); for (let round = 0; round < 8; round++) await flush(); }
+    const session = world.sessions[0] as FakeSession;
+    assert.deepEqual(session.calls, ["connect", "Profiler.enable", "Profiler.start", "Profiler.stop", "Profiler.start", "Profiler.stop", "disconnect"], "stopped at the switch's time while the write still waits");
+    assert.ok(world.lines.some((line) => line.includes("profiler stopped (switch expired)")));
+    assert.equal(writes.length, 1);
+    release();
+    await world.settle();
+    assert.equal(writes.length, 1, "the second chunk held no long stall");
+  } finally { release(); await world.cleanup(); }
+});
+
+test("a poll that reads an earlier end time ends the recording at that time, not at the chunk's end", async () => {
+  const sessions: FakeSession[] = [];
+  const gated = gatedSessions({ sessions });
+  const world = await profilerWorld({ session: gated.session });
+  try {
+    await offsetRecording(world, gated.enabling, gated.open);
+    await world.clock.run(30_000, world.settle);
+    // At 100 s: the owner moves the end to 125 s; the poll at 120 s reads it, the chunk would run to 130 s.
+    await world.writeSwitch(world.clock.wallNow() + 25_000);
+    await world.clock.run(27_000, world.settle);
+    assert.equal((sessions[0] as FakeSession).calls.at(-1), "disconnect", world.lines.join("\n"));
+    assert.ok(world.lines.some((line) => line.includes("profiler stopped (switch expired)")));
+  } finally { await world.cleanup(); }
+});
+
+test("a failing Profiler.stop when the switch is removed disables the profiler until reload", async () => {
+  const sessions: FakeSession[] = [];
+  const gated = gatedSessions({ sessions });
+  const world = await profilerWorld({ session: gated.session });
+  try {
+    await offsetRecording(world, gated.enabling, gated.open);
+    await world.clock.run(70_000, world.settle);
+    const session = sessions[0] as FakeSession;
+    session.fail = "Profiler.stop";
+    // At 140 s; the poll at 180 s finds the switch gone inside the chunk that runs to 190 s.
+    await rm(join(world.directory, "profile-until"));
+    await world.clock.run(45_000, world.settle);
+    assert.equal(session.calls.at(-1), "disconnect");
+    const disabled = world.lines.filter((line) => line.includes("profiler disabled until reload"));
+    assert.equal(disabled.length, 1, world.lines.join("\n"));
+    assert.match(disabled[0] as string, /Profiler\.stop failed/);
+    assert.equal(world.lines.filter((line) => line.includes("profiler stopped")).length, 0);
+    await world.writeSwitch(world.clock.wallNow() + 60 * MINUTE);
+    await world.clock.run(3 * MINUTE, world.settle);
+    assert.equal(sessions.length, 1, "nothing starts again until reload");
+  } finally { await world.cleanup(); }
+});
+
+test("stopping the plugin keeps the last chunk under the stall rule", async () => {
+  for (const [stall, kept] of [[6000, 1], [3000, 0]] as const) {
+    const world = await profilerWorld();
+    try {
+      await world.writeSwitch(world.clock.wallNow() + 60 * MINUTE);
+      await world.clock.run(70_000, world.settle);
+      world.clock.block(stall);
+      world.probe.stop();
+      await world.settle();
+      assert.deepEqual((world.sessions[0] as FakeSession).calls.slice(-2), ["Profiler.stop", "disconnect"]);
+      assert.equal((await world.profiles()).length, kept, `a ${stall} ms stall`);
+    } finally { await world.cleanup(); }
+  }
 });
