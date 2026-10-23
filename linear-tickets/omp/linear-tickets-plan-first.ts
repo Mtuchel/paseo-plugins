@@ -594,7 +594,7 @@ export default function linearTicketsPlanFirst(pi: ExtensionApi): void {
     const input = event.input;
     const linearTool = linearWrite(event.toolName, input);
     if (linearTool) {
-      return { block: true, reason: `Stopped by the linear-tickets plugin: ${linearTool} would act as the owner. Ticket agents change Linear only through the ${TICKET_TOOL_PREFIX}* tools, which write as Paseo: comments and relations on any issue, status and links on your ticket and the issues you created, create_issue for follow-ups. Reading with the Linear tools is fine. For anything else in Linear, ask the owner (or add a manual task).` };
+      return { block: true, reason: `Stopped by the linear-tickets plugin: ${linearTool} would act as the owner. Ticket agents change Linear only through the ${TICKET_TOOL_PREFIX}* tools, which write as Paseo: comments and relations on any issue, status and links on your ticket and the issues you created, attach_file for evidence files (screenshots, PDFs, videos) on your ticket and its sub-issues, create_issue for follow-ups. Reading with the Linear tools is fine. For anything else in Linear, ask the owner (or add a manual task).` };
     }
     const tests = writtenPaths(event.toolName, input).length ? acceptanceTests() : null;
     let testWrite = blockedTestWrite(tests, event.toolName, input, ctx?.models?.current(), process.env[STRONG_MODEL_ENV]);

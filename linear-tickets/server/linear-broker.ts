@@ -10,8 +10,12 @@ import { paseoHome } from "./ticket-mcp";
 const PERIOD = 3_600_000;
 const MAX_POINTS = 10_000;
 const MAX_BODY = 1024 * 1024;
+// A ticket agent's evidence file (README, "Agent access to Linear"): raw bytes on /upload.
+const MAX_UPLOAD_BODY = 25 * 1024 * 1024;
+const UPLOAD_DEADLINE_MS = 60_000;
+const HEADER_NAME = /^[A-Za-z0-9!#$%&'*+.^_|~-]+$/;
 const TOOLS: Record<string, true> = { get_ticket: true, get_issue: true, get_comments: true, search_issues: true, add_comment: true,
-  set_status: true, link_url: true, add_relation: true, create_issue: true, update_issue: true, add_manual_task: true };
+  set_status: true, link_url: true, add_relation: true, create_issue: true, update_issue: true, add_manual_task: true, attach_file: true };
 const UNAVAILABLE = "The host's Linear budget service is unavailable; no request was sent. Retry after the plugin is running.";
 const UNKNOWN = "The Linear request may have completed; check the ticket before retrying a write.";
 export type BrokerRequest = { authorization: string; query: string; variables: Record<string, unknown>; tool: string };
@@ -24,6 +28,8 @@ export type BrokerOptions = {
   home?: string; budget?: RateBudget; usage?: LinearUsage; now?: () => number; deadlineMs?: number;
   // Tests supply an upstream here, never through an agent-selected URL or environment variable.
   upstream?: (authorization: string, query: string, variables: Record<string, unknown>, signal: AbortSignal) => Promise<Response>;
+  // The storage PUT behind /upload; tests inject it like `upstream`, never through agent input.
+  store?: (url: string, headers: Record<string, string>, bytes: Buffer, signal: AbortSignal) => Promise<Response>;
 };
 
 export class LinearBroker {
@@ -33,6 +39,7 @@ export class LinearBroker {
   private readonly now: () => number;
   private readonly deadlineMs: number;
   private readonly upstream: NonNullable<BrokerOptions["upstream"]>;
+  private readonly store: NonNullable<BrokerOptions["store"]>;
   private readonly intents = new Map<string, Intent>();
   private readonly active = new Set<Promise<unknown>>();
   private readonly reading = new Set<IncomingMessage>();
@@ -57,6 +64,7 @@ export class LinearBroker {
       method: "POST", redirect: "error", headers: { authorization, "content-type": "application/json" },
       body: JSON.stringify({ query, variables }), signal,
     }));
+    this.store = options.store ?? ((url, headers, bytes, signal) => fetch(url, { method: "PUT", headers, body: new Uint8Array(bytes), redirect: "error", signal }));
   }
 
   get socketPath(): string { return join(this.home, "linear-tickets", "linear-broker.sock"); }
@@ -154,7 +162,9 @@ export class LinearBroker {
     try {
       await this.starting;
       if (this.stopped || this.broken) return this.reply(response, reply);
-      if (request.method !== "POST" || request.url !== "/graphql") return this.reply(response, { kind: "unsent", message: "Invalid Linear broker request." });
+      if (request.method !== "POST") return this.reply(response, { kind: "unsent", message: "Invalid Linear broker request." });
+      if (request.url === "/upload") return this.reply(response, await this.receiveUpload(request));
+      if (request.url !== "/graphql") return this.reply(response, { kind: "unsent", message: "Invalid Linear broker request." });
       let bytes = 0;
       const chunks: Buffer[] = [];
       for await (const chunk of request) {
@@ -193,6 +203,56 @@ export class LinearBroker {
       if (error instanceof RateLimitedError) reply = this.held(error.pool, error.reason, error.resumeAt);
     }
     this.reply(response, reply);
+  }
+
+  // The storage half of attach_file. The credential never reaches this route: fileUpload runs
+  // through /graphql first, and here the broker forwards only the headers attach_file passes (the
+  // file's type, a cache header and Linear's own). The bytes are not a Linear API request, so they
+  // are not part of the hourly GraphQL budget.
+  private async receiveUpload(request: IncomingMessage): Promise<BrokerReply> {
+    const encodedUrl = request.headers["x-paseo-upload-url"];
+    const encodedHeaders = request.headers["x-paseo-upload-headers"];
+    if (typeof encodedUrl !== "string" || typeof encodedHeaders !== "string") return { kind: "unsent", message: "Invalid Linear broker request." };
+    let target: URL;
+    const headers: Record<string, string> = {};
+    try {
+      target = new URL(Buffer.from(encodedUrl, "base64url").toString("utf8"));
+      const pairs: unknown = JSON.parse(Buffer.from(encodedHeaders, "base64url").toString("utf8"));
+      if (!Array.isArray(pairs) || pairs.length > 64) return { kind: "unsent", message: "Invalid Linear broker request." };
+      for (const pair of pairs) {
+        const entry = pair as Record<string, unknown>;
+        if (!entry || typeof entry.key !== "string" || typeof entry.value !== "string" || !HEADER_NAME.test(entry.key)
+          || entry.value.length > 8192 || /[\r\n\0]/.test(entry.value)) return { kind: "unsent", message: "Invalid Linear broker request." };
+        headers[entry.key] = entry.value;
+      }
+    } catch {
+      return { kind: "unsent", message: "Invalid Linear broker request." };
+    }
+    // The address Linear returns is https; never one carrying credentials or another scheme.
+    if (target.protocol !== "https:" || target.username || target.password) return { kind: "unsent", message: "Invalid Linear broker request." };
+    let size = 0;
+    const chunks: Buffer[] = [];
+    for await (const chunk of request) {
+      size += chunk.length;
+      if (size > MAX_UPLOAD_BODY) {
+        request.resume();
+        return { kind: "unsent", message: "The file is larger than 25 MB, the attachment limit; nothing was uploaded." };
+      }
+      chunks.push(chunk);
+    }
+    this.reading.delete(request);
+    request.setTimeout(0);
+    if (size === 0) return { kind: "unsent", message: "The file is empty; nothing was uploaded." };
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), UPLOAD_DEADLINE_MS);
+    try {
+      const answer = await this.store(target.href, headers, Buffer.concat(chunks), controller.signal);
+      return { kind: "answer", status: answer.status, payload: null };
+    } catch {
+      return { kind: "unsent", message: "Could not reach Linear's file storage; nothing was attached." };
+    } finally {
+      clearTimeout(timeout);
+    }
   }
 
   private reply(response: ServerResponse, reply: BrokerReply): void {

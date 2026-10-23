@@ -4,8 +4,9 @@ export const TICKET_MCP_SOURCE = String.raw`
 import { randomUUID } from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { request } from "node:http";
-import { mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { lstat, mkdir, readdir, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { basename, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 const argv = process.argv.slice(2);
 function arg(name) { const index = argv.indexOf(name); return index >= 0 ? argv[index + 1] : undefined; }
@@ -146,7 +147,7 @@ async function linear(query, variables) {
 }
 
 // The issue a tool acts on: this agent's ticket, or another one by identifier (ENG-123) or ID.
-const ISSUE = "query ticket($id: String!) { issue(id: $id) { id identifier title url description priorityLabel state { name type } assignee { name } project { id name } parent { identifier title } labels(first: 20) { nodes { name } } team { id key name states(first: 50) { nodes { id name type position } } } comments(first: 50) { nodes { body createdAt user { name } } } attachments(first: 20) { nodes { title url } } children(first: 50) { nodes { identifier title state { name } } } relations(first: 50) { nodes { type relatedIssue { identifier title } } } inverseRelations(first: 50) { nodes { type issue { identifier title } } } } }";
+const ISSUE = "query ticket($id: String!) { issue(id: $id) { id identifier title url description priorityLabel state { name type } assignee { name } project { id name } parent { id identifier title } labels(first: 20) { nodes { name } } team { id key name states(first: 50) { nodes { id name type position } } } comments(first: 50) { nodes { body createdAt user { name } } } attachments(first: 20) { nodes { title url } } children(first: 50) { nodes { identifier title state { name } } } relations(first: 50) { nodes { type relatedIssue { identifier title } } } inverseRelations(first: 50) { nodes { type issue { identifier title } } } } }";
 // One page of an issue's comments; get_ticket and get_issue only carry the recent ones.
 const COMMENTS = "query comments($id: String!, $first: Int!, $after: String) { issue(id: $id) { identifier comments(first: $first, after: $after) { nodes { id body createdAt url user { name } } pageInfo { hasNextPage endCursor } } } }";
 
@@ -254,7 +255,7 @@ async function scopeOf(issue) {
 }
 
 const ALLOWED = {
-  own: ["add_comment", "set_status", "link_url", "add_relation", "add_manual_task"],
+  own: ["add_comment", "set_status", "link_url", "attach_file", "add_relation", "add_manual_task"],
   created: ["add_comment", "set_status", "link_url", "add_relation", "update_issue"],
   other: ["add_comment", "add_relation (from your ticket or an issue you created)"],
   read_only: [],
@@ -291,6 +292,103 @@ const PLAN_STAGES = { "plan review": true, "plan approved": true };
 const PLAN_STAGE_REFUSAL = "Only a plan review moves a ticket to Plan review, and only the owner's plan decision moves it to Plan approved; an agent setting either leaves a status with no review for the owner to decide. Submit the plan through the plan review flow instead (in omp write the plan file, then write its slug to xd://propose; elsewhere call plannotator_submit_plan), or leave an issue you created to its own planner.";
 const ISSUE_PROPERTY = { type: "string", minLength: 1, maxLength: 100, description: "Identifier such as ENG-123. Omit for this agent's own ticket." };
 
+// Evidence files (README, "Agent access to Linear"): only this agent's ticket and its sub-issues
+// take them. The bytes go to the storage address Linear returns, with the file's type, a cache
+// header and the headers Linear names (as the plan-image upload in linear.ts sends them) and no
+// credential; fileUpload and attachmentCreate are the only credentialed calls.
+const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
+const UPLOAD_TYPES = {
+  ".png": { contentType: "image/png", label: "PNG", test: (bytes) => startsWith(bytes, [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]) },
+  ".jpg": { contentType: "image/jpeg", label: "JPEG", test: (bytes) => startsWith(bytes, [0xff, 0xd8, 0xff]) },
+  ".jpeg": { contentType: "image/jpeg", label: "JPEG", test: (bytes) => startsWith(bytes, [0xff, 0xd8, 0xff]) },
+  ".gif": { contentType: "image/gif", label: "GIF", test: (bytes) => ascii(bytes, 0, "GIF8") },
+  ".webp": { contentType: "image/webp", label: "WebP", test: (bytes) => ascii(bytes, 0, "RIFF") && ascii(bytes, 8, "WEBP") },
+  ".pdf": { contentType: "application/pdf", label: "PDF", test: (bytes) => ascii(bytes, 0, "%PDF-") },
+  ".mp4": { contentType: "video/mp4", label: "MP4", test: (bytes) => ascii(bytes, 4, "ftyp") },
+  ".webm": { contentType: "video/webm", label: "WebM", test: (bytes) => startsWith(bytes, [0x1a, 0x45, 0xdf, 0xa3]) },
+  ".json": { contentType: "application/json", label: "JSON" },
+  ".txt": { contentType: "text/plain", label: "text" },
+  ".zip": { contentType: "application/zip", label: "ZIP", test: (bytes) => startsWith(bytes, [0x50, 0x4b]) && [0x03, 0x05, 0x07].includes(bytes[2]) },
+  ".tgz": { contentType: "application/gzip", label: "gzip", test: (bytes) => startsWith(bytes, [0x1f, 0x8b]) },
+  ".tar.gz": { contentType: "application/gzip", label: "gzip", test: (bytes) => startsWith(bytes, [0x1f, 0x8b]) },
+};
+const UPLOAD_TYPE_LIST = "png, jpeg, webp, gif, pdf, mp4, webm, json, txt, zip, tar.gz";
+const FILE_UPLOAD = "mutation fileUpload($contentType: String!, $filename: String!, $size: Int!) { fileUpload(contentType: $contentType, filename: $filename, size: $size) { success uploadFile { uploadUrl assetUrl headers { key value } } } }";
+const ATTACHMENT_CREATE = "mutation attach($input: AttachmentCreateInput!) { attachmentCreate(input: $input) { success attachment { id url } } }";
+
+function startsWith(bytes, expected) { return expected.every((byte, index) => bytes[index] === byte); }
+function ascii(bytes, start, expected) { for (let index = 0; index < expected.length; index++) if (bytes[start + index] !== expected.charCodeAt(index)) return false; return true; }
+
+// True when path is root or lies below it.
+function within(root, path) {
+  const rel = relative(resolve(root), resolve(path));
+  return rel === "" || (rel !== ".." && !rel.startsWith(".." + sep) && !isAbsolute(rel));
+}
+
+// A local file the tool may upload. Absolute path, regular file, 25 MB, an allowed type whose
+// signature matches its extension, and never a credential directory. A symlink inside the agent's
+// worktree may not point outside it (a screenshot copied in is fine; ~/.ssh/id_rsa is not).
+async function evidenceFile(value) {
+  const path = text(value, "path", 4096);
+  if (path.indexOf("\u0000") >= 0) throw new Error("path must be a plain file path.");
+  if (!isAbsolute(path)) throw new Error("path must be an absolute path to a local file.");
+  const requested = resolve(path);
+  const real = await realpath(requested).catch(() => null);
+  if (!real) throw new Error("No readable file at " + path + ".");
+  const info = await lstat(real).catch(() => null);
+  if (!info || !info.isFile()) throw new Error(path + " is not a regular file.");
+  const root = await realpath(process.cwd()).catch(() => resolve(process.cwd()));
+  if (within(root, requested) && !within(root, real)) throw new Error(path + " is a symbolic link that leaves the agent's worktree, and files outside it are not read through it. Copy the evidence into the worktree or pass the real path.");
+  const forbidden = [];
+  for (const dir of [join(homedir(), ".ssh"), join(homedir(), ".config"), resolve(paseoHome)]) forbidden.push(await realpath(dir).catch(() => resolve(dir)));
+  if (forbidden.some((dir) => within(dir, real))) throw new Error(path + " is under a credential directory (~/.ssh, ~/.config or the Paseo home directory), which is never uploaded. Evidence files belong in the worktree.");
+  if (info.size > MAX_UPLOAD_BYTES) throw new Error(path + " is larger than " + (MAX_UPLOAD_BYTES / 1024 / 1024) + " MB, the attachment limit.");
+  const name = basename(real);
+  const lower = name.toLowerCase();
+  const type = lower.endsWith(".tar.gz") ? UPLOAD_TYPES[".tar.gz"] : UPLOAD_TYPES[extname(lower)];
+  if (!type) throw new Error(name + " is not an allowed evidence type. Allowed: " + UPLOAD_TYPE_LIST + ".");
+  const bytes = await readFile(real);
+  if (bytes.byteLength > MAX_UPLOAD_BYTES) throw new Error(path + " is larger than " + (MAX_UPLOAD_BYTES / 1024 / 1024) + " MB, the attachment limit.");
+  if (type.test && !type.test(bytes)) throw new Error(name + " does not contain " + type.label + " data; a file is uploaded only as the type its extension names.");
+  return { name, contentType: type.contentType, bytes };
+}
+
+// PUTs the bytes through the broker's upload route, which validates the address and forwards
+// Linear's headers verbatim. The storage address never sees a Linear credential.
+function putFile(url, headers, bytes) {
+  const encodedUrl = Buffer.from(url, "utf8").toString("base64url");
+  const encodedHeaders = Buffer.from(JSON.stringify(headers), "utf8").toString("base64url");
+  return new Promise((resolve, reject) => {
+    let connected = false;
+    const done = (message) => reject(new Error(message));
+    const client = request({ socketPath, path: "/upload", method: "POST", headers: {
+      "content-type": "application/octet-stream", "content-length": String(bytes.byteLength),
+      "x-paseo-upload-url": encodedUrl, "x-paseo-upload-headers": encodedHeaders,
+    } }, (response) => {
+      let body = "";
+      response.setEncoding("utf8");
+      response.on("data", (chunk) => { body += chunk; });
+      response.on("error", () => done("The file upload may have completed; nothing was attached to the ticket. Retry the attachment."));
+      response.on("end", () => {
+        let reply;
+        try { reply = JSON.parse(body); } catch { return done("The file upload may have completed; nothing was attached to the ticket. Retry the attachment."); }
+        if (!reply || reply.kind !== "answer") return done(reply && typeof reply.message === "string" ? reply.message : "The file upload may have completed; nothing was attached to the ticket. Retry the attachment.");
+        if (reply.status < 200 || reply.status >= 300) return done("Linear's file storage answered HTTP " + reply.status + "; nothing was attached to the ticket.");
+        resolve();
+      });
+    });
+    client.on("socket", (socket) => {
+      if (!socket.connecting) connected = true;
+      socket.once("connect", () => { connected = true; });
+    });
+    client.on("error", () => done(connected
+      ? "The file upload may have completed; nothing was attached to the ticket. Retry the attachment."
+      : "The host's Linear budget service is unavailable; no file was uploaded. Retry after the plugin is running."));
+    client.setTimeout(90000, () => client.destroy());
+    client.end(bytes);
+  });
+}
+
 const tools = [
   {
     name: "get_ticket",
@@ -323,7 +421,7 @@ const tools = [
         labels: ((issue.labels && issue.labels.nodes) || []).map((l) => l.name), parent: issue.parent || null,
         subIssues: ((issue.children && issue.children.nodes) || []).map((c) => ({ identifier: c.identifier, title: c.title, status: c.state ? c.state.name : null })),
         relations: relationsOf(issue), description: issue.description, comments, links: (issue.attachments && issue.attachments.nodes) || [],
-        scope, youMay: ALLOWED[scope],
+        scope, youMay: scope !== "own" && issue.parent && issue.parent.id === issueId ? ALLOWED[scope].concat(["attach_file (this ticket's sub-issue)"]) : ALLOWED[scope],
       };
     },
   },
@@ -411,6 +509,50 @@ const tools = [
       const data = await linear("mutation link($issueId: String!, $url: String!, $title: String) { attachmentLinkURL(issueId: $issueId, url: $url, title: $title) { success } }", { issueId: target.id, url: url.href, title });
       if (!data.attachmentLinkURL || !data.attachmentLinkURL.success) throw new Error("Linear did not attach the link.");
       return { linked: true, url: url.href };
+    },
+  },
+  {
+    name: "attach_file",
+    description: "Upload a local evidence file (screenshot, PDF, video, log or archive) and attach it to this agent's Linear ticket or one of its sub-issues (issue), as Paseo. Use it for screenshots and other evidence your pull request body or the ticket should show; it returns the Linear asset URL to paste there. This is never a manual task for the owner. At most 25 MB; allowed types: " + UPLOAD_TYPE_LIST + ". The path must be absolute and inside the worktree or an ordinary folder, never a credential directory.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        path: { type: "string", minLength: 1, maxLength: 4096, description: "Absolute path of a local file to upload." },
+        title: { type: "string", minLength: 1, maxLength: 200, description: "Attachment title shown on the ticket; default: the file name." },
+        subtitle: { type: "string", minLength: 1, maxLength: 500, description: "Optional second line, for example what the screenshot shows." },
+        issue: { ...ISSUE_PROPERTY, description: "A sub-issue of this agent's ticket, identifier such as ENG-123. Omit for this ticket." },
+      },
+      required: ["path"],
+      additionalProperties: false,
+    },
+    async run(input) {
+      const issue = await loadIssue(input.issue);
+      const own = issue.id === issueId || issue.identifier === issueId;
+      if (!own && !(issue.parent && issue.parent.id === issueId)) throw new Error(issue.identifier + " is neither this agent's ticket nor one of its sub-issues, so a file cannot be attached there. Attach evidence to this ticket or a sub-issue of it; for a file elsewhere, link its URL with link_url.");
+      const file = await evidenceFile(input.path);
+      const title = input.title === undefined ? file.name : text(input.title, "title", 200);
+      const subtitle = input.subtitle === undefined ? null : text(input.subtitle, "subtitle", 500);
+      const uploaded = await linear(FILE_UPLOAD, { contentType: file.contentType, filename: file.name, size: file.bytes.byteLength });
+      const result = uploaded.fileUpload && uploaded.fileUpload.success ? uploaded.fileUpload.uploadFile : null;
+      if (!result) throw new Error("Linear did not accept the upload.");
+      const uploadUrl = typeof result.uploadUrl === "string" ? result.uploadUrl : "";
+      const assetUrl = typeof result.assetUrl === "string" ? result.assetUrl : "";
+      if (!uploadUrl.startsWith("https://") || !assetUrl.startsWith("https://")) throw new Error("Linear returned no https upload address; nothing was uploaded.");
+      // Content-Type and Cache-Control as Linear's upload guide sets them (the signed storage address
+      // checks the type), then exactly the headers Linear names, passed through unchanged and taking
+      // precedence. The storage address never sees a Linear credential.
+      const named = Array.isArray(result.headers) ? result.headers.filter((entry) => entry && typeof entry.key === "string" && entry.key && typeof entry.value === "string") : [];
+      const headers = [{ key: "Content-Type", value: file.contentType }, { key: "Cache-Control", value: "public, max-age=31536000" }]
+        .filter((base) => !named.some((entry) => entry.key.toLowerCase() === base.key.toLowerCase()));
+      for (const entry of named) headers.push({ key: entry.key, value: entry.value });
+      if (headers.length > 16) throw new Error("Linear returned more upload headers than the broker forwards; nothing was uploaded.");
+      await putFile(uploadUrl, headers, file.bytes);
+      const attachmentInput = { issueId: issue.id, url: assetUrl, title };
+      if (subtitle !== null) attachmentInput.subtitle = subtitle;
+      const attached = await linear(ATTACHMENT_CREATE, { input: attachmentInput });
+      const attachment = attached.attachmentCreate && attached.attachmentCreate.success ? attached.attachmentCreate.attachment : null;
+      if (!attachment || typeof attachment.id !== "string" || !attachment.id) throw new Error("Uploaded the file, but Linear did not attach it to " + issue.identifier + ". Retry the attachment; the asset URL is " + assetUrl + ".");
+      return { attached: true, issue: issue.identifier, title, assetUrl, attachmentId: attachment.id };
     },
   },
   {
@@ -640,7 +782,7 @@ async function handle(message) {
       serverInfo: { name: "linear-ticket", version: "1.0.0" },
       instructions: readOnly
         ? "Reads cover any Linear issue: search with search_issues, then open one with get_issue. This server is read-only and writes nothing to Linear."
-        : "Reads cover any Linear issue. Writes go out as Paseo: comments and relations on any issue; status and links on the ticket this agent was launched from and the issues it created; title and description only on the issues it created.",
+        : "Reads cover any Linear issue. Writes go out as Paseo: comments and relations on any issue; status and links on the ticket this agent was launched from and the issues it created; evidence files (attach_file) on the ticket and its sub-issues; title and description only on the issues it created.",
     });
   }
   if (method === "ping") return reply({});

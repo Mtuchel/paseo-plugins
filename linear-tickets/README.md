@@ -337,7 +337,7 @@ a write. Multi-request tools can still partly complete before a later hold.
 
 | Scope | Write (as Paseo) |
 | --- | --- |
-| The agent's own ticket | comment, status (not Plan review or Plan approved), links, relations, manual tasks |
+| The agent's own ticket | comment, status (not Plan review or Plan approved), links, relations, manual tasks; evidence files (also on the ticket's sub-issues) |
 | Issues the agent created with `create_issue` | comment, status (not Plan review or Plan approved), links, relations, title and description |
 | Any other issue | comment and relations only |
 
@@ -363,6 +363,15 @@ agent's own ticket):
   exist. Submit the plan through its review flow instead (in omp, write the plan file and then
   write its slug to `xd://propose`); an issue the agent created waits for its own planner;
 - `link_url` — attach an https link, such as the pull request;
+- `attach_file` — upload a local evidence file (screenshot, PDF, video, log or archive: png, jpeg,
+  webp, gif, pdf, mp4, webm, json, txt, zip or tar.gz; absolute path, at most 25 MB) and attach it
+  to the ticket or one of its sub-issues as Paseo. It returns the Linear `assetUrl` and the
+  attachment id, so the agent can paste the link into the pull request body. Files under `~/.ssh`,
+  `~/.config` or `$PASEO_HOME` are refused, and a symlink inside the worktree may not point out of
+  it; the file's bytes must match the type its extension names. `fileUpload` and
+  `attachmentCreate` use the app credential through the broker like every other write, while the
+  storage PUT carries only the file's type, a cache header and the headers Linear returns; a failed storage upload creates no
+  attachment;
 - `add_relation` — relate the ticket (or an issue the agent created) to any issue: related,
   blocks, blocked by or duplicate of;
 - `create_issue` — file a follow-up, related to the ticket (or blocking it, or blocked by it), or a
@@ -383,8 +392,11 @@ The agent closes its own ticket, so finished work never waits on you: once the t
 definition of done it moves it to Done, unless a merged pull request already closed it. That
 covers work outside a repository and pull requests that only mention the ticket ("Part of"),
 which close nothing on their own. A step left for a person becomes a manual task and does not
-keep the ticket open. Work that turns out unnecessary (already done, obsolete, a duplicate) is
-moved to Canceled or Duplicate with the reason. Agents limited to planning never close a ticket.
+keep the ticket open. Screenshots and other evidence are **not** manual tasks: the agent uploads
+them itself with `attach_file` and puts the returned link in its pull request body or comment, so
+a ticket that only needs a screenshot never waits on you. Work that turns out unnecessary
+(already done, obsolete, a duplicate) is moved to Canceled or Duplicate with the reason. Agents
+limited to planning never close a ticket.
 
 The launch prompt tells the agent to comment when it starts and finishes, link its pull request,
 move the ticket to review, register every manual step as a manual task and close the ticket as above; custom templates can place that note with `{{linear_access}}`,
@@ -405,7 +417,7 @@ credential is put into them.
 ### Who Linear shows as the author
 
 Everything the plugin and the `linear_ticket` tools write (comments, status moves, labels, links,
-new sub-issues, reactions, plan documents) is sent with the [Paseo Linear app](#native-linear-agent)'s
+uploaded evidence files and their attachments, new sub-issues, reactions, plan documents) is sent with the [Paseo Linear app](#native-linear-agent)'s
 token, so Linear's history shows **Paseo**, not you. Your own comments stay yours, so they
 still steer agents ([Replies from Linear](#write-back-to-linear)). The `linear_ticket` server reads the app's token from
 `agent-app/token.json` on every call; only the daemon refreshes it (ten minutes before it expires,
@@ -4273,7 +4285,9 @@ instead of two:
 
 Some steps only a person can do: environment variables and secrets, Railway, Linear, GitHub or
 Paseo settings, webhooks, integrations. Agents register each one with `add_manual_task` instead
-of leaving it in a comment. Each task is a **sub-issue of the ticket, assigned to you** (the
+of leaving it in a comment. Screenshots and other evidence files are not manual tasks: an agent
+uploads and attaches them itself with `attach_file` (see [Agent access to Linear](#agent-access-to-linear)).
+Each task is a **sub-issue of the ticket, assigned to you** (the
 owner of the plugin's key), explicitly in the parent's project, with the steps in its description and one of three due points:
 
 | `when` | Created in | Effect |
@@ -5975,6 +5989,14 @@ specific outcome is established; otherwise retain debt or roll back the transpor
 Shutdown refuses new work and drains attempts within the 30-second upstream deadline.
 Usage counts settle once while the broker runs or drains; persistence remains best-effort across
 crashes, and unknown/recovered intervals invalidate outside-estimate continuity.
+
+`attach_file` adds one route: `POST /upload` takes the raw file bytes (at most 25 MB) and the
+storage address plus headers Linear returned, with the broker checking that the address is https
+and has no credentials. It is not journaled like a GraphQL intent: the credentialed
+`fileUpload` and `attachmentCreate` calls already went through `/graphql` admission and debt
+accounting, and a storage PUT that fails or is lost creates no attachment, so a retry uploads a
+fresh copy. The route forwards the headers it is given (the file's type, a cache header and
+Linear's own, which win) and never sends a Linear credential to the storage address.
 
 For **each host** (laptop and server087), drain current agent turns/MCP calls, then run
 `node ~/dev/paseo-plugins/tools/plugin-rollout.mjs ~/dev/paseo-plugins/linear-tickets` — it pulls,
