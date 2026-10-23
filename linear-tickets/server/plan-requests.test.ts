@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import type { PaseoApi } from "@getpaseo/client";
+import { AgentDirectory } from "./agent-directory";
 import { PlanRequests, TrustedApps, planRequestText, type PlanRequest } from "./plan-requests";
 import { planSetup } from "./starter";
 import { documentPlanHash } from "./review-outcome";
@@ -41,6 +42,8 @@ async function harness(run: (h: {
   const paseo = {
     agents: { list: async () => ({ entries: [{ agent: { id: "agent-1", createdAt: CREATED_AT, provider: options.provider ?? "omp", labels: { "linear.issueId": "issue-1", "linear.identifier": "TUC-7" } } }], pageInfo: { hasMore: false } }) },
   } as unknown as PaseoApi;
+  const agentDirectory = new AgentDirectory({ liveTtlMs: 0 });
+  agentDirectory.attach(paseo);
   const delivery = { outcome: "sent" as "sent" | "busy" | "waiting" | "unavailable" };
   const build = () => new PlanRequests({
     linear: {
@@ -60,6 +63,7 @@ async function harness(run: (h: {
     apps: { ids: async () => options.apps ?? ["app-1"] },
     prompt: async (agentId: string, text: string) => { prompts.push(`${agentId}: ${text}`); return delivery.outcome; },
     directory,
+    agentDirectory,
   });
   let requests = build();
   requests.attach(paseo);
@@ -375,6 +379,8 @@ test("a poll reads every ticket's own history only when the ticket changed since
   const refused = new Set(["issue-3"]);
   const agent = (n: number) => ({ agent: { id: `agent-${n}`, createdAt: CREATED_AT, provider: "omp", labels: { "linear.issueId": `issue-${n}`, "linear.identifier": `TUC-${n}` } } });
   const paseo = { agents: { list: async () => ({ entries: [agent(1), agent(2), agent(3)], pageInfo: { hasMore: false } }) } } as unknown as PaseoApi;
+  const agentDirectory = new AgentDirectory({ liveTtlMs: 0 });
+  agentDirectory.attach(paseo);
   const requests = new PlanRequests({
     linear: {
       planRequestStamps: async (ids: string[]) => { calls.push(`stamps ${ids.length}`); return new Map(ids.map((id) => [id, { updatedAt: updated[id], replanAt: null }])); },
@@ -391,6 +397,7 @@ test("a poll reads every ticket's own history only when the ticket changed since
     apps: { ids: async () => ["app-1"] },
     prompt: async () => "sent",
     directory,
+    agentDirectory,
   });
   requests.attach(paseo);
   try {

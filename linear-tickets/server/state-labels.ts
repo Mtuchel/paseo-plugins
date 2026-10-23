@@ -1,4 +1,5 @@
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
+import type { AgentDirectory } from "./agent-directory";
 import { UUID, type LinearService, type WrittenState } from "./linear";
 import { loadProbe } from "./load-probe";
 import { RateLimitedError, withPriority } from "./rate-budget";
@@ -283,7 +284,7 @@ export class StateLabels {
 const CATALOG_SUBSCRIPTION = "linear-tickets-state-labels";
 const PAGE = 200;
 
-export function labelDaemon(client: DaemonClient): LabelDaemon {
+export function labelDaemon(client: DaemonClient, directory: Pick<AgentDirectory, "all">): LabelDaemon {
   return {
     async workspaces() {
       const found: LabelWorkspace[] = [];
@@ -301,15 +302,10 @@ export function labelDaemon(client: DaemonClient): LabelDaemon {
     // that is not a Linear id (a test run's "guard-test") makes no ticket agent.
     async ticketAgents() {
       const found: LabelAgent[] = [];
-      let cursor: string | undefined;
-      do {
-        const page = await client.fetchAgents({ filter: { includeArchived: true }, page: { limit: PAGE, ...(cursor ? { cursor } : {}) } });
-        for (const { agent } of page.entries) {
-          const issueId = agent.labels?.["linear.issueId"];
-          if (issueId && UUID.test(issueId) && agent.workspaceId) found.push({ workspaceId: agent.workspaceId, issueId, identifier: agent.labels["linear.identifier"] ?? "", createdAt: agent.createdAt });
-        }
-        cursor = page.pageInfo.hasMore ? page.pageInfo.nextCursor ?? undefined : undefined;
-      } while (cursor);
+      for (const agent of await directory.all()) {
+        const issueId = agent.labels?.["linear.issueId"];
+        if (issueId && UUID.test(issueId) && agent.workspaceId) found.push({ workspaceId: agent.workspaceId, issueId, identifier: agent.labels["linear.identifier"] ?? "", createdAt: agent.createdAt });
+      }
       return found;
     },
     // The same subscription id each time: the daemon replaces the previous listing's subscription.

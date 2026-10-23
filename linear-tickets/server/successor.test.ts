@@ -14,6 +14,7 @@ import { Handover } from "./handover";
 import { Launcher, LEAD_INTRO, type ResumeTarget } from "./launch";
 import type { AdmissionState, IssueCore, IssueState, LabeledIssue } from "./linear";
 import { REPAIR_LABEL, SessionRouter, SessionStore, type HostOwnership, type SessionLink, type Succession } from "./sessions";
+import { AgentDirectory } from "./agent-directory";
 import { DEFAULT_WORKTREE_SHARDS, DEFAULT_ACTIVATION, DEFAULT_BACKSTOP, DEFAULT_DISPATCH, DEFAULT_WRITEBACK, DEFAULT_WATCHDOG, DEFAULT_STEWARD, DEFAULT_DEPUTY, type PluginSettings } from "./settings";
 import { ResumeUnavailableError, TicketStarter, runningTicketAgents, type Started } from "./starter";
 import { REPAIR_BUSY_MESSAGE, RepairBusyError, RepairExclusion } from "./repair-exclusion";
@@ -237,6 +238,8 @@ function routerHarness(options: {
 } = {}) {
   const calls: string[] = [];
   const daemon = options.daemon ?? fakeDaemon(options.agents ?? [], { pageSize: options.pageSize });
+  const agentDirectory = new AgentDirectory({ liveTtlMs: 0 });
+  agentDirectory.attach(daemon.paseo);
   const directory = join(tmpdir(), `paseo-successor-${process.pid}-${Math.random().toString(36).slice(2)}`);
   const store = options.store ?? new SessionStore(join(directory, "sessions.json"));
   const gates = options.gates ?? launcher(daemon).instance;
@@ -264,6 +267,7 @@ function routerHarness(options: {
     admission: async () => typeof options.admission === "function" ? options.admission() : options.admission ?? { ok: true as const },
   };
   const router = new SessionRouter({
+    agentDirectory,
     api: {
       activity: async (_session: string, content: { type: string; body?: string }) => { calls.push(`${content.type}:${(content.body ?? "").split("\n")[0]}`); },
       updateSession: async () => {},
@@ -691,7 +695,10 @@ test("the claimed instruction is the last part of the created agent's first prom
     } as never);
 
     const calls: string[] = [];
+    const agentDirectory = new AgentDirectory({ liveTtlMs: 0 });
+    agentDirectory.attach(daemon.paseo);
     const router = new SessionRouter({
+      agentDirectory,
       api: { activity: async () => {}, updateSession: async () => {}, createSessionOnIssue: async () => "s-new", openSessions: async () => [], activities: async () => [], sessionStatus: async () => "active", sessionStatuses: async () => new Map() } as never,
       linear: linear as never,
       starter: starter as never,
@@ -733,7 +740,10 @@ test("a real admission refusal leaves the instruction unclaimed", async (t) => {
     branches: async () => ({ branches: [{ id: "refs/heads/dev", label: "dev" }], defaultBranch: "refs/heads/dev" }),
   } as never);
   const calls: string[] = [];
+  const agentDirectory = new AgentDirectory({ liveTtlMs: 0 });
+  agentDirectory.attach(daemon.paseo);
   const router = new SessionRouter({
+    agentDirectory,
     api: { activity: async () => {}, updateSession: async () => {}, createSessionOnIssue: async () => "s-new", openSessions: async () => [], activities: async () => [], sessionStatus: async () => "active", sessionStatuses: async () => new Map() } as never,
     linear: linear as never,
     starter: starter as never,
@@ -822,7 +832,10 @@ test("a dispatch paused inside the start holds the ticket's gate: the watch wait
 
   const calls: string[] = [];
   const claim = async () => { calls.push("claim"); };
+  const agentDirectory = new AgentDirectory({ liveTtlMs: 0 });
+  agentDirectory.attach(daemon.paseo);
   const router = new SessionRouter({
+    agentDirectory,
     api: { activity: async () => {}, updateSession: async () => {}, createSessionOnIssue: async () => "s-new", openSessions: async () => [], activities: async () => [], sessionStatus: async () => "active", sessionStatuses: async () => new Map() } as never,
     linear: linear as never,
     starter: starter as never,
@@ -1279,7 +1292,10 @@ test("an explicitly resumed queued owner message reaches the real successor's fi
     branches: async () => ({ branches: [{ id: "refs/heads/dev", label: "dev" }], defaultBranch: "refs/heads/dev" }),
   } as never);
   const store = new SessionStore(join(directory, "sessions.json"));
+  const agentDirectory = new AgentDirectory({ liveTtlMs: 0 });
+  agentDirectory.attach(daemon.paseo);
   const router = new SessionRouter({
+    agentDirectory,
     api: { activity: async () => {}, updateSession: async () => {}, sessionStatus: async () => "active", sessionStatuses: async () => new Map() } as never,
     linear: linear as never, starter, handover, launcher: gates, settings: { read: async () => settings }, store,
   });

@@ -9,6 +9,7 @@ import { createServer, type AddressInfo } from "node:net";
 import type { PaseoApi } from "@getpaseo/client";
 import type { AgentPermissionRequest, AgentPermissionResponse } from "@getpaseo/protocol/agent-types";
 import { fingerprint } from "./deputy";
+import { AgentDirectory } from "./agent-directory";
 import { HealthMonitor } from "./health";
 import { reviewChange, type PullRequestView } from "./pr-watch";
 import { currentCallerName } from "./linear-usage";
@@ -71,6 +72,8 @@ function routerHarness(pending: AgentPermissionRequest[], extra: Partial<Constru
       }),
     },
   } as unknown as PaseoApi;
+  const agentDirectory = new AgentDirectory({ liveTtlMs: 0 });
+  agentDirectory.attach(paseo);
   const directory = extra.store ? dirname(extra.store.path) : join(tmpdir(), `paseo-flow-${process.pid}-${Math.random().toString(36).slice(2)}`);
   const store = extra.store ?? new SessionStore(join(directory, "sessions.json"));
   const replies = extra.replies ?? new PermissionReplies({
@@ -91,6 +94,7 @@ function routerHarness(pending: AgentPermissionRequest[], extra: Partial<Constru
     settings: { read: async () => settings },
     store,
     replies,
+    agentDirectory,
     stop: async (agentId) => { calls.push(`stop ${agentId}`); },
     ...extra,
   });

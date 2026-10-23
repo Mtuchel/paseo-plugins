@@ -2,6 +2,7 @@ import type { PaseoApi } from "@getpaseo/client";
 import { join } from "node:path";
 import type { FocusPhase, FocusStatus, FocusTicket } from "../shared/contracts";
 import type { ActivationIntake } from "./activation-intake";
+import type { AgentDirectory } from "./agent-directory";
 import { JsonFile } from "./activation";
 import { dispatchLabels } from "./dispatch";
 import { inReviewState, type FocusNode, type LinearService } from "./linear";
@@ -39,24 +40,19 @@ function parseFile(raw: unknown): FocusFile {
 
 // The root ticket agents on this host (not archived, no subagents), by ticket: `live` the agent
 // exists to work (LIVE_AGENT), `working` it works right now, `waiting` it waits for the owner.
-async function agentsByTicket(paseo: PaseoApi): Promise<Map<string, AgentState>> {
+async function agentsByTicket(directory: Pick<AgentDirectory, "live">): Promise<Map<string, AgentState>> {
   const byTicket = new Map<string, AgentState>();
-  let cursor: string | undefined;
-  do {
-    const page = await paseo.agents.list({ filter: { includeArchived: false }, page: { limit: 200, ...(cursor ? { cursor } : {}) } });
-    for (const { agent } of page.entries) {
-      const issueId = agent.labels?.["linear.issueId"];
-      if (!issueId || agent.labels["paseo.parent-agent-id"]) continue;
-      const waiting = Boolean(agent.pendingPermissions?.length);
-      const state = byTicket.get(issueId) ?? { live: false, working: false, waiting: false };
-      byTicket.set(issueId, {
-        live: state.live || Boolean(LIVE_AGENT[agent.status]),
-        working: state.working || ((agent.status === "running" || agent.status === "initializing") && !waiting),
-        waiting: state.waiting || waiting,
-      });
-    }
-    cursor = page.pageInfo?.hasMore ? page.pageInfo.nextCursor ?? undefined : undefined;
-  } while (cursor);
+  for (const agent of await directory.live()) {
+    const issueId = agent.labels?.["linear.issueId"];
+    if (!issueId || agent.labels["paseo.parent-agent-id"]) continue;
+    const waiting = Boolean(agent.pendingPermissions?.length);
+    const state = byTicket.get(issueId) ?? { live: false, working: false, waiting: false };
+    byTicket.set(issueId, {
+      live: state.live || Boolean(LIVE_AGENT[agent.status]),
+      working: state.working || ((agent.status === "running" || agent.status === "initializing") && !waiting),
+      waiting: state.waiting || waiting,
+    });
+  }
   return byTicket;
 }
 
@@ -69,6 +65,8 @@ export class Focus {
   constructor(private readonly deps: {
     linear: Pick<LinearService, "focusTickets" | "focusSeed" | "focusQueueBlockers" | "trustedAppIds">;
     settings: Pick<Settings, "read">;
+    // The shared read-only agent listing (TUC-3006).
+    agentDirectory: Pick<AgentDirectory, "live">;
     // The plans waiting for the owner's decision on the central Plannotator host (parked.ts).
     parked?: Pick<ParkedPlans, "all">;
     // The peer host's claims (activation-intake.ts): the tickets a live root agent works there.
@@ -93,7 +91,7 @@ export class Focus {
     const file = await this.file.load();
     if (!file.active) return null;
     if (file.roots[issueId]) return null;
-    const snapshot = await this.current(paseo).catch(() => this.snapshot);
+    const snapshot = await this.current().catch(() => this.snapshot);
     return snapshot?.members.has(issueId) ? null : FOCUS_REASON;
   }
 
@@ -108,7 +106,7 @@ export class Focus {
   async enable(paseo: PaseoApi): Promise<FocusStatus> {
     const settings = await this.deps.settings.read();
     const labels = dispatchLabels(settings.dispatch.label);
-    const agents = await agentsByTicket(paseo);
+    const agents = await agentsByTicket(this.deps.agentDirectory);
     const appIds = new Set(await this.deps.linear.trustedAppIds());
     const seed = await this.deps.linear.focusSeed(settings.dispatch.teamKeys, [labels.running, labels.needsYou, labels.blocked, labels.failed]);
     const planReady = (node: FocusNode) => node.labels.some((name) => name.toLowerCase() === PLAN_READY_LABEL);
@@ -159,7 +157,7 @@ export class Focus {
   async status(paseo: PaseoApi): Promise<FocusStatus> {
     const file = await this.file.load();
     if (!file.active) return { active: false, since: null, readAt: null, error: null, tickets: [], left: 0, complete: false };
-    const snapshot = await this.current(paseo).catch(() => this.snapshot);
+    const snapshot = await this.current().catch(() => this.snapshot);
     const tickets = snapshot?.tickets ?? [];
     const left = tickets.filter((ticket) => !["manual", "review", "done"].includes(ticket.phase)).length;
     return {
@@ -170,9 +168,9 @@ export class Focus {
 
   // The snapshot, read again when older than REFRESH_MS; one read at a time. A failed read is
   // remembered for the status and rethrown.
-  private current(paseo: PaseoApi): Promise<Snapshot> {
+  private current(): Promise<Snapshot> {
     if (this.snapshot && this.now() - this.snapshot.readAt < REFRESH_MS) return Promise.resolve(this.snapshot);
-    this.refreshing ??= this.walk(paseo).then((snapshot) => {
+    this.refreshing ??= this.walk().then((snapshot) => {
       this.snapshot = snapshot;
       this.error = null;
       return snapshot;
@@ -192,11 +190,11 @@ export class Focus {
     return this.deps.intake.claimedTickets().catch(() => null);
   }
 
-  private async walk(paseo: PaseoApi): Promise<Snapshot> {
+  private async walk(): Promise<Snapshot> {
     const file = await this.file.load();
     const settings = await this.deps.settings.read();
     const labels = dispatchLabels(settings.dispatch.label);
-    const agents = await agentsByTicket(paseo);
+    const agents = await agentsByTicket(this.deps.agentDirectory);
     const peer = await this.peerTickets(settings);
     const parked = new Set((await this.deps.parked?.all().catch(() => []) ?? []).map((plan) => plan.issueId));
     const reasons = new Map<string, FocusTicket["reason"]>(Object.keys(file.roots).map((id) => [id, "in-flight"]));

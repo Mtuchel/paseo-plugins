@@ -15,6 +15,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ParkedPlans } from "./parked";
+import { AgentDirectory } from "./agent-directory";
 import { SessionRouter, SessionStore } from "./sessions";
 import { ParentStore } from "./parents";
 import { WatchdogStore } from "./watchdog";
@@ -165,6 +166,7 @@ async function groupDispatch(t: TestContext, owner: () => Promise<"here" | "else
   const parents = new ParentStore(directory);
   const watchdog = new WatchdogStore(join(directory, "watchdog.json"));
   const router = new SessionRouter({
+    agentDirectory: new AgentDirectory(),
     linear: linear as never, store, parents, watchdog, owner, settings: { read: async () => baseSettings },
     api: { activity: async () => {}, updateSession: async () => {} } as never,
     starter: { admission: async () => ({ ok: true }), start: async () => { throw new Error("Group must not launch an implementation worker"); } },

@@ -6,6 +6,7 @@ import test from "node:test";
 import type { PaseoApi } from "@getpaseo/client";
 import { candidates } from "../shared/model-fallbacks";
 import { availability, LIMIT_DAY, LimitResumeStore, limitError, type UsageReport, UsageReader } from "./limit-resume";
+import { AgentDirectory } from "./agent-directory";
 import { SessionRouter, SessionStore, type SessionLink } from "./sessions";
 import { DEFAULT_WORKTREE_SHARDS, DEFAULT_ACTIVATION, DEFAULT_DEPUTY, DEFAULT_BACKSTOP, DEFAULT_DISPATCH, DEFAULT_WATCHDOG, DEFAULT_STEWARD, DEFAULT_WRITEBACK, type PluginSettings } from "./settings";
 import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
@@ -46,9 +47,12 @@ async function harness() {
       }),
     },
   } as unknown as PaseoApi;
+  const agentDirectory = new AgentDirectory({ liveTtlMs: 0 });
+  agentDirectory.attach(paseo);
   let counter = 0;
   const makeRouter = () => {
     const router = new SessionRouter({
+      agentDirectory,
       api: { activity: async (_session: string, content: { body?: string }) => { if (state.panelFails && content.body?.startsWith("Resumed")) throw new Error("panel lost"); state.messages.push(content.body ?? ""); }, updateSession: async () => {}, openSessions: async () => [], activities: async () => [] } as never,
       linear: { viewerId: async () => "owner", appUserId: async () => "app", addLabel: async () => {}, removeLabel: async () => {}, userUrl: async () => { await state.pauseRecipient?.(); return "https://linear.app/owner"; }, hasComment: async (_issue: string, mark: string) => state.comments.some((comment) => comment.includes(mark)), comment: async (_issue: string, body: string) => { if (state.commentFailure === "before") throw new Error("comment failed"); state.comments.push(body); if (state.commentFailure === "after") { state.commentFailure = "none"; throw new Error("response lost"); } } } as never,
       starter: { start: async (_id: string, _paseo: PaseoApi, _settings: PluginSettings, options: { fresh?: boolean }) => {

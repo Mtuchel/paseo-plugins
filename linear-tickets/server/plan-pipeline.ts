@@ -5,6 +5,7 @@ import { dirname, join } from "node:path";
 import type { PaseoAgent, PaseoApi } from "@getpaseo/client";
 import { PipelineHost, PipelineRow, type PipelineStage, type PipelineStatus } from "../shared/plan-pipeline";
 import { ADVISOR_MODEL } from "../shared/plan-advisor";
+import type { AgentDirectory } from "./agent-directory";
 import { loadProbe } from "./load-probe";
 import type { ParkedPlan } from "./parked";
 import { ghostAgents, LIVE_AGENT, type ProcessInspector } from "./process-liveness";
@@ -28,6 +29,8 @@ export type PlanPipelineOptions = {
   owners?: (issueIds: readonly string[]) => Promise<readonly PipelineOwnerEvidence[]>;
   // Source root and read-only process inspection seam; useful for deterministic isolated tests.
   home?: string; processInspector?: ProcessInspector;
+  // The shared read-only agent listing (TUC-3006); archived agents included.
+  agentDirectory: Pick<AgentDirectory, "all">;
 };
 type Row = PipelineRow;
 type PlannerIdentity = { projectId: string; runId: string };
@@ -113,7 +116,7 @@ export class PlanPipeline {
   private reviews: readonly PipelineReview[] = [];
   private decided: readonly PipelineReview[] = [];
 
-  constructor(private readonly options: PlanPipelineOptions = {}) {
+  constructor(private readonly options: PlanPipelineOptions) {
     this.host = label(options.host ?? hostname(), 100);
     this.home = options.home ?? paseoHome();
     this.file = options.file ?? join(this.home, "linear-tickets", "plan-pipeline.json");
@@ -340,22 +343,6 @@ export class PlanPipeline {
     this.prune();
   }
 
-  private async agents(): Promise<PaseoAgent[]> {
-    if (!this.paseo) throw new Error("Paseo source unavailable");
-    const agents: PaseoAgent[] = [];
-    const seen = new Set<string>();
-    let cursor: string | undefined;
-    for (let page = 0; page < 50; page++) {
-      const result = await this.paseo.agents.list({ filter: { includeArchived: true }, page: { limit: 200, ...(cursor ? { cursor } : {}) } });
-      agents.push(...result.entries.map(({ agent }) => agent));
-      if (!result.pageInfo?.hasMore) { if (!result.pageInfo) throw new Error("Agent listing incomplete"); return agents; }
-      cursor = result.pageInfo.nextCursor ?? undefined;
-      if (!cursor || seen.has(cursor)) throw new Error("Agent listing incomplete");
-      seen.add(cursor);
-    }
-    throw new Error("Agent listing exceeds safe bound");
-  }
-
   private async timeline(agent: PaseoAgent): Promise<{ progress: string | null; submitAt?: string; failure?: string }> {
     if (!this.paseo) throw new Error("Paseo source unavailable");
     const page = await this.paseo.agents.ref(agent).timeline.refetch({ direction: "tail", projection: "canonical", limit: 64 });
@@ -404,7 +391,7 @@ export class PlanPipeline {
 
   private async run(): Promise<void> {
     await this.load();
-    const [agentSource, sessionSource, parkedSource, plannerSource] = await Promise.allSettled([this.agents(), this.sessions(), this.parked(), pipelinePlannerEvidence(this.home)]);
+    const [agentSource, sessionSource, parkedSource, plannerSource] = await Promise.allSettled([this.options.agentDirectory.all(), this.sessions(), this.parked(), pipelinePlannerEvidence(this.home)]);
     const agents = agentSource.status === "fulfilled" ? agentSource.value : [];
     const links = sessionSource.status === "fulfilled" ? sessionSource.value : [];
     const parked = parkedSource.status === "fulfilled" ? parkedSource.value : [];

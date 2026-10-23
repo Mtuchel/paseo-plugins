@@ -1,6 +1,7 @@
 import { mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type { PaseoApi } from "@getpaseo/client";
+import type { AgentDirectory } from "./agent-directory";
 import type { LinearService, PlanRequestStamp } from "./linear";
 import type { LabelEvent } from "./label-rules";
 import { documentPlanHash } from "./review-outcome";
@@ -52,6 +53,8 @@ type Deps = {
   directory?: string;
   // The small-ticket route, which refuses `plan`: the owner's label add is taken as a request there.
   routes?: Pick<SmallRoutes, "ownerRequested">;
+  // The shared read-only agent listing (TUC-3006).
+  agentDirectory: Pick<AgentDirectory, "live">;
 };
 // Per agent: the request ids delivered to it, and when the planning round it answers started (the
 // newest request delivered; null until one was). `checkedAt` (this host's clock), `updatedAt` and
@@ -225,7 +228,7 @@ export class PlanRequests {
     const paseo = this.paseo;
     if (!paseo || this.stopped) return;
     const startedAt = new Date().toISOString();
-    const agents = await ticketAgents(paseo);
+    const agents = await ticketAgents(this.deps.agentDirectory);
     const trusted = new Set(await this.deps.apps.ids());
     const apps = [...trusted].sort().join(",");
     const previous = await this.load();
@@ -361,17 +364,12 @@ async function writeApps(path: string, apps: Record<string, { appUserId: string;
 }
 
 // Root ticket agents that are not archived, idle or working.
-async function ticketAgents(paseo: PaseoApi): Promise<TicketAgent[]> {
+async function ticketAgents(directory: Pick<AgentDirectory, "live">): Promise<TicketAgent[]> {
   const agents: TicketAgent[] = [];
-  let cursor: string | undefined;
-  do {
-    const page = await paseo.agents.list({ filter: { includeArchived: false }, page: { limit: 200, ...(cursor ? { cursor } : {}) } });
-    for (const { agent } of page.entries) {
-      const labels = agent.labels ?? {};
-      const issueId = labels["linear.issueId"];
-      if (issueId && !labels["paseo.parent-agent-id"]) agents.push({ id: agent.id, issueId, identifier: labels["linear.identifier"] || issueId, createdAt: agent.createdAt, provider: agent.provider });
-    }
-    cursor = page.pageInfo.hasMore ? page.pageInfo.nextCursor ?? undefined : undefined;
-  } while (cursor);
+  for (const agent of await directory.live()) {
+    const labels = agent.labels ?? {};
+    const issueId = labels["linear.issueId"];
+    if (issueId && !labels["paseo.parent-agent-id"]) agents.push({ id: agent.id, issueId, identifier: labels["linear.identifier"] || issueId, createdAt: agent.createdAt, provider: agent.provider });
+  }
   return agents;
 }

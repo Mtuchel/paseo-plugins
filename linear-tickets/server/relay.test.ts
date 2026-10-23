@@ -10,6 +10,7 @@ import type { Candidate } from "./deputy";
 import { RateLimitedError } from "./rate-budget";
 import { closeAnswered, NeedsYouIssues } from "./needs-you";
 import { recordPluginComment } from "./agent-records";
+import { AgentDirectory } from "./agent-directory";
 import { approvalDecision, CommentRelay, mentionMessage, questionAnswer } from "./relay";
 import { PermissionReplies } from "./permission-replies";
 
@@ -91,6 +92,8 @@ function setup(agents: AgentFixture[], comments: Record<string, RelayComment[]>,
       }),
     },
   } as unknown as PaseoApi;
+  const agentDirectory = new AgentDirectory({ liveTtlMs: 0 });
+  agentDirectory.attach(paseo);
   let answerError: Error | null = null;
   const answers: string[] = [];
   const replies = new PermissionReplies({ directory: dirname(path), daemon: async () => checked ? {
@@ -106,7 +109,7 @@ function setup(agents: AgentFixture[], comments: Record<string, RelayComment[]>,
       if (needsYou && (await needsYou.all()).some((entry) => entry.id === issueId && entry.agentId === agentId)) await closeAnswered(needsYou, linear, issueId!);
     },
   });
-  return { relay: new CommentRelay(linear, path, needsYou, undefined, replies, options), paseo, events, since, reads, readIssues, fake, path, replies, answers, failAnswer: (error: Error) => { answerError = error; } };
+  return { relay: new CommentRelay(linear, path, needsYou, undefined, replies, { ...options, agentDirectory }), paseo, events, since, reads, readIssues, fake, path, replies, answers, failAnswer: (error: Error) => { answerError = error; } };
 }
 
 const comment = (id: string, body: string, extra: Partial<RelayComment> = {}): RelayComment => ({ id, body, createdAt: `2026-02-01T00:00:0${id.length}Z`, userId: ME, reactions: [], sessionId: null, parent: null, ...extra });

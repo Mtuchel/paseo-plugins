@@ -7,6 +7,7 @@ import type { PaseoApi } from "@getpaseo/client";
 import type { AgentPermissionRequest, AgentPermissionResponse } from "@getpaseo/protocol/agent-types";
 import type { OwnerAsk } from "../shared/contracts";
 import type { BrowserDecisionAction, DecisionHost, StewardFlow } from "../shared/decision-inbox";
+import { AgentDirectory } from "./agent-directory";
 import { BrowserDecisionInbox, type BrowserDecisionInboxDeps } from "./decision-inbox";
 import { PermissionReplies } from "./permission-replies";
 import { INBOX_DISPLAYED_HEADER } from "./inbox-transport";
@@ -70,6 +71,8 @@ async function harness(t: TestContext, host = "laptop", asks: OwnerAsk[] = [owne
       respondToPermission: async () => { throw new Error("A browser action must use checked delivery."); },
     }),
   } } as unknown as PaseoApi;
+  const agentDirectory = new AgentDirectory({ liveTtlMs: 0 });
+  agentDirectory.attach(sdk);
   const daemon = async () => ({ respondToPermissionAndWait: async (agentId: string, requestId: string, response: AgentPermissionResponse) => {
     sent.push({ agentId, requestId, response });
     if (submit) await submit(requestId, response);
@@ -83,7 +86,7 @@ async function harness(t: TestContext, host = "laptop", asks: OwnerAsk[] = [owne
   const create = (backendInstanceId?: () => string | undefined) => {
     const replies = new PermissionReplies({ directory: join(directory, "replies"), daemon, now: () => now });
     replies.attach(sdk);
-    const inbox = new BrowserDecisionInbox({ ownerAsks, paseo: () => sdk, replies, peers: async () => peers,
+    const inbox = new BrowserDecisionInbox({ ownerAsks, paseo: () => sdk, agentDirectory, replies, peers: async () => peers,
       canonicalPeer: async () => canonical, host, backendInstanceId, agentUrl: async (id) => `https://paseo.test/agents/${id}`,
       directory: join(directory, "inbox"), now: () => now,
       // Only a test that asks for a steward flow gets the dependency: a host without one answers

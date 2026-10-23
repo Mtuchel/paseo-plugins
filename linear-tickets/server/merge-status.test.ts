@@ -7,6 +7,7 @@ import type { FocusNode } from "./linear";
 import type { HandoverRecord } from "./handover";
 import type { ParkedPlan } from "./parked";
 import type { SessionLink } from "./sessions";
+import { AgentDirectory } from "./agent-directory";
 import { MergeStatus, type MergeStatusDeps } from "./merge-status";
 
 function ticket(id: string, status = "In Progress", labels: string[] = []): FocusNode {
@@ -28,9 +29,11 @@ function harness() {
     const index = Number(input.page.cursor ?? 0);
     return { entries: (pages ? pages[index] : agents).map(agent => ({ agent })), pageInfo: { hasMore: malformed || Boolean(pages && index + 1 < pages.length), nextCursor: malformed ? null : String(index + 1) } };
   } } } as unknown as PaseoApi;
+  const agentDirectory = new AgentDirectory({ liveTtlMs: 0 });
+  agentDirectory.attach(paseo);
   const deps: MergeStatusDeps = {
     linear: { focusQueueBlockers: async keys => { assert.deepEqual(keys, ["TUC"]); reads++; await beforeRead?.(); if (failure) throw new Error(failure); return tickets; } },
-    teamKeys: async () => ["TUC"], paseo: () => paseo,
+    teamKeys: async () => ["TUC"], paseo: () => paseo, agentDirectory,
     handover: { all: async () => records }, parked: { all: async () => parked }, sessions: { all: async () => sessions },
     waiting: () => [], agentUrl: async id => `https://app.paseo.sh/h/test/agent/${id}`, now: () => now,
   };

@@ -5827,6 +5827,16 @@ never changes what the work it times returns or throws. It writes four kinds of 
   resolution) covers only the last ten minutes.
 - `[linear-tickets] profiler …`: the CPU profiler's start, stop and failures (below).
 
+Every daemon request the plugin makes is counted per caller and request kind; once an hour the
+`[linear-tickets] Daemon usage <since>..<until>: total <n> requests` line and up to twelve
+`Daemon usage <caller>: <n> requests (<kind> <n>, …)` lines say where the last hour's requests went
+(an archived listing is its own kind, `agents.list[archived]`). The periodic readers that only list
+agents share one directory instead of polling on their own timers: live agents are cached for 20
+seconds, the archived index for 10 minutes, and an agent created or archived drops the live cache
+at once.
+Work that starts, claims or decides ownership still reads the daemon directly, so a decision never
+runs on a cached list.
+
 The CPU profiler only runs while the owner asks for it. The switch is the file
 `$PASEO_HOME/linear-tickets/diagnostics/profile-until` holding an ISO end time with its zone, for
 example `date -u -d '+5 hours' +%Y-%m-%dT%H:%M:%SZ > ~/.paseo/linear-tickets/diagnostics/profile-until`.

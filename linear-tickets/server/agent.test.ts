@@ -17,6 +17,7 @@ import { AuthenticationError, LinearApiError, LinearService, postGraphQL, type A
 import { closeAnswered, NeedsYouIssues } from "./needs-you";
 import { PermissionReplies } from "./permission-replies";
 import { planSteps, SessionRouter, SessionStore, type SessionLink } from "./sessions";
+import { AgentDirectory } from "./agent-directory";
 import { DEFAULT_WORKTREE_SHARDS, DEFAULT_ACTIVATION, DEFAULT_BACKSTOP, DEFAULT_DISPATCH, DEFAULT_WRITEBACK, DEFAULT_WATCHDOG, DEFAULT_STEWARD, DEFAULT_DEPUTY, type PluginSettings } from "./settings";
 import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
 import { ticketProcessLiveness, type ProcessAgent, type ProcessInspector } from "./process-liveness";
@@ -292,6 +293,8 @@ function harness(options: { owner?: (issueId: string) => Promise<"here" | "elsew
       }),
     },
   } as unknown as PaseoApi;
+  const agentDirectory = new AgentDirectory({ liveTtlMs: 0 });
+  agentDirectory.attach(paseo);
   const directory = options.directory ?? join(tmpdir(), `paseo-sessions-${process.pid}-${Math.random().toString(36).slice(2)}`);
   const store = new SessionStore(join(directory, "sessions.json"));
   const replies = new PermissionReplies({
@@ -334,6 +337,7 @@ function harness(options: { owner?: (issueId: string) => Promise<"here" | "elsew
     settings: { read: async () => settings },
     store,
     replies,
+    agentDirectory,
     needsYou: options.needsYou,
     route: options.route,
     owner: options.owner,

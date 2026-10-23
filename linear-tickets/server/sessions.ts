@@ -6,6 +6,7 @@ import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
 import type { PaseoAgent, PaseoAgentHandle, PaseoApi } from "@getpaseo/client";
+import type { AgentDirectory } from "./agent-directory";
 import type { AgentPermissionRequest } from "@getpaseo/protocol/agent-types";
 import type { AgentActivity, AgentApi, OpenSession, SelectOption, SessionPlanStep } from "./agent-app";
 import { agentAppDirectory, SESSION_ACTIVITIES_BATCH } from "./agent-app";
@@ -388,6 +389,8 @@ export function planSteps(markdown: string): string[] {
 
 type Deps = {
   api: AgentApi;
+  // The shared read-only agent listing (TUC-3006), read by watchdogRoots.
+  agentDirectory: Pick<AgentDirectory, "live">;
   linear: Pick<LinearService, "viewerId" | "appUserId" | "addLabel" | "removeLabel" | "complete" | "cancel" | "issueState" | "issueStatus" | "admissionStates" | "issueGroup" | "delegate" | "moveToStateNamed" | "comment" | "hasComment" | "userUrl">;
   starter: Pick<TicketStarter, "start" | "admission">;
   // The ticket's handover record: a successor resumes from it and takes it over (succeed).
@@ -2461,23 +2464,12 @@ export class SessionRouter {
   async watchdogRoots(): Promise<Map<string, TicketRoots>> {
     const tickets = new Map<string, TicketRoots>();
     if (!this.paseo) return tickets;
-    let cursor: string | undefined;
-    const cursors = new Set<string>();
-    for (let pageNumber = 0; ; pageNumber++) {
-      if (pageNumber === QUEUED_OWNER_MAX_PAGES) throw new Error("The agent list could not be fully read.");
-      const page = await this.paseo.agents.list({ filter: { includeArchived: false }, page: { limit: 200, ...(cursor ? { cursor } : {}) } });
-      for (const { agent } of page.entries) {
-        const issueId = agent.labels?.["linear.issueId"];
-        if (!issueId || agent.labels?.["paseo.parent-agent-id"] || agent.labels?.["linear-tickets.steward"] || agent.archivedAt) continue;
-        const ticket = tickets.get(issueId) ?? { issueId, identifier: agent.labels?.["linear.identifier"] ?? issueId, roots: [], ghosts: new Set<string>() };
-        ticket.roots.push(agent);
-        tickets.set(issueId, ticket);
-      }
-      if (!page.pageInfo) throw new Error("The agent list could not be fully read.");
-      if (!page.pageInfo.hasMore) break;
-      cursor = page.pageInfo.nextCursor ?? undefined;
-      if (!cursor || cursors.has(cursor)) throw new Error("The agent list could not be fully read.");
-      cursors.add(cursor);
+    for (const agent of await this.deps.agentDirectory.live()) {
+      const issueId = agent.labels?.["linear.issueId"];
+      if (!issueId || agent.labels?.["paseo.parent-agent-id"] || agent.labels?.["linear-tickets.steward"] || agent.archivedAt) continue;
+      const ticket = tickets.get(issueId) ?? { issueId, identifier: agent.labels?.["linear.identifier"] ?? issueId, roots: [], ghosts: new Set<string>() };
+      ticket.roots.push(agent);
+      tickets.set(issueId, ticket);
     }
     const ghosts = await ghostAgents([...tickets.values()].flatMap((ticket) => ticket.roots), this.clock(), this.deps.processInspector);
     for (const ticket of tickets.values()) for (const agent of ticket.roots) if (ghosts.has(agent.id)) ticket.ghosts.add(agent.id);

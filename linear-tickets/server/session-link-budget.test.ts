@@ -6,6 +6,7 @@ import test from "node:test";
 import { AgentApi } from "./agent-app";
 import { postGraphQL } from "./linear";
 import { RateBudget, RateLimitedError, withPriority } from "./rate-budget";
+import { AgentDirectory } from "./agent-directory";
 import { SessionRouter, SessionStore } from "./sessions";
 
 test("a refused background session link stays undelivered and is retried after refill", async (t) => {
@@ -33,7 +34,7 @@ test("a refused background session link stays undelivered and is retried after r
     return new Response(JSON.stringify({ data: { agentSessionUpdate: { success: true } } }));
   });
   const api = new AgentApi({ accessToken: async () => "app-token" }, (key, query, variables) => postGraphQL(key, query, variables, budget));
-  const router = new SessionRouter({ api, store } as never);
+  const router = new SessionRouter({ api, store, agentDirectory: new AgentDirectory() } as never);
   const deliver = () => withPriority("background", "session sweep: session links", () => router.linkToPaseo("s1", "agent-1"));
   await assert.rejects(deliver(), RateLimitedError);
   assert.equal(writes.length, 0);
