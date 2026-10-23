@@ -365,11 +365,14 @@ test("AC-13: a request for a provider without the extension stays pending until 
   }, { provider: "claude-code" });
 });
 
-test("a poll reads every ticket's own history only when the ticket changed since the poll before", async () => {
+test("a poll reads every ticket's own history only when the ticket changed since the poll before", async (t) => {
+  t.mock.method(console, "error", () => {});
   const directory = await mkdtemp(join(tmpdir(), "paseo-plan-requests-"));
   const calls: string[] = [];
   const updated: Record<string, string> = { "issue-1": CREATED_AT, "issue-2": CREATED_AT, "issue-3": CREATED_AT };
   const events: LabelEvent[] = [];
+  // The budget pause refuses a read part way through a poll.
+  const refused = new Set(["issue-3"]);
   const agent = (n: number) => ({ agent: { id: `agent-${n}`, createdAt: CREATED_AT, provider: "omp", labels: { "linear.issueId": `issue-${n}`, "linear.identifier": `TUC-${n}` } } });
   const paseo = { agents: { list: async () => ({ entries: [agent(1), agent(2), agent(3)], pageInfo: { hasMore: false } }) } } as unknown as PaseoApi;
   const requests = new PlanRequests({
@@ -378,7 +381,11 @@ test("a poll reads every ticket's own history only when the ticket changed since
       issueDocument: async (issueId: string) => { calls.push(`document ${issueId}`); return { content: PLAN }; },
       replanComments: async (issueId: string) => { calls.push(`comments ${issueId}`); return []; },
       existingLabelId: async () => "label-plan",
-      labelHistory: async (issueId: string) => { calls.push(`history ${issueId}`); return issueId === "issue-2" ? events : []; },
+      labelHistory: async (issueId: string) => {
+        calls.push(`history ${issueId}`);
+        if (refused.has(issueId)) throw new Error("Background Linear work is paused");
+        return issueId === "issue-2" ? events : [];
+      },
       viewerId: async () => "owner-1",
     } as never,
     apps: { ids: async () => ["app-1"] },
@@ -389,6 +396,10 @@ test("a poll reads every ticket's own history only when the ticket changed since
   try {
     await requests.poll();
     assert.deepEqual(calls.filter((call) => call.startsWith("history")).length, 3, "an agent seen the first time has its ticket read");
+    calls.length = 0;
+    refused.clear();
+    await requests.poll();
+    assert.deepEqual(calls, ["stamps 3", "comments issue-3", "history issue-3"], "after a refusal part way, the next poll reads only the tickets it did not finish");
     calls.length = 0;
     await requests.poll();
     assert.deepEqual(calls, ["stamps 3"], "nothing changed: one read for all tickets");
