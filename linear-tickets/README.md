@@ -3564,6 +3564,19 @@ over N tickets lists the agent registry once, not once per ticket; only an actio
 re-read before its effect lists it again. Diagnostic helpers consume real capacity
 through the control lane; they do not become implementation roots.
 
+**Linear reads per pass.** A pass reads the dispatch teams' tickets carrying a Paseo label, the
+tickets delegated to Paseo's apps and the Needs input tickets, then by id, in batches of 50, only
+the tracked tickets those reads did not already return. A tracked ticket that the last pass found
+closed with nothing of the steward's own still open on it — no verifier, unfinished diagnostic,
+queued action, park, claim in flight or application — and that no root agent, Needs-you
+question or parent link watches is read by id at most every 15 minutes (`CLOSED_RECHECK_MS`):
+its pass would only renew timestamps. Between those reads it keeps its stored entry and still
+counts as closed in the flow view. A ticket reopened meanwhile is seen on the next pass once it
+carries a Paseo label or delegate again, otherwise within 15 minutes. The blocker-only pass never
+reads such a ticket. The fences an action re-checks right before its effect (parent resume,
+diagnostic, completion and repair) read their one ticket by id: one request, not every label and
+delegate page.
+
 **Where to see it.** The flow summary — the counts per state, the oldest ticket of each state and
 the pass's health — is in the browser decision inbox page's **Flow** section
 (`https://<host>:8444/decisions`) and in the plugin's dispatch status RPC. The section's recovery

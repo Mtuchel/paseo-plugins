@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { AgentApi } from "./agent-app";
 import { Credentials } from "./credentials";
-import { AuthenticationError, CREATE_ISSUE_QUERY, ISSUE_ATTACHMENT_URLS_QUERY, ISSUE_COMMENT_HISTORY_QUERY, ISSUE_CORE_QUERY, ISSUE_GROUP_QUERY, ISSUE_GROUP_LABELS_QUERY, ISSUE_WATCH_STATE_QUERY, ISSUE_METADATA_QUERY, ISSUE_STATUS_QUERY, ISSUE_STATE_QUERY, ISSUE_STATUSES_QUERY, ISSUES_ATTACHMENT_URLS_QUERY, ISSUES_ATTACHMENTS_BATCH, ISSUES_METADATA_QUERY, ISSUES_WATCH_STATES_BATCH, ISSUES_WATCH_STATES_QUERY, LABELED_ISSUES_QUERY, LinearApiError, LinearService, MARKED_COMMENT_QUERY, MENTIONING_ISSUES_QUERY, OWNER_ASKS_QUERY, TEAM_STATES_QUERY, type App, type IssueCore, type Post } from "./linear";
+import { AuthenticationError, CREATE_ISSUE_QUERY, ISSUE_ATTACHMENT_URLS_QUERY, ISSUE_COMMENT_HISTORY_QUERY, ISSUE_CORE_QUERY, ISSUE_GROUP_QUERY, ISSUE_GROUP_LABELS_QUERY, ISSUE_WATCH_STATE_QUERY, ISSUE_METADATA_QUERY, ISSUE_STATUS_QUERY, ISSUE_STATE_QUERY, ISSUE_STATUSES_QUERY, ISSUES_ATTACHMENT_URLS_QUERY, ISSUES_ATTACHMENTS_BATCH, ISSUES_METADATA_QUERY, ISSUES_WATCH_STATES_BATCH, ISSUES_WATCH_STATES_QUERY, LABELED_ISSUES_QUERY, LinearApiError, LinearService, MARKED_COMMENT_QUERY, MENTIONING_ISSUES_QUERY, OWNER_ASKS_QUERY, STEWARD_ISSUES_QUERY, TEAM_STATES_QUERY, type App, type IssueCore, type Post } from "./linear";
 import { RateLimitedError } from "./rate-budget";
 
 const issue = { id: "i1", identifier: "TUC-1", state: { id: "s1", name: "Todo", type: "unstarted" }, team: { id: "t1" }, labels: { nodes: [] }, attachments: { nodes: [] }, inverseRelations: { nodes: [] } };
@@ -333,6 +333,34 @@ test("issuesMetadata reads up to 50 tickets of one team per request by number, p
   assert.equal(found.size, 60);
   assert.deepEqual(found.get("TUC-12"), await linear.issueMetadata("TUC-12"), "the same fields as the single read");
   assert.deepEqual(await linear.issuesMetadata([]), new Map(), "no identifiers, no request");
+});
+
+test("stewardIssues reads by id only the tracked tickets its label and delegate reads did not return", async () => {
+  const node = (id: string, type = "started") => ({ id, identifier: `TUC-${id}`, title: id, state: { name: type, type }, team: { id: "t1", key: "TUC" }, labels: { nodes: [] } });
+  const labeled = Array.from({ length: 60 }, (_, index) => `open-${index}`);
+  // Each read's filter, as Linear receives it (the request body is JSON).
+  const asked: { labels?: unknown; delegate?: unknown; id?: { in: string[] } }[] = [];
+  const { linear } = service({
+    query: (query, variables) => {
+      assert.equal(query, STEWARD_ISSUES_QUERY);
+      const filter: (typeof asked)[number] = JSON.parse(JSON.stringify(variables.filter));
+      asked.push(filter);
+      if (filter.labels) return Promise.resolve({ issues: { nodes: labeled.map((id) => node(id)), pageInfo: { hasNextPage: false } } });
+      if (filter.delegate) return Promise.resolve({ issues: { nodes: [node("delegated")], pageInfo: { hasNextPage: false } } });
+      const ids = filter.id?.in ?? [];
+      return Promise.resolve({ issues: { nodes: ids.filter((id) => id !== "deleted").map((id) => node(id, "completed")), pageInfo: { hasNextPage: false } } });
+    },
+  }, () => { throw new Error("the key must not be used"); });
+  const found = await linear.stewardIssues({ teamKeys: ["TUC"], labels: ["paseo"], appIds: ["app1"], ids: [...labeled, "delegated", "closed-1", "closed-2", "deleted"] });
+  assert.equal(asked.length, 3, "one label read, one delegate read, one id batch");
+  assert.deepEqual(asked[2], { id: { in: ["closed-1", "closed-2", "deleted"] } }, "only the tracked tickets no filter returned");
+  assert.equal(found.length, 63);
+  assert.equal(found.find((issue) => issue.id === "open-0")?.statusType, "started", "a ticket a filter returned keeps that read");
+  assert.equal(found.some((issue) => issue.id === "deleted"), false);
+
+  asked.length = 0;
+  assert.deepEqual((await linear.stewardIssues({ teamKeys: [], labels: [], appIds: [], ids: ["closed-1"] })).map((issue) => issue.id), ["closed-1"]);
+  assert.deepEqual(asked, [{ id: { in: ["closed-1"] } }], "a read of one ticket by id is one request");
 });
 
 // TUC-1684: the queue's batch decides admission on the same parsed fields as a single read.

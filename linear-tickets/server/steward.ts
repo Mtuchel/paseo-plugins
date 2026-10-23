@@ -65,6 +65,10 @@ export const REFUSAL_CAP = 3;
 export const CLAIM_GRACE_MS = RECOVERY_REACTION_MS;
 // A verifier that has not reported within this long is escalated.
 export const VERIFY_TIMEOUT_MS = RECOVERY_REACTION_MS;
+// A tracked ticket that is closed and settled (settledClosed) is re-read by id at most this often;
+// every other tracked ticket is read on every pass. A reopened ticket that carries a Paseo label or
+// delegate is read on the next pass anyway (the label and delegate reads find it).
+export const CLOSED_RECHECK_MS = 15 * 60_000;
 // A recorded wait whose ending event was lost is cleared after this long without a live agent
 // (writeback.ts WAIT_NO_AGENT_GRACE_MS, unchanged).
 const WAIT_NO_AGENT_GRACE_MS = 10 * 60_000;
@@ -416,6 +420,14 @@ export type StewardTicket = {
   recoveryObservation?: { key: string; at: string; advancedAt?: string };
   recoveryOutcomes?: Record<string, number>;
 };
+// A tracked ticket whose last pass found it closed with nothing of the steward's own still open on
+// it — no verifier, unfinished diagnostic, queued action, park, claim in flight or application. A
+// closed ticket's pass then only renews its timestamps: recovery stops at the terminal state and
+// the verdict step needs a verifier.
+export function settledClosed(ticket: StewardTicket | undefined): boolean {
+  return ticket?.situation === "closed" && !ticket.verifier && !(ticket.diagnostic && ticket.diagnostic.state !== "done")
+    && !ticket.queued && !ticket.parked && ticket.claim?.state !== "claimed" && !ticket.applying;
+}
 // The flow view: the counts of the last pass and the oldest tickets of each state.
 export type StewardFlow = {
   at: string;
@@ -868,6 +880,8 @@ export class Steward {
   private enabled = true;
   private running = false;
   private passStartedAt: string | null = null;
+  // When each settled closed ticket was last read by a full pass (CLOSED_RECHECK_MS).
+  private readonly closedReadAt = new Map<string, number>();
   private readonly host = hostname();
 
   constructor(private readonly deps: StewardDeps) {}
@@ -922,7 +936,7 @@ export class Steward {
     if (await this.deps.owner(issueId) !== "here") return "the parent is not owned by this host";
     const names = { ...dispatchLabels(settings.dispatch.label), trigger: settings.dispatch.label };
     const appIds = await this.deps.linear.trustedAppIds();
-    const issue = (await this.deps.linear.stewardIssues({ teamKeys: settings.dispatch.teamKeys, labels: Object.values(names), appIds, ids: [issueId] })).find((entry) => entry.id === issueId);
+    const issue = await this.freshIssue(issueId);
     if (!issue) return "the parent cannot be read";
     const fresh = await this.completeParentIssue(issue);
     if (CLOSED_TYPES.includes(fresh.statusType.trim().toLowerCase() as typeof CLOSED_TYPES[number])) return `the parent is ${fresh.status}`;
@@ -1056,7 +1070,21 @@ export class Steward {
     const recordOf = new Map(records.map((record) => [record.issueId, record]));
     const parentOf = new Map(parents.map((parent) => [parent.issueId, parent]));
     const inventory = new Set<string>([...Object.keys(file.tickets), ...records.map((record) => record.issueId), ...roots.keys(), ...needsYou.map((entry) => entry.parentId), ...parentOf.keys()]);
+    // A closed, settled ticket (settledClosed) with no root agent, no Needs-you sub-issue and no
+    // parent orchestration: its pass changes nothing but its timestamps, so it is re-read only every
+    // CLOSED_RECHECK_MS and the passes between leave its stored entry as it is. The queue-blocker
+    // pass acts on open failed tickets only, so it never reads one.
+    const watched = new Set<string>([...roots.keys(), ...needsYou.map((entry) => entry.parentId), ...parentOf.keys()]);
+    const deferred = [...inventory].filter((id) => !watched.has(id) && settledClosed(file.tickets[id])
+      && (options.queueBlockers === true || now - (this.closedReadAt.get(id) ?? -Infinity) < CLOSED_RECHECK_MS));
+    for (const id of deferred) inventory.delete(id);
     const all = await this.deps.linear.stewardIssues({ teamKeys: settings.dispatch.teamKeys, labels: labelNames, appIds, ids: [...inventory], queueBlockers: options.queueBlockers === true });
+    if (options.queueBlockers !== true) {
+      for (const id of inventory) {
+        if (settledClosed(file.tickets[id])) this.closedReadAt.set(id, now);
+        else this.closedReadAt.delete(id);
+      }
+    }
     // The owner-wait state is not a label. A ticket an agent's status call or the owner left there
     // (or whose wait record its dead agent took with it) carries no dispatch label, no record and no
     // root, so none of the reads above returns it -- and every consumer of the state needs a record
@@ -1086,7 +1114,7 @@ export class Steward {
     const responsibility = this.deps.responsibility;
     if (responsibility && !options.queueBlockers && responsibility.due(now) && this.alive()) {
       try {
-        await responsibility.run({ tickets: candidates.map((candidate) => candidate.check), enabled: settings.steward.enabled, fence: (issueId, identifier) => this.repairFence(settings, names, paseo, issueId, identifier), paseo });
+        await responsibility.run({ tickets: candidates.map((candidate) => candidate.check), enabled: settings.steward.enabled, fence: (issueId, identifier) => this.repairFence(names, paseo, issueId, identifier), paseo });
       } catch (error) {
         if (error instanceof RateLimitedError) throw error;
         console.error(`[linear-tickets] the responsibility check failed: ${message(error)}; it runs again in ten minutes`);
@@ -1114,7 +1142,7 @@ export class Steward {
     if (options.queueBlockers) return;
     // The flow view (the counts of this pass and the oldest tickets of each state) for the browser
     // inbox and the status RPC.
-    await this.flowView(candidates);
+    await this.flowView(candidates, deferred.length);
   }
 
   // Whether a ticket is inside the steward's scope: open, of a *configured* dispatch team, and
@@ -1419,9 +1447,7 @@ export class Steward {
     if (await this.deps.deletions?.blocked(issue.id)) return "Ticket deletion is pending";
     const current = (await this.deps.store.read()).tickets[issue.id];
     if (current?.responsibility?.generation !== generation || current.responsibility.host !== this.host) return "Responsible generation changed";
-    const appIds = await this.deps.linear.trustedAppIds();
-    const settings = await this.deps.settings.read();
-    const fresh = (await this.deps.linear.stewardIssues({ teamKeys: settings.dispatch.teamKeys, labels: Object.values(names), appIds, ids: [issue.id] })).find((entry) => entry.id === issue.id);
+    const fresh = await this.freshIssue(issue.id);
     if (!fresh) return "Current ticket evidence is unavailable";
     if (CLOSED_TYPES.includes(fresh.statusType.trim().toLowerCase() as typeof CLOSED_TYPES[number])) return "Ticket is terminal";
     const parent = await this.deps.sessions.parentProgress(issue.id);
@@ -2117,7 +2143,7 @@ export class Steward {
           // The evidence is re-read before the ticket is closed: a pull request opened (or recorded)
           // while the verifier ran, an owner hold, a fresh blocker or a live agent aborts the close,
           // and the next pass classifies the ticket anew.
-          const blocked = await this.completionFence(paseo, settings, names, candidate, now);
+          const blocked = await this.completionFence(paseo, names, candidate, now);
           if (blocked) {
             console.log(`[linear-tickets] ${issue.identifier}: the verifier's close verdict is not applied — ${blocked}`);
             await this.consume(issue, null);
@@ -2232,14 +2258,13 @@ export class Steward {
   // complete pull-request inventory of the ticket — every attached and recorded pull request, read
   // from GitHub now by pr-watch's `completionPulls` across all of its repositories, without the
   // retirement policy's veto exclusions and without trusting a recorded closed state.
-  private async completionFence(paseo: PaseoApi, settings: PluginSettings, names: DispatchLabels & { trigger: string }, candidate: Candidate, now: number): Promise<string | null> {
+  private async completionFence(paseo: PaseoApi, names: DispatchLabels & { trigger: string }, candidate: Candidate, now: number): Promise<string | null> {
     const { issue } = candidate;
     if (await this.deps.deletions?.blocked(issue.id).catch(() => true)) return "the ticket is paused for deletion";
     const ownership = await this.deps.owner(issue.id).catch(() => "unknown" as HostOwnership);
     if (ownership !== "here") return `another host owns the ticket (${ownership})`;
     const appIds = (await this.deps.linear.trustedAppIds().catch(() => [])).filter(Boolean);
-    const labelNames = [names.trigger, names.running, names.failed, names.blocked, names.needsYou, names.manual, names.hold, names.attended, names.queued];
-    let fresh = (await this.deps.linear.stewardIssues({ teamKeys: settings.dispatch.teamKeys, labels: labelNames, appIds, ids: [issue.id] })).find((entry) => entry.id === issue.id) ?? null;
+    let fresh = await this.freshIssue(issue.id);
     if (!fresh) return "the ticket cannot be read";
     if (candidate.facts.parentPhase !== null || fresh.children.length > 0 || candidate.ticket.verifier?.children?.length) {
       const complete = await this.completeParentIssue(fresh).catch(() => null);
@@ -2286,6 +2311,12 @@ export class Steward {
     return null;
   }
 
+  // One ticket's current facts for an effect's fence, read by its id alone. The label and delegate
+  // reads would return the same ticket in the same query, at the cost of every one of their pages.
+  private async freshIssue(issueId: string): Promise<StewardIssue | null> {
+    return (await this.deps.linear.stewardIssues({ teamKeys: [], labels: [], appIds: [], ids: [issueId] })).find((entry) => entry.id === issueId) ?? null;
+  }
+
   // Verification wins classification, not authority to ignore a newer owner gate. No failure
   // fallback here: unreadable evidence rejects the effect. inTurn ignores only the router's own
   // exclusive resume turn; threadQueued still checks actual live queued links.
@@ -2325,14 +2356,12 @@ export class Steward {
   // and nothing of the owner's or the steward's own stands in the way — a pause, an owner gate, a
   // blocker, a live agent, an owner wait or question, a steward action within the grace. Unreadable
   // evidence refuses; every answer is temporary.
-  private async repairFence(settings: PluginSettings, names: DispatchLabels & { trigger: string }, paseo: PaseoApi, issueId: string, identifier: string): Promise<string | null> {
+  private async repairFence(names: DispatchLabels & { trigger: string }, paseo: PaseoApi, issueId: string, identifier: string): Promise<string | null> {
     const now = this.clock();
     if (await this.deps.deletions?.blocked(issueId).catch(() => true)) return "the ticket is paused for deletion";
     const ownership = await this.deps.owner(issueId).catch(() => "unknown" as HostOwnership);
     if (ownership !== "here") return `another host owns the ticket (${ownership})`;
-    const appIds = (await this.deps.linear.trustedAppIds().catch(() => [])).filter(Boolean);
-    const labelNames = [names.trigger, names.running, names.failed, names.blocked, names.needsYou, names.manual, names.hold, names.attended, names.queued];
-    const fresh = (await this.deps.linear.stewardIssues({ teamKeys: settings.dispatch.teamKeys, labels: labelNames, appIds, ids: [issueId] })).find((entry) => entry.id === issueId) ?? null;
+    const fresh = await this.freshIssue(issueId);
     if (!fresh) return "the ticket cannot be read";
     const stage = planStage(fresh.status, fresh.statusType);
     if (stage !== PLANNING_STATE && stage !== PLAN_REVIEW_STATE) return `the ticket moved to ${fresh.status}`;
@@ -2599,11 +2628,13 @@ export class Steward {
   }
 
   // The flow view (README, "Ticket steward"): the counts of the last pass and the oldest tickets of
-  // each state, for the browser inbox and the status RPC.
-  private async flowView(candidates: Candidate[]): Promise<void> {
+  // each state, for the browser inbox and the status RPC. `deferredClosed`: the settled closed
+  // tickets this pass did not re-read (CLOSED_RECHECK_MS), still closed in the count.
+  private async flowView(candidates: Candidate[], deferredClosed: number): Promise<void> {
     const counts: Record<string, number> = {};
     for (const situation of STEWARD_SITUATIONS) counts[situation] = 0;
     for (const candidate of candidates) counts[candidate.situation] = (counts[candidate.situation] ?? 0) + 1;
+    counts.closed += deferredClosed;
     const oldest = candidates
       .filter((candidate) => STEWARD_STATES[candidate.situation])
       .sort((a, b) => a.ticket.since.localeCompare(b.ticket.since))

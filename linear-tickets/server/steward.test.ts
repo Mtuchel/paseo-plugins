@@ -682,6 +682,33 @@ test("a Needs input state no wait backs is cleared, and read by state so no labe
   assert.deepEqual(f.calls.escalates, [], "and it is not an owner ask");
 });
 
+test("a settled closed ticket is read again every fifteen minutes, not every pass, and still counts as closed", async (t) => {
+  const closed = ticketIssue({ status: "Done", statusType: "completed", delegateId: null, labels: [] });
+  const watched = ticketIssue({ id: "i2", identifier: "ENG-2", status: "Done", statusType: "completed", delegateId: null, labels: [] });
+  const issues = [closed, watched];
+  // i2 still has a (finished) root agent, so it is read on every pass.
+  const f = await passFixture(t, { issues, roots: new Map([["i2", { roots: [{ id: "a2", status: "closed", updatedAt: at(120), createdAt: at(600) }], ghosts: new Set<string>() }]]) });
+  await f.seed("i1", "ENG-1", { situation: "closed" });
+  await f.seed("i2", "ENG-2", { situation: "closed" });
+  const steward = f.build();
+  const start = f.clock.now;
+  const tickAt = async (minutes: number) => { f.clock.now = start + minutes * 60_000; await steward.tick(f.paseo, stewardSettings()); };
+  const askedIds = () => [...(f.calls.issueReads.filter((input) => !input.states?.length).at(-1)?.ids ?? [])].sort();
+
+  await tickAt(0);
+  assert.deepEqual(askedIds(), ["i1", "i2"], "the first pass reads every tracked ticket");
+  const readAt = (await f.ticket("i1"))?.at;
+  // Linear's label and delegate reads never return a closed ticket; only its id read does.
+  issues.splice(0, 1);
+  await tickAt(2);
+  assert.deepEqual(askedIds(), ["i2"], "the settled closed ticket is not read again within fifteen minutes");
+  assert.equal((await f.ticket("i1"))?.at, readAt, "its stored entry is left as it was");
+  assert.equal((await f.store.read()).flow?.counts.closed, 2, "the flow view still counts it closed");
+  issues.unshift(closed);
+  await tickAt(15);
+  assert.deepEqual(askedIds(), ["i1", "i2"], "fifteen minutes on it is read again");
+});
+
 test("a Needs-you sub-issue in Needs input is an open question, not an unrecorded state", async (t) => {
   const f = await passFixture(t, {
     issues: [],
