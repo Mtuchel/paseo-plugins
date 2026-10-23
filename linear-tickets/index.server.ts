@@ -183,6 +183,7 @@ export default function contribute(server: PluginServerContext) {
   let planRequests: PlanRequests | null = null;
   const starter = new TicketStarter({ linear, launcher, handover, presence, tiers, acceptanceTests, routes: smallRoutes, deletions, shards, focus, parked: waitingPlans, doneTickets,
     requests: (issueId, identifier, since, hash) => planRequests!.requests(issueId, identifier, since, hash),
+    related: relatedWork,
     repairs: { exclusion, parked: { get: (issueId) => parking.plans.get(issueId) } } });
   // The decision journal (README, "Decision journal"): every owner decision on a plan is written
   // here first and carried out by the bridge's worker; the inbox lists what is being applied.
@@ -536,6 +537,8 @@ export default function contribute(server: PluginServerContext) {
   const planRelations = new PlanRelations(linear, (issueId, identifier, since, hash) => planRequests!.requests(issueId, identifier, since, hash), () => hostName);
   plannotator.useRelations(planRelations);
   plannotator.usePlanRequests(planRequests);
+  // The risk policy's overlap check (README, "Plan risk and auto-approval").
+  plannotator.useRelated(relatedWork);
   let commentWake: NodeJS.Timeout | null = null;
   const wakeComments = () => {
     if (commentWake) return;
@@ -866,7 +869,7 @@ export default function contribute(server: PluginServerContext) {
     // instead of forwarding a launch whose workspace the owner picked on this host.
     if (current.activation.mode === "remote") throw new Error(`This host forwards new Linear work to ${current.activation.peer ?? "the peer host"}; the agent starts there. Assign Paseo or add the trigger label on the ticket.`);
     const { template, agentLinearAccess } = current;
-    const setup = await planSetup(linear, input.id, input.provider, input.modeId, { tiers, routes: smallRoutes, settings: current });
+    const setup = await planSetup(linear, input.id, input.provider, input.modeId, { tiers, routes: smallRoutes, settings: current, related: relatedWork });
     const model = tierModel(current, input.provider.split("/")[0], setup.tier?.tier ?? null, { provider: input.provider, ...(input.thinkingOptionId ? { thinkingOptionId: input.thinkingOptionId } : {}) });
     const launch = { ...input, ...model, modeId: setup.modeId, instructions: [...setup.notes, QUESTIONS_NOTE, input.instructions.trim()].filter(Boolean).join("\n\n") };
     const markInProgress = input.markInProgress && setup.policy !== "required";

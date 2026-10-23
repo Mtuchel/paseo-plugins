@@ -924,6 +924,22 @@ one it named. The ticket's `plan` label is removed once the approval's round has
 and kept (or put back) when one arrives. A planner run gets its own work-order instructions (see
 **Projects** below).
 
+**Implementing an approved plan.** A launch that implements an approved plan (`plan-ready`, no newer
+replan request) first hears what moved since that plan was approved, so it does not code against
+work that already changed ([`server/related-work.ts`](server/related-work.ts) `changedSince`,
+[`server/starter.ts`](server/starter.ts) `sinceApprovalNote`). The cutoff is the plan's own approval
+instant, its earliest bound when the header is coarser. The note lists, newest first: every pull
+request of the team's open and done tickets merged since the cutoff whose files overlap the plan's
+(marked `merged <instant>`, with the overlapping paths), and every other ticket's approved plan
+whose footprint overlaps the plan's (`approved <instant>`, plus `done <instant>` for a finished
+ticket, with the files, `## Reach` places or tickets both name). It states the precedence rule
+above and what to do: where later implemented work contradicts the plan, adapt the details that
+leave the plan's acceptance criteria intact and say so in the final comment; otherwise stop before
+coding and ask you in a question request whether to re-plan, naming the ticket that wins. The pull
+request reads go through the same cache and limit as the candidate list. When the plan document or
+the check cannot be read, the note says the check could not run and asks the agent to compare with
+recent approvals and merged pull requests itself.
+
 **Reach and principles.** A decision made in one ticket should apply everywhere it belongs and not
 come back in the next one, so every plan carries two more sections before `## Risk and impact`, in
 a fixed format ([`shared/plan-sections.ts`](shared/plan-sections.ts)):
@@ -1240,6 +1256,21 @@ takes the higher of both ratings. For omp planners, `record_plan_advice` refuses
 readable section (or with `agreed`/`disagreements` but no advisor rating, or a `New rule` that
 disagrees with `## Principles and rules`) and tells the plugin which verdict was recorded for which
 plan text.
+
+The approval instant is recorded exactly: the `Plan: <ticket>` document's
+`> **Approved** in Plannotator on <date> UTC` header is written from the decision's timestamp with
+milliseconds (`2026-10-15 10:41:10.900 UTC`). Older headers without them cover the second, minute
+or day they name ([`server/review-outcome.ts`](server/review-outcome.ts) `approvalInterval`); a
+coarser header is never rounded down, so a plan approved somewhere in 10:41 is approved at the
+start of that minute for its own cutoff and at its end when it is somebody else's newer work.
+
+Nothing that overlaps the plan is approved on your behalf. Before approving, the policy reads the
+approved plans of other tickets approved since this plan's planning round began — the newest
+replan request delivered to the agent, or the agent's start — and turns each one that
+shares files, `## Reach` places or related tickets with this plan, or that names this ticket or is
+named by it, into a reason: `TUC-12's plan names the same files: server/x.ts`, also for shared
+places (`reaches the same places: …`) and tickets (`names the same tickets: …`). A read that fails
+gives `the related-work check failed` instead: the plan waits for you either way.
 
 It also refuses a ticket plan that does not follow the owner's plan layout
 ([`shared/plan-layout.ts`](shared/plan-layout.ts)). The layout is read at every record from

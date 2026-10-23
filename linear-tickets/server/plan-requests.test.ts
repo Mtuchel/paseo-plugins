@@ -307,6 +307,33 @@ test("AC-13: planSetup plans again for an unhandled request, and a `plan` label 
   assert.match(owner.notes.join("\n"), /the owner added the `plan` label/);
 });
 
+test("AC-13 (regression): a plan approved at 10:00:50.000 is newer than a request written at 10:00:10.000, so the next launch implements", async () => {
+  const labels = [{ id: "label-plan-ready", name: "plan-ready" }];
+  const request: PlanRequest = { id: "comment:c-1", at: "2026-10-03T10:00:10.000Z", kind: "comment", authorId: "app-1", body: "Change it.", commentId: "c-1" };
+  const plan = `> **Approved** in Plannotator on 2026-10-03 10:00:50.000 UTC for TUC-7.\n\n---\n\n${PLAN}\n## Model\n\n- Tier: cheap — one column\n- Strong steps: none — routine\n`;
+  const seen: (string | null)[] = [];
+  // The request fake filters on the cutoff as `PlanRequests.requests` does; the cutoff itself is
+  // the launch's question.
+  const setup = (content: string) => planSetup({
+    issueCore: async () => ({ id: "issue-1", identifier: "TUC-7", creatorId: "owner-1", status: "Todo", statusType: "unstarted", labels }) as never,
+    viewerId: async () => "owner-1",
+    trustedAppIds: async () => ["app-1"],
+    issueDocument: async () => ({ content, url: "https://linear.app/doc/plan" }),
+  } as never, "issue-1", "omp", undefined, { requests: async (_issueId: string, _identifier: string, since: string | null) => { seen.push(since); return since && request.at > since ? [request] : []; } });
+
+  const exact = await setup(plan);
+  assert.deepEqual(seen, ["2026-10-03T10:00:50.000Z"], "the cutoff is the exact approval instant, not the start of its minute");
+  assert.equal(exact.policy, null, "the request is older than the approval: the launch implements");
+  assert.doesNotMatch(exact.notes.join("\n"), /Change it\./);
+
+  // A legacy minute-only header is approved somewhere in its minute, so its earliest bound is the
+  // cutoff and the request at :10 may be newer.
+  seen.length = 0;
+  const legacy = await setup(plan.replace("2026-10-03 10:00:50.000", "2026-10-03 10:00"));
+  assert.deepEqual(seen, ["2026-10-03T10:00:00.000Z"]);
+  assert.equal(legacy.policy, "required");
+});
+
 test("AC-13: an owner's label add counts after an app removed the label before the poll", async () => {
   await harness(async ({ requests, events, prompts }) => {
     events.push(

@@ -15,6 +15,8 @@ import { Handover, PARKED_PLAN_LINE, type HandoverRecord } from "./handover";
 import { Writeback } from "./writeback";
 import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
 import { planHash } from "./review-outcome";
+import type { PlanDocument } from "./linear";
+import { RelatedWork } from "./related-work";
 import { PlanRelations } from "./plan-relations";
 import { DecisionLog, type LogEntry } from "./owner-decisions";
 import { ReviewDeletions } from "./review-deletions";
@@ -72,11 +74,14 @@ test("events are validated; unknown shapes are rejected", () => {
     { type: "decided", agentId: "a", approved: false, feedback: "tighten scope", at: "2026-01-01T10:00:00Z" });
 });
 
-test("the plan document states the decision and feedback above the plan", () => {
+test("the plan document states the decision and feedback above the plan, at the exact approval instant", () => {
   const document = planDocument({ type: "decided", agentId: "a", approved: false, feedback: "Split step 3", planContent: "# Plan\n\n- step", at: "2026-01-01T10:00:00Z" }, "TUC-25");
-  assert.match(document, /^> \*\*Sent back with feedback\*\* in Plannotator on 2026-01-01 10:00 UTC for TUC-25/);
+  assert.match(document, /^> \*\*Sent back with feedback\*\* in Plannotator on 2026-01-01 10:00:00\.000 UTC for TUC-25/);
   assert.match(document, /## Review feedback\n\nSplit step 3/);
   assert.ok(document.endsWith("# Plan\n\n- step"));
+  // Milliseconds are kept: comparison cutoffs (review-outcome.ts `approvalInterval`) need them.
+  const exact = planDocument({ type: "decided", agentId: "a", approved: true, planContent: "# Plan", at: "2026-01-01T10:00:10.123Z" }, "TUC-25");
+  assert.match(exact, /^> \*\*Approved\*\* in Plannotator on 2026-01-01 10:00:10\.123 UTC for TUC-25/);
 });
 
 const settings: PluginSettings = {
@@ -86,7 +91,7 @@ const settings: PluginSettings = {
 
 // `ticket`: who wrote the ticket and its labels, for the risk policy's checks. `documents`: the
 // ticket's documents by title (the approved plan).
-function setup(labels: Record<string, string>, ticket: { creatorId: string; labels: string[] } = { creatorId: "owner", labels: [] }) {
+function setup(labels: Record<string, string>, ticket: { creatorId: string; labels: string[] } = { creatorId: "owner", labels: [] }, createdAt?: string) {
   const calls: string[] = [];
   const documents: Record<string, string> = {};
   const comments = new Set<string>();
@@ -132,7 +137,7 @@ function setup(labels: Record<string, string>, ticket: { creatorId: string; labe
     agents: {
       // The snapshot of the agent: Handover.remember takes its id, title and cwd from it.
       ref: (id: string) => ({
-        refresh: async () => ({ agent: { id, title: labels["linear.identifier"] ?? null, cwd: "/repo", labels } }),
+        refresh: async () => ({ agent: { id, title: labels["linear.identifier"] ?? null, cwd: "/repo", ...(createdAt ? { createdAt } : {}), labels } }),
         timeline: { append: async (item: { data: { title: string; url?: string } }) => { calls.push(`row ${id}: ${item.data.title}${item.data.url ? ` ${item.data.url}` : ""}`); } },
       }),
       // The ticket's agents, as writeback.ts lists them (Writeback.archived).
@@ -383,6 +388,89 @@ test("a plan that sets a new rule goes to the owner although everything else wou
   assert.deepEqual(rule.decisions, []);
   assert.match(rule.comment, /Needs your approval: it sets a new rule\.$/);
   assert.equal((await review({ advisedPlan: RISKY(0) })).decisions.length, 1, "the same plan without the rule is approved");
+});
+
+// The approved plans other tickets carry, as `planDocumentsSince` returns them. `approved` is the
+// header's own text, so a test can state the precision the approval was written with.
+function approvedPlanRow(identifier: string, approved: string, body = "Change `server/x.ts`."): PlanDocument {
+  return {
+    id: `doc-${identifier}`, title: `Plan: ${identifier}`, url: `https://linear.app/doc/${identifier}`, updatedAt: "2026-10-15T10:41:11.000Z",
+    content: `> **Approved** in Plannotator on ${approved} UTC for ${identifier}.\n\n---\n\n# Plan\n\n${body}\n`,
+    issue: { id: `issue-${identifier}`, identifier, url: `https://linear.app/issue/${identifier}`, project: "" },
+  };
+}
+
+// A real RelatedWork over a fake Linear: only the plan documents of other tickets matter here.
+function relatedPlans(plans: PlanDocument[], fail = false) {
+  return new RelatedWork({
+    linear: {
+      planDocumentsSince: async () => { if (fail) throw new Error("Linear unavailable"); return plans; },
+      teamCandidates: async () => ({ items: [], complete: true }),
+      doneSince: async () => ({ items: [], complete: true }),
+      documentContents: async () => new Map(),
+    } as never,
+    pullRequests: { refresh: async () => undefined, filesOf: () => null, stateOf: () => null },
+  });
+}
+
+// Hands `plan` off after an agreed advisor review, by a planner that started at 10:41:10.500. The
+// risk policy's overlap check reads the approved plans of other tickets through a real RelatedWork.
+async function reviewWithRelated(plan: string, plans: PlanDocument[], options: { fail?: boolean } = {}) {
+  const { calls, linear, paseo } = setup({ "linear.issueId": "issue-1", "linear.identifier": "TUC-25" }, undefined, "2026-10-15T10:41:10.500Z");
+  const decisions: string[] = [];
+  await withEvents([
+    { type: "advised", agentId: "agent-1", verdict: "agreed", hash: planHash(plan), at: "2026-10-15T10:45:00Z" },
+    { type: "opened", agentId: "agent-1", localUrl: "http://localhost:4000/", remoteUrl: "https://host.ts.net:4000/", at: "2026-10-15T10:50:00Z" },
+  ], async (directory) => {
+    const bridge = new PlannotatorBridge(linear, { read: async () => settings }, directory, undefined, async () => plan, undefined, undefined, undefined, async (url, approve) => { decisions.push(`${url} ${approve}`); }, () => {});
+    bridge.attach(paseo);
+    bridge.useRelated(relatedPlans(plans, options.fail));
+    await bridge.drain();
+    bridge.stop();
+  });
+  return { decisions, comment: calls.find((call) => call.startsWith("comment issue-1")) ?? "" };
+}
+
+test("AC-3: an approval counts from the planning round's start at its header's precision, and never from this ticket", async () => {
+  const plan = `${RISKY(1)}\n\nChange \`server/x.ts\`.\n`;
+  const rows = [
+    approvedPlanRow("TUC-2", "2026-10-15 10:41:10.900"), // after the start
+    approvedPlanRow("TUC-3", "2026-10-15 10:41:10"), // the start's own second: its latest bound reaches it
+    approvedPlanRow("TUC-4", "2026-10-15 10:41"), // a legacy minute header: its minute reaches it
+    approvedPlanRow("TUC-5", "2026-10-15 10:41:10.400"), // before the start
+    approvedPlanRow("TUC-6", "2026-10-15 10:40:59.999"), // a minute earlier
+    approvedPlanRow("TUC-23", "2026-10-15 10:41:10.500"), // exactly at the start: its latest bound is the start
+    approvedPlanRow("TUC-24", "2026-10-15 10:41:10.499"), // a millisecond before the start
+    approvedPlanRow("TUC-25", "2026-10-15 10:41:10.900"), // the plan's own ticket
+    // A plan sent back is no approval, however recently it was saved.
+    { ...approvedPlanRow("TUC-26", "2026-10-15 10:41:20"), content: "> **Sent back with feedback** in Plannotator on 2026-10-15 10:41:20 UTC for TUC-26.\n\n---\n\n# Plan\n\nChange `server/x.ts`.\n" },
+  ];
+  const { decisions, comment } = await reviewWithRelated(plan, rows);
+  assert.deepEqual(decisions, [], "an overlap needs the owner");
+  assert.match(comment, /Needs your approval: /);
+  for (const counted of ["TUC-2", "TUC-3", "TUC-4", "TUC-23"]) assert.match(comment, new RegExp(`${counted}'s plan names the same files: server/x\\.ts`), counted);
+  for (const other of ["TUC-5", "TUC-6", "TUC-24", "TUC-25", "TUC-26"]) assert.doesNotMatch(comment, new RegExp(`${other}'s plan`), other);
+
+  const clean = await reviewWithRelated(plan, []);
+  assert.equal(clean.decisions.length, 1, "nothing overlaps: the policy still approves within its threshold");
+});
+
+test("AC-3: a shared place, a shared ticket and naming this ticket each need the owner, and a failed check approves nothing", async () => {
+  const block = "```related-work\nTUC-9 relates to TUC-25\nTUC-25 relates to TUC-22\n```\n";
+  const plan = `${RISKY(1)}\n\nChange \`server/x.ts\`.\n\n## Reach\n\n- Settings page: include — AC-7\n\n## Related work\n\n${block}\nTUC-9 covers the export.\n`;
+  const place = approvedPlanRow("TUC-20", "2026-10-15 10:41:20", "# Plan\n\nChange `server/y.ts`.\n\n## Reach\n\n- settings page: include — AC-2\n\n## Related work\n\nTUC-25 touches the same page.\n");
+  const ticket = approvedPlanRow("TUC-21", "2026-10-15 10:41:20", "# Plan\n\n## Related work\n\n- TUC-9 covers the sender side.\n");
+  // TUC-22's plan shares nothing; this plan names TUC-22, which is a relation worth the owner too.
+  const named = approvedPlanRow("TUC-22", "2026-10-15 10:41:20", "# Plan\n\nChange `server/other.ts`.\n");
+  const { decisions, comment } = await reviewWithRelated(plan, [place, ticket, named]);
+  assert.deepEqual(decisions, []);
+  assert.match(comment, /TUC-20's plan reaches the same places: Settings page; names this ticket or is named by it/);
+  assert.match(comment, /TUC-21's plan names the same tickets: TUC-9/);
+  assert.match(comment, /TUC-22's plan names this ticket or is named by it/);
+
+  const failed = await reviewWithRelated(plan, [], { fail: true });
+  assert.deepEqual(failed.decisions, [], "a check that cannot run approves nothing");
+  assert.match(failed.comment, /Needs your approval: the related-work check failed\./);
 });
 
 // A plugin reload (a rollout, a daemon restart) between the planner's record and its hand-off used

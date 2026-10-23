@@ -7,7 +7,7 @@ import type { PaseoApi, PaseoWorkspaceAgentCreateOptions } from "@getpaseo/clien
 import { normalizeIssue } from "./context";
 import { PullRequestFiles, type PullRequestRead } from "./label-sync";
 import { Launcher } from "./launch";
-import type { CandidateIssue, DoneIssue, Pages } from "./linear";
+import type { CandidateIssue, DoneIssue, Pages, PlanDocument } from "./linear";
 import { CANDIDATE_PULL_REQUEST_READS, CANDIDATE_TTL_MS, PRECEDENCE_RULE, RelatedWork } from "./related-work";
 import { DEFAULT_WORKTREE_SHARDS, DEFAULT_ACTIVATION, DEFAULT_BACKSTOP, DEFAULT_DISPATCH, DEFAULT_WRITEBACK, DEFAULT_WATCHDOG, DEFAULT_STEWARD, DEFAULT_DEPUTY, type PluginSettings } from "./settings";
 import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
@@ -20,9 +20,9 @@ function candidate(n: number, over: Partial<CandidateIssue> = {}): CandidateIssu
 }
 
 // A Linear fake counting the candidate list's reads; `fail` makes the next read of that kind throw.
-function fakeLinear(open: CandidateIssue[], documents: Record<string, { content: string; updatedAt: string }> = {}, done: DoneIssue[] = []) {
-  const calls = { teamCandidates: [] as string[], doneSince: [] as string[], documentContents: [] as string[][] };
-  const fail: { teamCandidates?: boolean; doneSince?: boolean; documentContents?: boolean } = {};
+function fakeLinear(open: CandidateIssue[], documents: Record<string, { content: string; updatedAt: string }> = {}, done: DoneIssue[] = [], plans: PlanDocument[] = []) {
+  const calls = { teamCandidates: [] as string[], doneSince: [] as string[], documentContents: [] as string[][], planDocumentsSince: [] as string[] };
+  const fail: { teamCandidates?: boolean; doneSince?: boolean; documentContents?: boolean; planDocumentsSince?: boolean } = {};
   const linear = {
     teamCandidates: async (teamId: string): Promise<Pages<CandidateIssue>> => {
       calls.teamCandidates.push(teamId);
@@ -38,6 +38,11 @@ function fakeLinear(open: CandidateIssue[], documents: Record<string, { content:
       calls.documentContents.push(ids);
       if (fail.documentContents) throw new Error("HTTP 503");
       return new Map(ids.filter((id) => documents[id]).map((id) => [id, documents[id]]));
+    },
+    planDocumentsSince: async (since: string): Promise<PlanDocument[]> => {
+      calls.planDocumentsSince.push(since);
+      if (fail.planDocumentsSince) { fail.planDocumentsSince = false; throw new Error("Linear unavailable"); }
+      return plans.filter((plan) => plan.updatedAt >= since);
     },
   };
   return { linear, calls, fail };
@@ -70,7 +75,7 @@ test("AC-1: the candidate list gives the team's open tickets, approved plans wit
     d2: { updatedAt: "2026-10-13T10:00:00Z", content: "> **Sent back with feedback** in Plannotator on 2026-10-13 10:00 UTC for TUC-2.\n\n# Plan\n\n## Reach\n\nNowhere else.\n" },
     d3: { updatedAt: "2026-10-02T00:00:00Z", content: "> **Approved** in Plannotator on 2026-10-01 for TUC-3.\n\n# Plan\n\nNothing else.\n" },
   };
-  const { linear, calls } = fakeLinear(open, documents, [{ id: "i90", identifier: "TUC-90", title: "Shipped export", completedAt: "2026-10-01T08:00:00Z", pullRequests: [] }]);
+  const { linear, calls } = fakeLinear(open, documents, [{ id: "i90", identifier: "TUC-90", title: "Shipped export", completedAt: "2026-10-01T08:00:00Z", pullRequests: [], planDocuments: [] }]);
   const { files } = await pullRequests(t, {
     [pr(1)]: { state: "OPEN", files: ["o/r/server/y.ts"], mergedAt: null },
     [pr(2)]: { state: "MERGED", files: ["o/r/server/z.ts"], mergedAt: "2026-10-10T08:00:00Z" },

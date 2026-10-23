@@ -782,7 +782,10 @@ export type CandidateIssue = {
   id: string; identifier: string; title: string; description: string; updatedAt: string; status: string; statusType: string;
   labels: string[]; pullRequests: string[]; planDocuments: { id: string; title: string; updatedAt: string }[];
 };
-export type DoneIssue = { id: string; identifier: string; title: string; completedAt: string; pullRequests: string[] };
+export type PlanText = { id: string; title: string; url: string; updatedAt: string; content: string };
+// `planDocuments`: the ticket's documents read with it, so the since-approval check need not ask
+// for them one by one (related-work.ts `changedSince`).
+export type DoneIssue = { id: string; identifier: string; title: string; completedAt: string; pullRequests: string[]; planDocuments: PlanText[] };
 // `complete`: false when Linear had more pages than the plugin reads (see WINDOW_PAGES).
 export type Pages<T> = { items: T[]; complete: boolean };
 // `parentId`: the ticket's parent when it is open and in the same project (the parent's group hands it out).
@@ -1161,7 +1164,7 @@ export const TEAM_CANDIDATES_QUERY = `query teamCandidates($team: ID!, $after: S
 }`;
 export const DONE_SINCE_QUERY = `query doneSince($team: ID!, $since: DateTimeOrDuration!, $after: String) {
   issues(first: 100, after: $after, orderBy: updatedAt, filter: { team: { id: { eq: $team } }, completedAt: { gte: $since } }) {
-    nodes { id identifier title completedAt attachments(first: 25) { nodes { url } } }
+    nodes { id identifier title completedAt attachments(first: 25) { nodes { url } } documents(first: 10) { nodes { id title url updatedAt content } } }
     pageInfo { hasNextPage endCursor }
   }
 }`;
@@ -1891,6 +1894,10 @@ export class LinearService {
       items: pages.items.map((node) => ({
         id: label(node.id), identifier: label(node.identifier), title: label(node.title), completedAt: label(node.completedAt),
         pullRequests: pullRequestUrls(node.attachments),
+        planDocuments: connection(record(node.documents ?? {})).nodes.map((document) => record(document)).map((document) => ({
+          id: label(document.id), title: label(document.title), url: label(document.url), updatedAt: label(document.updatedAt),
+          content: typeof document.content === "string" ? document.content : "",
+        })).filter((document) => document.id),
       })).filter((issue) => issue.id),
     };
   }

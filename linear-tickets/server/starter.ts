@@ -5,6 +5,7 @@ import type { TicketDetail } from "../shared/contracts";
 import { AUTONOMY_NOTE } from "../shared/autonomy-policy";
 import { mappedBaseBranch, mappingLabel, savedMapping, type ProjectMapping } from "../shared/mapping";
 import { modelSteps, planTier, type Tier } from "../shared/plan-model";
+import { overlapText } from "../shared/plan-risk";
 import type { AcceptanceTestsStore } from "./acceptance-tests";
 import { Capacity } from "./capacity";
 import { execFile } from "./child-processes";
@@ -18,8 +19,8 @@ import { findProject, readBranches } from "./projects";
 import { advisorNote, hasLabel, PLAN_POLICY_ENV, PLAN_POLICY_LABEL, PLAN_READY_LABEL, PLAN_REQUIRED_NOTE, PLAN_SECTIONS_NOTE, PLAN_SLICING_NOTE, planPolicy, SAFE_MODES, type PlanPolicy } from "./plan-policy";
 import { needsOwner, type Presence } from "./presence";
 import { ghostAgents, LIVE_AGENT, type ProcessInspector } from "./process-liveness";
-import { PRECEDENCE_RULE } from "./related-work";
-import { documentApprovedAt, documentPlanHash } from "./review-outcome";
+import { PRECEDENCE_RULE, type ChangedSinceEntry, type RelatedWork } from "./related-work";
+import { approvalInterval, documentPlanHash, documentPlanText } from "./review-outcome";
 import type { PlanRequest } from "./plan-requests";
 import { nightInput, Scheduler, type Admission } from "./scheduler";
 import type { PluginSettings } from "./settings";
@@ -49,6 +50,9 @@ type Deps = {
   // A ticket's unhandled replan requests (server/plan-requests.ts), read when its approved plan
   // would be implemented: one newer than the plan sends it back to planning.
   requests?: (issueId: string, identifier: string, since: string | null, planHash: string | null) => Promise<PlanRequest[]>;
+  // What changed since an approved plan was approved (server/related-work.ts `changedSince`): an
+  // implementing launch lists it, so the agent adapts or asks before coding against moved work.
+  related?: Pick<RelatedWork, "changedSince">;
   deletions?: Pick<ReviewDeletions, "blocked">;
   // Which of a repository's clones a ticket's work belongs to (README, "Worktree shards").
   shards?: ShardAssignor;
@@ -139,6 +143,20 @@ export function sentBackPlanNote(identifier: string, plan: { url: string; conten
   ].join("\n\n");
 }
 
+// A plan implemented now may be older than work merged or approved since (README, "Related work"):
+// the note lists what changed, newest first, the precedence rule, and what to do when later work
+// contradicts the plan. `entries: null` is a check that could not run: the agent compares itself.
+export function sinceApprovalNote(identifier: string, entries: ChangedSinceEntry[] | null): string {
+  const step = "Where later implemented work contradicts the plan, adapt the details that leave the plan's acceptance criteria intact and say so in your final comment; otherwise stop before coding and ask the owner in a question request whether to re-plan, naming the ticket that wins.";
+  const lines = (entries ?? []).map((entry) => entry.kind === "merged"
+    ? `- ${entry.identifier}${entry.status ? ` (${entry.status})` : ""} ${entry.url}, merged ${entry.mergedAt}: ${entry.files.map((file) => `\`${file}\``).join(", ")}`
+    : `- ${entry.identifier}${entry.status ? ` (${entry.status})` : ""} approved ${new Date(entry.approvedAt).toISOString().slice(0, 23).replace("T", " ")} UTC${entry.completedAt ? `, done ${entry.completedAt}` : ""}: ${overlapText(entry.overlap)}`);
+  const what = entries === null
+    ? `The check for work that changed since ${identifier}'s plan was approved could not run. Compare the plan with recent approvals and merged pull requests yourself before implementing.`
+    : `Work that changed since ${identifier}'s plan was approved, newest first:${lines.length ? `\n${lines.join("\n")}` : " none."}`;
+  return [what, `What to do: ${PRECEDENCE_RULE} ${step}`].join("\n\n");
+}
+
 // Tickets the owner wrote, or a Paseo app wrote in a flow the owner started (split sub-issues,
 // needs-you sub-issues, manual tasks, follow-ups, tickets agents file), are trusted unless they
 // carry the feedback label. `appIds` are this host's app user and the peer host's (README, "Several
@@ -169,6 +187,8 @@ export async function planSetup(
     // The requests newer than a time on a ticket (server/plan-requests.ts): an unhandled one newer
     // than the approved plan sends the ticket back to planning instead of implementing it.
     requests?: (issueId: string, identifier: string, since: string | null, planHash: string | null) => Promise<PlanRequest[]>;
+    // The since-approval check an implementing launch gets (README, "Related work").
+    related?: Pick<RelatedWork, "changedSince">;
   } = {},
 ): Promise<PlanSetup> {
   const { tiers, routes, settings } = context;
@@ -180,8 +200,11 @@ export async function planSetup(
   const approvedPlan = planPolicy(state.labels) === null;
   // A request asks for that plan to be revised (README, "Related work"): plan again, holding the
   // plan and the requests. A replan comment counts only when it was written for this exact plan.
+  // The cutoff is the plan's earliest approval bound, never a minute rounded down: a request at
+  // 10:00:10 is older than a plan approved at 10:00:50, and newer than one approved at 10:00:05.
+  const approvedAt = plan ? approvalInterval(plan.content)?.at(0) : undefined;
   const replan = approvedPlan && plan && context.requests
-    ? await context.requests(issueId, state.identifier, documentApprovedAt(plan.content) === null ? null : new Date(documentApprovedAt(plan.content)!).toISOString(), documentPlanHash(plan.content)).catch(() => [])
+    ? await context.requests(issueId, state.identifier, approvedAt === undefined ? null : new Date(approvedAt).toISOString(), documentPlanHash(plan.content)).catch(() => [])
     : [];
   const approved = approvedPlan && replan.length === 0;
   // The `plan` label wins over `no-plan`, `plan-ready` over both; a `no-plan` without the route's
@@ -198,6 +221,13 @@ export async function planSetup(
   const tier = tierMissing ? null : decided;
   // Offered to omp planners only: the tool that checks the conditions is the omp extension's.
   const offer = policy && !tierMissing && providerKey === "omp" && settings && !eligibilityProblems(state, untrusted, 0, settings).length;
+  // The plan is implemented now: list what changed since its approval (README, "Related work"), so
+  // the agent adapts or asks instead of implementing against work that moved. A failed read leaves
+  // null: the note says the check could not run and the agent compares itself. Without a plan
+  // document there is no approval to compare against.
+  const sinceApproval = !policy && plan && context.related
+    ? await context.related.changedSince({ issueId, identifier: state.identifier, teamId: state.teamId ?? "", plan: documentPlanText(plan.content), approved: plan.content }).then((entries) => entries, () => null)
+    : undefined;
   return {
     identifier: state.identifier,
     untrusted,
@@ -215,6 +245,7 @@ export async function planSetup(
       policy ? MODEL_NOTE : "",
       policy ? advisorNote(providerKey) : approvedPlanNote(state.identifier, plan),
       policy && !tierMissing ? sentBackPlanNote(state.identifier, plan) : "",
+      sinceApproval !== undefined ? sinceApprovalNote(state.identifier, sinceApproval) : "",
       tier ? tierNote(tier, tier === planned?.tier ? planned : null) : "",
       MISSED_REACH_NOTE,
     ].filter(Boolean),
@@ -473,7 +504,7 @@ export class TicketStarter {
       // read-only brief as its whole instructions, no plan policy. `SAFE_MODES` is the same mapping
       // the planner runs take; a provider without one keeps the owner's usual mode.
       ? { identifier: detail.issue.identifier, untrusted: true, policy: null, modeId: SAFE_MODES[preference.model.split("/")[0]] ?? undefined, notes: [options.verifier.brief], labels: {}, env: {}, tier: { tier: "cheap" as const, reason: "a steward verifier runs on the cheap tier" }, tests: [] }
-      : await planSetup(this.deps.linear, issueId, preference.model, preference.modeId, { tiers: this.deps.tiers, routes: this.deps.routes, settings, requests: this.deps.requests });
+      : await planSetup(this.deps.linear, issueId, preference.model, preference.modeId, { tiers: this.deps.tiers, routes: this.deps.routes, settings, requests: this.deps.requests, related: this.deps.related });
     const model = tierModel(settings, preference.model.split("/")[0], setup.tier?.tier ?? null, { provider: preference.model, ...(preference.thinkingOptionId ? { thinkingOptionId: preference.thinkingOptionId } : {}) });
     const diagnostic = options.verifier?.marker.startsWith("diagnostic-") ?? false;
     const diagnosticProvider = model.provider.split("/")[0];

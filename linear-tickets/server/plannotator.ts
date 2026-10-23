@@ -24,6 +24,7 @@ import { orderProblems, parseRelatedWork, relatedWorkProblems } from "../shared/
 import type { PlanFollowUps } from "./plan-follow-ups";
 import type { PlanRelations } from "./plan-relations";
 import type { PlanRequests } from "./plan-requests";
+import type { RelatedWork } from "./related-work";
 import { hasSection, RELATED_WORK_SECTION } from "../shared/plan-sections";
 import { feedbackEntry, logQuietly, type DecisionLog } from "./owner-decisions";
 import { modelProblem, modelSteps, planTier, strongerTier, TIERS, type Tier } from "../shared/plan-model";
@@ -174,7 +175,10 @@ export function parseEvent(raw: string): PlannotatorEvent | null {
 // `round`: the review round of this plan (README, "Statuses and labels"), a header line the next
 // round reads back (planRound).
 export function planDocument(event: DecidedEvent, identifier: string, model?: string | null, round?: number): string {
-  const date = event.at.slice(0, 16).replace("T", " ");
+  // The exact instant (milliseconds): comparisons against a plan's approval need no guess about
+  // which second or minute the coarser headers used to leave open (review-outcome.ts `approvalInterval`).
+  const at = new Date(event.at);
+  const date = Number.isFinite(at.getTime()) ? at.toISOString().slice(0, 23).replace("T", " ") : event.at.slice(0, 16).replace("T", " ");
   const plan = (event.planContent ?? "").trim() || "_The plan text was not recorded._";
   return [
     `> **${event.approved ? "Approved" : "Sent back with feedback"}** in Plannotator on ${date} UTC for ${identifier}. Replaced on every review round; the decision comments on the ticket keep the history.`,
@@ -253,6 +257,9 @@ export class PlannotatorBridge {
   private relations: Pick<PlanRelations, "file" | "retryPending"> | null = null;
   // The requests delivered to a planner (plan-requests.ts), for the time its planning round began.
   private planRequests: Pick<PlanRequests, "roundStartedAt"> | null = null;
+  // The approved plans of other tickets that overlap this one (related-work.ts `approvedSince`):
+  // the risk policy turns them into reasons the owner decides.
+  private related: Pick<RelatedWork, "approvedSince"> | null = null;
   // Reviews already opened on this machine, so a retried event does not open a second tab.
   private readonly shown = new Set<string>();
   // Where the owner's review feedback is kept for the weekly decision candidates (owner-decisions.ts).
@@ -380,6 +387,10 @@ export class PlannotatorBridge {
 
   usePlanRequests(requests: Pick<PlanRequests, "roundStartedAt">): void {
     this.planRequests = requests;
+  }
+
+  useRelated(related: Pick<RelatedWork, "approvedSince">): void {
+    this.related = related;
   }
 
   recordDecisions(log: Pick<DecisionLog, "append">): void {
@@ -620,8 +631,9 @@ export class PlannotatorBridge {
     return (await this.paseo?.agents.ref(agentId).refresh().catch(() => undefined))?.agent.createdAt ?? null;
   }
 
-  // What the risk policy needs to know about the ticket besides the plan.
-  private async reviewFacts(state: IssueState, verdict: string | null, settings: PluginSettings, plan: string): Promise<ReviewFacts> {
+  // What the risk policy needs to know about the ticket besides the plan. `round`: how the
+  // planning round is found; a parked plan passes the round it was parked in.
+  private async reviewFacts(state: IssueState, verdict: string | null, settings: PluginSettings, plan: string, round: { agentId: string; startedAt?: string | null }): Promise<ReviewFacts> {
     return {
       verdict,
       untrusted: isUntrusted(state, await this.linear.viewerId(), await this.linear.trustedAppIds()),
@@ -629,7 +641,25 @@ export class PlannotatorBridge {
       // D1 (README, "Plan risk and auto-approval"): a block line that makes this ticket wait for an
       // open ticket is the owner's call, whoever wrote it.
       waitsFor: await this.waitsFor(plan, state.identifier),
+      ...(await this.relatedFacts(state, plan, round)),
     };
+  }
+
+  // The plans of other tickets approved since this planning round began that overlap this plan
+  // (README, "Plan risk and auto-approval"): an overlap needs the owner. A check that cannot run
+  // keeps automatic approval off either way.
+  private async relatedFacts(state: IssueState, plan: string, round: { agentId: string; startedAt?: string | null }): Promise<Pick<ReviewFacts, "overlaps" | "overlapCheckFailed">> {
+    if (!this.related) return {};
+    const started = round.startedAt ?? await this.roundStart(round.agentId);
+    const since = started === null ? Number.NaN : Date.parse(started);
+    if (!Number.isFinite(since)) return { overlapCheckFailed: true };
+    try {
+      const overlaps = await this.related.approvedSince(state.id, since, plan, state.identifier);
+      return { overlaps: overlaps.map(({ identifier, overlap }) => ({ identifier, ...overlap })) };
+    } catch (error) {
+      console.error(`[linear-tickets] the related-work check for ${state.identifier} failed: ${message(error)}`);
+      return { overlapCheckFailed: true };
+    }
   }
 
   // The open tickets this plan's block lines make it wait for, that is `X blocks <this ticket>`
@@ -669,7 +699,7 @@ export class PlannotatorBridge {
       const tierOnly = approvedBefore ? onlyTierAdded(approvedBefore.content, planText) : false;
       if (!tierOnly && "problem" in rated) return null;
       const advice = await this.advice(agentId);
-      const outcome = tierOnly || "problem" in rated ? { approve: tierOnly, reasons: [] } : autoApproval(rated.risk, settings.autoApprove, await this.reviewFacts(state, advice && advice.hash === planHash(planText) ? advice.verdict : null, settings, planText));
+      const outcome = tierOnly || "problem" in rated ? { approve: tierOnly, reasons: [] } : autoApproval(rated.risk, settings.autoApprove, await this.reviewFacts(state, advice && advice.hash === planHash(planText) ? advice.verdict : null, settings, planText, { agentId }));
       if (!outcome.approve) return { approved: false, line: `${rating} Needs your approval: ${outcome.reasons.join("; ")}.`, reasons: outcome.reasons };
       const feedback = tierOnly ? "Approved again: the owner approved this plan before; only its model tier was added." : `Auto-approved by the risk policy. ${rating}`;
       const attempt = await this.journal.begin({ review, agentId, planContent: planText, approved: true, feedback, source: "risk-policy", state: "deciding", snapshot: await this.snapshot(agentId, review) });
@@ -702,7 +732,7 @@ export class PlannotatorBridge {
     const rated = parsePlanRisk(parked.plan);
     if ("problem" in rated) return;
     const settings = await this.settings.read();
-    const outcome = autoApproval(rated.risk, settings.autoApprove, await this.reviewFacts(await this.linear.issueState(parked.issueId), verdict, settings, parked.plan));
+    const outcome = autoApproval(rated.risk, settings.autoApprove, await this.reviewFacts(await this.linear.issueState(parked.issueId), verdict, settings, parked.plan, { agentId: parked.agentId, startedAt: parked.roundStartedAt }));
     const rating = `Risk: ${ratingText(rated.risk)}.`;
     if (outcome.approve) {
       const hosted = this.journal.latestReview(parked.agentId, { parked: true });
