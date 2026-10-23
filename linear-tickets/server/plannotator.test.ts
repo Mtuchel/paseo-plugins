@@ -8,7 +8,7 @@ import { setImmediate as immediate } from "node:timers/promises";
 import { promisify } from "node:util";
 import type { PaseoApi } from "@getpaseo/client";
 import { DEFAULT_WORKTREE_SHARDS, DEFAULT_ACTIVATION, DEFAULT_BACKSTOP, DEFAULT_DISPATCH, DEFAULT_WRITEBACK, DEFAULT_WATCHDOG, DEFAULT_STEWARD, DEFAULT_DEPUTY, type PluginSettings } from "./settings";
-import { openInBrowser, parseEvent, planDocument, PlannotatorBridge, plannotatorPaths, planRound, roundStep, writeOpenScript, type Parking } from "./plannotator";
+import { openInBrowser, parseEvent, planDocument, PlannotatorBridge, plannotatorPaths, planRound, roundStep, writeOpenScript, type CatchUpHooks, type Parking } from "./plannotator";
 import { ReviewClosedError } from "./sessions";
 import type { ParkedPlan } from "./parked";
 import { Handover, PARKED_PLAN_LINE, type HandoverRecord } from "./handover";
@@ -2979,4 +2979,193 @@ test("the owner settles an uncertain decision and an unbound report: carry-out a
     assert.equal(h.commented.filter((body) => body.startsWith("✅")).length, 0);
     await voidBridge.stop();
   });
+});
+
+// ---------------------------------------------------------------------------------------------
+// The catch-up of older approved plans (TUC-747, related-catch-up.ts): its plan is its own kind.
+// It is opened for the owner, approved or sent back, never split, and its approval writes no
+// ticket plan.
+// ---------------------------------------------------------------------------------------------
+
+const CATCH_UP_PLAN = `${RISKY(2)}\n## TUC-1\n\nVerdict: holds — nothing approved later changes it.\n\n\`\`\`related-work\nTUC-1 relates to TUC-4: the same report\n\`\`\`\n`;
+
+// The catch-up's routes, as the bridge calls them; `state.problems` is what its plan's checks find.
+function catchUpFake(calls: string[]) {
+  const state = { problems: [] as string[] };
+  const hooks: CatchUpHooks = {
+    isCatchUp: async (issueId) => issueId === "issue-1",
+    problems: async () => state.problems,
+    opened: async (issueId) => { calls.push(`catchup-opened ${issueId}`); },
+    sentBack: async (issueId) => { calls.push(`catchup-sent-back ${issueId}`); },
+    apply: async (issueId, agentId) => { calls.push(`catchup-apply ${issueId} ${agentId}`); },
+  };
+  return { hooks, state };
+}
+
+// The approval coordinator's requester side: records whether a plan ever claimed.
+function claimsFake(calls: string[]) {
+  return {
+    claim: async () => { calls.push("claim"); return { state: "denied" as const, reason: "no coordinator here" }; },
+    committed: async () => { calls.push("committed"); },
+    ownerApproval: async () => { calls.push("owner approval"); },
+    reconcile: async () => {},
+    holder: async () => null,
+  };
+}
+
+// What a ticket-plan approval would write; a catch-up's approval writes none of it.
+const TICKET_PLAN_STEPS = /^(catchup-|retire|document|ready|state|\+plan-ready|-plan-ready|comment)/;
+
+test("a catch-up plan with problems goes back to its agent naming each, and is never opened for the owner", async () => {
+  const { calls, linear, paseo } = setup({ "linear.issueId": "issue-1", "linear.identifier": "TUC-77" });
+  const { hooks, state } = catchUpFake(calls);
+  state.problems = ["TUC-2 has no section", "TUC-1's line `TUC-9 blocks TUC-4` names a ticket it does not list"];
+  const decisions: string[] = [];
+  const claims: string[] = [];
+  const inbox: string[] = [];
+  const reviews = { opened: async () => null, decided: async () => {}, described: async (url: string) => { inbox.push(url); }, describedFor: async () => {} };
+  await withEvents([{ type: "opened", agentId: "agent-1", localUrl: "http://localhost:4000/", remoteUrl: null, at: "2026-01-01T10:00:00Z" }], async (directory) => {
+    const bridge = new PlannotatorBridge(linear, { read: async () => settings }, directory, undefined, async () => CATCH_UP_PLAN, undefined, undefined, reviews as never, async (url, approve, feedback) => { decisions.push(`${url} ${approve} ${feedback}`); }, () => {});
+    bridge.onCatchUp(hooks);
+    bridge.useClaims(claimsFake(claims) as never);
+    bridge.attach(paseo);
+    await bridge.drain();
+    bridge.stop();
+  });
+  assert.equal(decisions.length, 1);
+  assert.match(decisions[0], /^http:\/\/localhost:4000\/ false /);
+  assert.match(decisions[0], /TUC-2 has no section/);
+  assert.match(decisions[0], /`TUC-9 blocks TUC-4` names a ticket it does not list/);
+  assert.deepEqual(calls.filter((call) => call.startsWith("catchup-")), [], "a broken plan is not opened for review");
+  assert.deepEqual(claims, [], "a broken plan never claims the coordinator");
+  assert.deepEqual(inbox, [], "a plan that never reached the owner has no inbox row");
+});
+
+test("a catch-up plan that is fine is opened for the owner with its own reason: no claim, no auto-approval", async () => {
+  const { calls, linear, paseo } = setup({ "linear.issueId": "issue-1", "linear.identifier": "TUC-77" });
+  const { hooks } = catchUpFake(calls);
+  const { plans, parking } = parkingFake(calls);
+  const decisions: string[] = [];
+  const claims: string[] = [];
+  const described: string[][] = [];
+  const reviews = { opened: async () => null, decided: async () => {}, described: async (_url: string, _plan: string, judgement: { reasons: string[] }) => { described.push(judgement.reasons); }, describedFor: async () => {} };
+  // The host then serves the parked plan: that `opened` event is the owner's inbox row.
+  await withEvents([
+    { type: "opened", agentId: "agent-1", localUrl: "http://localhost:4000/", remoteUrl: "https://host.ts.net:4000/", at: "2026-01-01T10:00:00Z" },
+    { type: "opened", agentId: "agent-1", localUrl: "http://localhost:28700/", remoteUrl: "https://host.ts.net:28700/", at: "2026-01-01T10:00:05Z" },
+  ], async (directory) => {
+    const bridge = new PlannotatorBridge(linear, { read: async () => settings }, directory, undefined, async () => CATCH_UP_PLAN, undefined, undefined, reviews as never, async (url, approve) => { decisions.push(`${url} ${approve}`); }, () => {}, parking);
+    bridge.onCatchUp(hooks);
+    bridge.useClaims(claimsFake(claims) as never);
+    bridge.attach(paseo);
+    await bridge.drain();
+    bridge.stop();
+  });
+  assert.ok(calls.includes("catchup-opened issue-1"), "its own record says the plan awaits the review");
+  assert.deepEqual(decisions, [], "nothing is sent to Plannotator on the owner's behalf");
+  assert.deepEqual(claims, [], "a catch-up never claims the coordinator");
+  assert.equal(plans.get("issue-1")?.line, "Risk: impact 2/4, revert. Needs your approval: a related-work catch-up always goes to you.");
+  assert.deepEqual(plans.get("issue-1")?.reasons, ["a related-work catch-up always goes to you"]);
+  assert.ok(calls.includes("retire agent-1 http://localhost:4000/"), "the parked plan's agent is retired");
+  assert.deepEqual(described, [["a related-work catch-up always goes to you"]], "the inbox row gives the owner the reason");
+  assert.ok(calls.some((call) => call.startsWith("comment issue-1: 📋 **Plan waiting for your review in Plannotator**") && call.includes("a related-work catch-up always goes to you")), "the owner is told where the plan waits and why");
+});
+
+test("an approved catch-up on the Plannotator page applies the plan and retires its agent, with no ticket-plan step", async () => {
+  const { calls, linear, paseo } = setup({ "linear.issueId": "issue-1", "linear.identifier": "TUC-77" });
+  const { hooks } = catchUpFake(calls);
+  const { parking } = parkingFake(calls);
+  await withEvents([{ type: "decided", agentId: "agent-1", approved: true, planContent: CATCH_UP_PLAN, at: "2026-01-01T12:00:00Z" }], async (directory) => {
+    const bridge = new PlannotatorBridge(linear, { read: async () => settings }, directory, undefined, async () => CATCH_UP_PLAN, undefined, undefined, undefined, async () => {}, () => {}, parking);
+    bridge.onCatchUp(hooks);
+    bridge.attach(paseo);
+    await bridge.drain();
+    assert.equal(onlyAttempt(bridge).state, "applied");
+    await bridge.stop();
+  });
+  assert.deepEqual(calls.filter((call) => TICKET_PLAN_STEPS.test(call)), ["catchup-apply issue-1 agent-1", "retire agent-1 null"]);
+});
+
+test("an approved parked catch-up applies the plan, is unparked and starts no successor", async () => {
+  const { calls, linear, paseo } = setup({ "linear.issueId": "issue-1", "linear.identifier": "TUC-77" });
+  const { hooks } = catchUpFake(calls);
+  const { plans, parking } = parkingFake(calls);
+  plans.set("issue-1", { issueId: "issue-1", identifier: "TUC-77", agentId: "agent-1", plan: CATCH_UP_PLAN, line: "", reasons: [], model: null, parkedAt: "2026-01-01T10:00:00Z", announced: true });
+  const sessions = {
+    sessionFor: async () => null,
+    queueable: async () => { calls.push("queueable"); return "queueable" as const; },
+    requeueSession: async () => { calls.push("requeue"); return "queued" as const; },
+    holdSession: async () => {}, groupSession: async () => {}, clearReview: async () => {}, say: async () => {}, said: async () => false,
+  };
+  await withEvents([{ type: "decided", agentId: "agent-1", approved: true, parked: true, planContent: CATCH_UP_PLAN, at: "2026-01-01T12:00:00Z" }], async (directory) => {
+    const bridge = new PlannotatorBridge(linear, { read: async () => settings }, directory, sessions as never, async () => CATCH_UP_PLAN, undefined, undefined, undefined, async () => {}, () => {}, parking);
+    bridge.onCatchUp(hooks);
+    bridge.attach(paseo);
+    await bridge.drain();
+    assert.equal(onlyAttempt(bridge).state, "applied");
+    await bridge.stop();
+  });
+  assert.deepEqual(calls.filter((call) => TICKET_PLAN_STEPS.test(call)), ["catchup-apply issue-1 agent-1", "retire agent-1 null"]);
+  assert.equal(plans.size, 0, "the parked record ends with the decision");
+  assert.ok(!calls.includes("queueable") && !calls.includes("requeue"), "no successor agent is started");
+});
+
+test("an approved catch-up in the panel applies once, also when its retirement is retried, and splitting it is refused", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-01-01T12:00:00Z") });
+  t.mock.method(console, "error", () => {});
+  const { calls, linear, paseo } = setup({ "linear.issueId": "issue-1", "linear.identifier": "TUC-25" });
+  const { hooks } = catchUpFake(calls);
+  const { sessions } = panelFakes(calls);
+  const { parking } = parkingFake(calls);
+  const retire = parking.retire;
+  let lost = true;
+  // The plan is applied, but the agent's retirement fails once (its answer never arrives).
+  parking.retire = async (url, agentId, api, reason) => {
+    if (lost) { lost = false; throw new Error("socket hang up"); }
+    await retire(url, agentId, api, reason);
+  };
+  await withEvents([], async (directory) => {
+    const bridge = new PlannotatorBridge(linear, { read: async () => settings }, directory, sessions as never, async () => CATCH_UP_PLAN, undefined, undefined, undefined, async () => {}, () => {}, parking);
+    bridge.onCatchUp(hooks);
+    bridge.attach(paseo);
+    assert.match(await bridge.decidePanel(PANEL as never, "later") ?? "", /^Approved — being applied: socket hang up/);
+    assert.equal(onlyAttempt(bridge).state, "pending");
+    t.mock.timers.tick(60_000);
+    await bridge.drain();
+    assert.equal(onlyAttempt(bridge).state, "applied");
+    await bridge.stop();
+  });
+  assert.deepEqual(calls.filter((call) => /^(catchup-|retire|document|ready|state|\+plan-ready|-plan-ready)/.test(call)), ["catchup-apply issue-1 agent-1", "retire agent-1 null"]);
+  assert.deepEqual(calls.filter((call) => call.startsWith("catchup-apply")).length, 1, "a retry repeats only the missing step");
+  assert.ok(calls.includes("clear review") && calls.some((call) => call.startsWith("reply Catch-up approved")), "the panel replies and the review is cleared");
+
+  calls.length = 0;
+  await withEvents([], async (directory) => {
+    const bridge = new PlannotatorBridge(linear, { read: async () => settings }, directory, sessions as never, async () => CATCH_UP_PLAN, undefined, undefined, undefined, async () => {}, () => {}, parking);
+    bridge.onCatchUp(hooks);
+    bridge.attach(paseo);
+    await assert.rejects(bridge.decidePanel(PANEL as never, "split"), { message: "a catch-up is approved or sent back, not split" });
+    assert.equal(bridge.decisionJournal.attempts().length, 0, "nothing is journaled");
+    await bridge.stop();
+  });
+  assert.deepEqual(calls, [], "a refused split writes nothing");
+});
+
+test("a catch-up sent back returns its record to planning and is delivered like any send-back", async () => {
+  const { calls, linear, paseo } = setup({ "linear.issueId": "issue-1", "linear.identifier": "TUC-77" });
+  const { hooks } = catchUpFake(calls);
+  const { parking } = parkingFake(calls);
+  await withEvents([{ type: "decided", agentId: "agent-1", approved: false, feedback: "TUC-2: check origin/main", planContent: CATCH_UP_PLAN, at: "2026-01-01T12:00:00Z" }], async (directory) => {
+    const bridge = new PlannotatorBridge(linear, { read: async () => settings }, directory, undefined, async () => CATCH_UP_PLAN, undefined, undefined, undefined, async () => {}, () => {}, parking);
+    bridge.onCatchUp(hooks);
+    bridge.attach(paseo);
+    await bridge.drain();
+    assert.equal(onlyAttempt(bridge).state, "applied");
+    await bridge.stop();
+  });
+  assert.ok(calls.includes("catchup-sent-back issue-1"));
+  assert.ok(calls.includes("state issue-1 Planning"));
+  assert.ok(calls.includes("+plan-rework issue-1"));
+  assert.ok(calls.some((call) => call.startsWith("comment issue-1: ↩️ **Plan sent back**")));
+  assert.ok(!calls.some((call) => call.startsWith("catchup-apply")), "a send-back applies nothing");
 });

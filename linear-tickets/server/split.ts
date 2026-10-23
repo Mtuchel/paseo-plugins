@@ -1,5 +1,5 @@
 import type { LinearService } from "./linear";
-import { CODING_STATE, planDocument, roundStep } from "./plannotator";
+import { CODING_STATE, planDocument, roundStep, type CatchUpHooks } from "./plannotator";
 import { PLAN_READY_LABEL, PLAN_REWORK_LABEL } from "./plan-policy";
 import { MAX_SPLIT, planSteps } from "./sessions";
 import type { PlanFollowUps } from "./plan-follow-ups";
@@ -25,6 +25,9 @@ export type PanelWork = {
   // The approval coordinator's outbox: the owner's approval is saved before its `Plan:` document
   // exists, and reported until the coordinator acknowledged it (README, "Plan risk and auto-approval").
   claims?: { ownerApproval(input: { issueId: string; identifier: string; plan: string; approvedAt: string }): Promise<void> };
+  // The catch-up of older approved plans (related-catch-up.ts), when its plan is the one decided:
+  // it is approved or sent back, never split, and its approval writes no ticket plan.
+  catchUp?: Pick<CatchUpHooks, "isCatchUp" | "apply">;
   // When the planning round behind the approved plan began (README, "Related work").
   roundStartedAt: string | null;
   // The session is held first (offer "later" / "split"), so retiring the planner offers no Resume
@@ -43,6 +46,12 @@ export type PanelWork = {
 };
 
 export type ApprovedPlan = { agentId: string | null; issueId: string; identifier: string; plan: string; model: string | null; at: string };
+
+// A catch-up's plan holds per-ticket verdicts, not steps of its own, so there is nothing to split
+// (related-catch-up.ts).
+export const CATCH_UP_SPLIT = "a catch-up is approved or sent back, not split";
+// What an approved catch-up's agent is told when it is retired: its result was the plan, not code.
+export const CATCH_UP_RETIRE = "The owner approved this catch-up. Paseo applies it to the listed tickets: stop now and do not implement anything.";
 
 async function approvedDocument(steps: Steps, work: PanelWork, decision: ApprovedPlan): Promise<string> {
   await steps.once("approval-outbox", () => work.claims?.ownerApproval({ issueId: decision.issueId, identifier: decision.identifier, plan: decision.plan, approvedAt: decision.at }) ?? Promise.resolve());
@@ -68,6 +77,14 @@ async function finish(steps: Steps, work: PanelWork, summary: string): Promise<v
 // planning again.
 export async function applyLater(steps: Steps, work: PanelWork, decision: ApprovedPlan): Promise<void> {
   if (work.session) await steps.once("hold", () => work.session!.hold("later"));
+  // A catch-up has no ticket work to start later: its approval applies the plan to the listed
+  // tickets and ends its agent here, so no ticket-plan step follows.
+  if (work.catchUp && await work.catchUp.isCatchUp(decision.issueId)) {
+    await steps.once("catch-up", () => work.catchUp!.apply(decision.issueId, decision.agentId, decision.plan));
+    await steps.once("retire", () => work.retire(CATCH_UP_RETIRE));
+    await finish(steps, work, "Catch-up approved. Paseo applies it to the listed tickets.");
+    return;
+  }
   const documentUrl = await approvedDocument(steps, work, decision);
   await steps.once("retire", () => work.retire("The owner approved this plan for later implementation by another agent. Stop now and do not implement anything."));
   await steps.once("ready", async () => {
@@ -101,6 +118,7 @@ export function splitProblem(plan: string): string | null {
 // section names as strong, gets the `model:strong` label, which that plan cannot lower. Every
 // sub-issue gets its Linear id before it is created, so a retry never creates a second one.
 export async function applySplit(steps: Steps, work: PanelWork, decision: ApprovedPlan): Promise<void> {
+  if (work.catchUp && await work.catchUp.isCatchUp(decision.issueId)) throw new Error(CATCH_UP_SPLIT);
   const planned = planSteps(decision.plan);
   const problem = splitProblem(decision.plan);
   if (problem) throw new Error(problem);

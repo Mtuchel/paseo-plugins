@@ -139,8 +139,9 @@ export const DEFAULT_AUTO_APPROVE: AutoApprovePolicy = { enabled: true, maxImpac
 // What the plugin knows about the review besides the plan text. `verdict`: the advisor verdict the
 // omp extension recorded for exactly this text (null: none, so the rating is unverified).
 // `overlaps`: the approved plans of other tickets that overlap this one; `overlapCheckFailed`: the
-// related-work check could not run (no automatic approval either way).
-export type ReviewFacts = { verdict: string | null; untrusted: boolean; attended: boolean; waitsFor?: string[]; overlaps?: PlanOverlap[]; overlapCheckFailed?: boolean };
+// related-work check could not run (no automatic approval either way). `catchUp`: the plan of a
+// catch-up of older approved plans, which the owner always decides.
+export type ReviewFacts = { verdict: string | null; untrusted: boolean; attended: boolean; waitsFor?: string[]; overlaps?: PlanOverlap[]; overlapCheckFailed?: boolean; catchUp?: boolean };
 
 // Another plan's footprint against this one (README, "Plan risk and auto-approval", "Related
 // work"): the files, places and tickets both name, and whether either names the other's ticket.
@@ -161,6 +162,9 @@ export function overlapText(match: FootprintMatch): string {
 
 // Whether the plan is approved without the owner, and why (shown to the owner either way).
 export function autoApproval(risk: PlanRisk, policy: AutoApprovePolicy, facts: ReviewFacts): { approve: boolean; reasons: string[] } {
+  // A catch-up approves an analysis of other approved plans, not work on its own ticket: the owner
+  // decides it whatever its rating and threshold.
+  if (facts.catchUp) return { approve: false, reasons: ["a related-work catch-up always goes to you"] };
   const { impact, reversibility } = combinedRating(risk);
   const limit = risk.featureFlag ? Math.max(policy.maxImpact, policy.maxImpactWithFlag) : policy.maxImpact;
   const reasons = [
