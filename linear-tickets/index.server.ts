@@ -36,6 +36,9 @@ import { ResponsibilityCheck, ResponsibilityStore } from "./server/responsibilit
 import { ensureBackendSecret } from "./server/inbox-transport";
 import { tailnetOrigin } from "./server/tailscale";
 import { BrowserDecisionInbox } from "./server/decision-inbox";
+import { BoardInbox } from "./server/board-inbox";
+import { collectBoardFacts } from "./server/board-facts";
+import { boardIssues, boardPulls } from "./server/board-sources";
 import { MergeStatus } from "./server/merge-status";
 import { mergeStatusRpc } from "./shared/merge-status";
 import { closeInternalDaemon, internalDaemon, modelSetter, ownConnection } from "./server/connection";
@@ -388,6 +391,19 @@ export default function contribute(server: PluginServerContext) {
       return { at: snapshot.lastPassAt, counts: snapshot.counts, oldest: snapshot.oldest, error: snapshot.lastError, tickets: snapshot.tickets, control: snapshot.control };
     },
   });
+  // The factory board (/board): this host's live facts, its peers' answers, and the two shared
+  // sources, derived into one view (shared/board.ts, server/board.ts).
+  const board = new BoardInbox({
+    facts: () => collectBoardFacts({
+      host: hostname().split(".")[0].toLowerCase(),
+      home: join(paseoHome(), "linear-tickets"),
+      paseo: () => attachedPaseo,
+      maxRunning: async () => (await settings.read()).dispatch.maxRunning ?? null,
+    }),
+    peers: async () => (await settings.read()).reviewPeers,
+    issues: () => boardIssues(linear, settings),
+    pulls: (repos) => boardPulls(repos),
+  });
   const activationRoutes = activationEndpoints({ settings, intake, drain, appUserId: () => linear.appUserId() });
   // Stable per-agent review links on the tailnet (:8444); tailnet-only, so no Linear app needed.
   // Its root is the review inbox, listing the peer hosts' reviews too (README, "Review inbox").
@@ -411,7 +427,7 @@ export default function contribute(server: PluginServerContext) {
     },
     // Draining a host: /activation, /activation/claims, /activation/deliver and
     // /activation/health ride this tailnet service (activation-endpoints.ts).
-    routes: async (request) => await activationRoutes(request) ?? await browserDecisions.route(request),
+    routes: async (request) => await activationRoutes(request) ?? await browserDecisions.route(request) ?? await board.route(request),
     deletions,
     issueInfo: (identifier, options) => issueInfos.forIdentifier(identifier, options),
     issueLink: async (agentId) => {

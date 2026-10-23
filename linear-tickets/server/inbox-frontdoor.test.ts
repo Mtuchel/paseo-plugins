@@ -66,6 +66,9 @@ async function fakeBackend(options: { instance?: string; port?: number } = {}): 
         case "/api/decisions/flow":
         case "/api/decisions/flow/local":
           return json(200, { host: "laptop", tickets: [] });
+        case "/api/board":
+        case "/api/board/local":
+          return json(200, { board: path });
         case "/api/push/key":
           return json(200, { publicKey: "key" });
         case "/activation":
@@ -311,6 +314,25 @@ test("recovery evidence is forwarded with the host it names", async () => {
       const answer = await call(frontdoor.port, "GET", path);
       assert.equal(answer.status, 200, answer.text);
       assert.deepEqual(jsonBody(answer.text), { host: "laptop", tickets: [] });
+      assert.equal(fake.calls.filter((item) => item.path === path).length, 1, path);
+    }
+  });
+});
+
+// The board page is the frontdoor's own static shell; its data is read live from the backend.
+test("the board page is served by the frontdoor and its data is forwarded live", async () => {
+  const fake = await fakeBackend();
+  await withFrontdoor(fake, async (frontdoor) => {
+    await until(async () => (await readAvailability(frontdoor.port)).stale === false);
+    const page = await call(frontdoor.port, "GET", "/board");
+    assert.equal(page.status, 200);
+    assert.match(page.text, /<html/i);
+    assert.match(page.text, /\/api\/board/);
+    assert.equal(fake.calls.some((item) => item.path === "/board"), false);
+    for (const path of ["/api/board", "/api/board/local"]) {
+      const answer = await call(frontdoor.port, "GET", path);
+      assert.equal(answer.status, 200, answer.text);
+      assert.deepEqual(jsonBody(answer.text), { board: path });
       assert.equal(fake.calls.filter((item) => item.path === path).length, 1, path);
     }
   });

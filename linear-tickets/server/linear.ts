@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import { basename, join, sep } from "node:path";
 import { imageType, localPlanImages, replacePlanImages } from "../shared/plan-images";
 import { MAX_ATTACHMENT_BYTES } from "./attachments";
+import type { BoardIssue } from "../shared/board";
 import type { Issue, TicketDetail } from "../shared/contracts";
 import { boundedContext, normalizeIssue, issuePage, connection, record, stateHistorySpans, label, ticketRelations, type FinishedBlocker } from "./context";
 import { Credentials } from "./credentials";
@@ -353,6 +354,17 @@ export const STEWARD_CHILDREN_QUERY = `query stewardChildren($id: String!, $afte
   }
 }`;
 export const STEWARD_PAGE = 100;
+
+// The factory board's ticket half (shared/board.ts BoardIssue): every ticket carrying the dispatch
+// label, open or completed in the last day. Both parts of the state condition belong in the filter
+// so Linear pages over exactly what the board draws, not over the team's whole history.
+export const BOARD_ISSUES_QUERY = `query boardIssues($first: Int!, $after: String, $filter: IssueFilter) {
+  issues(first: $first, after: $after, includeArchived: false, orderBy: updatedAt, filter: $filter) {
+    nodes { identifier title url state { name type } project { name } labels(first: 50) { nodes { name } } startedAt completedAt updatedAt }
+    pageInfo { hasNextPage endCursor }
+  }
+}`;
+export const BOARD_PAGE = 100;
 // How many pages one steward read may take before it gives up on the pass: 30 × 100 tickets.
 export const STEWARD_MAX_PAGES = 30;
 // The tracked tickets are read by id, 50 per request.
@@ -1302,6 +1314,40 @@ export class LinearService {
   async issues(cursor?: string, stateNames?: string[], showClosed?: boolean, relation?: "blocking" | "blocked") {
     return this.withKey(async (key) =>
       issuePage(record(await this.post(key, LIST_ISSUES_QUERY, { first: 50, after: cursor ?? null, filter: listIssueFilter(stateNames, showClosed, relation) })).issues));
+  }
+
+  // The factory board's tickets: open ones plus those completed in the last day, at most ten pages.
+  // A truncated read is still a usable board, so the cap returns what it has.
+  async boardIssues(input: { label: string; teamKeys: string[] }): Promise<BoardIssue[]> {
+    const since = new Date(Date.now() - 24 * 60 * 60_000).toISOString();
+    const filter = {
+      labels: { some: { name: { eqIgnoreCase: input.label } } },
+      ...(input.teamKeys.length ? { team: { key: { in: input.teamKeys } } } : {}),
+      or: [{ state: { type: { nin: ["completed", "canceled", "duplicate"] } } }, { completedAt: { gte: since } }],
+    };
+    return this.withKey(async (key) => {
+      const issues: BoardIssue[] = [];
+      let after: string | null = null;
+      for (let page = 0; page < 10; page++) {
+        const found = connection(record(record(await this.post(key, BOARD_ISSUES_QUERY, { first: BOARD_PAGE, after, filter })).issues));
+        for (const node of found.nodes.map((item) => record(item))) {
+          const identifier = label(node.identifier);
+          if (!identifier) continue;
+          const state = record(node.state ?? {});
+          const project = node.project && typeof node.project === "object" ? label(record(node.project).name) : "";
+          issues.push({
+            identifier, title: label(node.title), url: label(node.url), status: label(state.name), statusType: label(state.type),
+            project: project || null, labels: labelNodes(node.labels).map((item) => item.name),
+            startedAt: label(node.startedAt) || null, completedAt: label(node.completedAt) || null, updatedAt: label(node.updatedAt),
+          });
+        }
+        if (!found.hasNextPage) return issues;
+        const cursor = found.endCursor;
+        if (!cursor || cursor === after) return issues;
+        after = cursor;
+      }
+      return issues;
+    });
   }
 
   // Linear's GraphQL exposes no aggregation, so chip counts come from a bounded pass over
