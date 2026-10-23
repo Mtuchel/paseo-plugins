@@ -20,7 +20,10 @@ import { DEFAULT_WORKTREE_SHARDS, DEFAULT_ACTIVATION, DEFAULT_BACKSTOP, DEFAULT_
 import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
 import { AWAY_REASON, type Candidate } from "./scheduler";
 import { TierStore } from "./model-tiers";
-import { isUntrusted, MISSED_REACH_NOTE, MODEL_NOTE, RELATED_WORK_NOTE, QUESTIONS_NOTE, TicketStarter, tierMissingNote, UNTRUSTED_NOTE } from "./starter";
+import { isUntrusted, MISSED_REACH_NOTE, MODEL_NOTE, planSetup, RELATED_WORK_NOTE, QUESTIONS_NOTE, TicketStarter, tierMissingNote, UNTRUSTED_NOTE } from "./starter";
+import { PRECEDENCE_RULE, RelatedWork } from "./related-work";
+import type { CandidateIssue, DoneIssue, PlanDocument } from "./linear";
+import type { PullRequestRead } from "./label-sync";
 import { advisorNote, PLAN_REQUIRED_NOTE, PLAN_SECTIONS_NOTE, PLAN_SLICING_NOTE, planPolicy } from "./plan-policy";
 import { REPAIR_BUSY_MESSAGE, RepairBusyError } from "./repair-exclusion";
 import type { ProcessInspector } from "./process-liveness";
@@ -1764,4 +1767,98 @@ test("a recovered outcome more than two minutes after the panel decision confirm
     assert.equal(h.calls.filter((call) => call === "thought:Plan approved — starting on it.").length, 1, "the decision is carried out once");
     assert.equal(panels.linear.calls.filter((call) => call.startsWith("comment ")).length, 1, "the outcome is delivered once");
   } finally { await panels.cleanup(); }
+});
+
+// AC-4 (README, "Related work"): a plan-ready launch implements an approved plan, so it first hears
+// what changed since that approval — a real RelatedWork over a fake Linear and pull request cache.
+const ac4Plan = (approved: string) => `> **Approved** in Plannotator on ${approved} UTC for TUC-1.\n\n---\n\n# Plan\n\nChange \`server/x.ts\`.\n\n## Model\n\n- Tier: cheap — one file\n- Strong steps: none — routine\n`;
+const ac4PlanRow = (identifier: string, approved: string): PlanDocument => ({
+  id: `doc-${identifier}`, title: `Plan: ${identifier}`, url: `https://linear.app/doc/${identifier}`, updatedAt: "2026-10-15T10:00:31.000Z",
+  content: `> **Approved** in Plannotator on ${approved} UTC for ${identifier}.\n\n---\n\n# Plan\n\nChange \`server/x.ts\`.\n`,
+  issue: { id: `issue-${identifier}`, identifier, url: `https://linear.app/issue/${identifier}`, project: "" },
+});
+
+function ac4Related(options: { plans?: PlanDocument[]; open?: CandidateIssue[]; done?: DoneIssue[]; pullRequests?: Record<string, PullRequestRead>; fail?: boolean }) {
+  return new RelatedWork({
+    linear: {
+      planDocumentsSince: async () => { if (options.fail) throw new Error("Linear unavailable"); return options.plans ?? []; },
+      teamCandidates: async () => ({ items: options.open ?? [], complete: true }),
+      doneSince: async () => ({ items: options.done ?? [], complete: true }),
+      documentContents: async () => new Map(),
+    } as never,
+    pullRequests: {
+      refresh: async () => undefined,
+      filesOf: (url: string) => options.pullRequests?.[url]?.files ?? null,
+      stateOf: (url: string) => options.pullRequests?.[url] ?? null,
+    },
+  });
+}
+
+const ac4Setup = (approved: string, related?: Pick<RelatedWork, "changedSince">) => planSetup({
+  issueCore: async () => ({ id: "issue-1", identifier: "TUC-1", creatorId: OWNER, status: "Todo", statusType: "unstarted", teamId: "team-1", labels: [{ id: "l1", name: "plan-ready" }] }) as never,
+  viewerId: async () => OWNER,
+  trustedAppIds: async () => [],
+  issueDocument: async () => ({ content: ac4Plan(approved), url: "https://linear.app/doc/plan" }),
+} as never, "issue-1", "omp", undefined, { related });
+
+const PR8 = "https://github.com/o/r/pull/8";
+const PR7 = "https://github.com/o/r/pull/7";
+
+test("AC-4: an implementing launch lists what changed since the plan's approval, newest first, merged work and approvals, and says what to do", async () => {
+  const open: CandidateIssue[] = [
+    { id: "i8", identifier: "TUC-8", title: "Ship the export", description: "", updatedAt: "2026-10-15T11:00:00Z", status: "In Progress", statusType: "started", labels: [], pullRequests: [PR8], planDocuments: [] },
+    { id: "i9", identifier: "TUC-9", title: "Plan the export", description: "", updatedAt: "2026-10-15T10:00:31.000Z", status: "Planning", statusType: "started", labels: [], pullRequests: [], planDocuments: [] },
+  ];
+  const done: DoneIssue[] = [
+    { id: "i7", identifier: "TUC-7", title: "Older export", completedAt: "2026-10-15T12:00:00Z", pullRequests: [PR7], planDocuments: [] },
+    { id: "i30", identifier: "TUC-30", title: "Earlier export", completedAt: "2026-10-15T13:00:00Z", pullRequests: [], planDocuments: [ac4PlanRow("TUC-30", "2026-10-10 08:00:00.000")] },
+  ];
+  const pullRequests = {
+    [PR8]: { state: "MERGED", files: ["o/r/server/x.ts"], mergedAt: "2026-10-15T11:00:00Z" },
+    [PR7]: { state: "MERGED", files: ["o/r/server/x.ts"], mergedAt: "2026-10-15T09:00:00Z" },
+  } as Record<string, PullRequestRead>;
+  // TUC-9's plan was approved 30 s after this one; TUC-6's a moment before it.
+  const plans = [ac4PlanRow("TUC-9", "2026-10-15 10:00:30.000"), ac4PlanRow("TUC-6", "2026-10-15 09:59:59.000")];
+  const result = await ac4Setup("2026-10-15 10:00:00.000", ac4Related({ plans, open, done, pullRequests }));
+  assert.equal(result.policy, null, "an approved plan on a plan-ready ticket is implemented, not replanned");
+
+  const note = result.notes.find((entry) => entry.includes("changed since TUC-1's plan was approved")) ?? "";
+  assert.ok(note, JSON.stringify(result.notes));
+  assert.deepEqual(note.split("\n").filter((line) => line.startsWith("- ")), [
+    `- TUC-8 (In Progress) ${PR8}, merged 2026-10-15T11:00:00Z: \`server/x.ts\``,
+    "- TUC-9 (Planning) approved 2026-10-15 10:00:30.000 UTC: names the same files: server/x.ts",
+    "- TUC-30 (Done) approved 2026-10-10 08:00:00.000 UTC, done 2026-10-15T13:00:00Z: names the same files: server/x.ts",
+  ], "newest first; work merged before the approval is left out");
+  assert.doesNotMatch(note, /TUC-6|TUC-7|pull\/7/, "an approval just before the cutoff and a pull request merged before it are left out");
+  assert.ok(note.includes(PRECEDENCE_RULE), "the candidate list's precedence rule, not a copy");
+  assert.match(note, /stop before coding and ask the owner in a question request whether to re-plan, naming the ticket that wins/);
+
+  // A legacy minute-only header is approved in its whole minute, so TUC-9 at 10:00:30 still counts.
+  const legacy = await ac4Setup("2026-10-15 10:00", ac4Related({ plans, open, done, pullRequests }));
+  const legacyNote = legacy.notes.find((entry) => entry.includes("changed since TUC-1's plan was approved")) ?? "";
+  assert.match(legacyNote, /TUC-9 \(Planning\) approved 2026-10-15 10:00:30\.000 UTC/);
+});
+
+test("AC-4: the ticket's own pull requests merged since its approval are its plan being carried out, not a change to it", async () => {
+  const PR5 = "https://github.com/o/r/pull/5";
+  const open: CandidateIssue[] = [
+    { id: "issue-1", identifier: "TUC-1", title: "This ticket", description: "", updatedAt: "2026-10-15T11:00:00Z", status: "In Progress", statusType: "started", labels: [], pullRequests: [PR5], planDocuments: [] },
+    { id: "i8", identifier: "TUC-8", title: "Ship the export", description: "", updatedAt: "2026-10-15T11:00:00Z", status: "In Progress", statusType: "started", labels: [], pullRequests: [PR8], planDocuments: [] },
+  ];
+  const pullRequests = {
+    [PR5]: { state: "MERGED", files: ["o/r/server/x.ts"], mergedAt: "2026-10-15T10:30:00Z" },
+    [PR8]: { state: "MERGED", files: ["o/r/server/x.ts"], mergedAt: "2026-10-15T11:00:00Z" },
+  } as Record<string, PullRequestRead>;
+  const result = await ac4Setup("2026-10-15 10:00:00.000", ac4Related({ open, pullRequests }));
+  const note = result.notes.find((entry) => entry.includes("changed since TUC-1's plan was approved")) ?? "";
+  assert.deepEqual(note.split("\n").filter((line) => line.startsWith("- ")), [`- TUC-8 (In Progress) ${PR8}, merged 2026-10-15T11:00:00Z: \`server/x.ts\``]);
+});
+
+test("AC-4: a since-approval check that cannot run says so and leaves the comparison to the agent", async () => {
+  const result = await ac4Setup("2026-10-15 10:00:00.000", ac4Related({ fail: true }));
+  assert.equal(result.policy, null);
+  const note = result.notes.find((entry) => entry.includes("could not run")) ?? "";
+  assert.ok(note, JSON.stringify(result.notes));
+  assert.match(note, /Compare the plan with recent approvals and merged pull requests yourself before implementing\./);
+  assert.ok(note.includes(PRECEDENCE_RULE));
 });

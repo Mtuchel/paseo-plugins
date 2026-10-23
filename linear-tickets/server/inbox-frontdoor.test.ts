@@ -79,6 +79,7 @@ async function fakeBackend(options: { instance?: string; port?: number } = {}): 
           break;
       }
       if (/^\/api\/reviews\/[^/]+\/decision$/.test(path)) return json(200, { ok: true });
+      if (path === "/api/approval-claims" || path.startsWith("/api/approval-claims/")) return json(200, { state: "granted", received: call.body.length });
       if (/^\/plannotator\/[0-9a-f]{64}\.(?:js|css)$/.test(path)) {
         const br = /\bbr\b/i.test(String(call.headers["accept-encoding"] ?? ""));
         const body = br ? Buffer.from("brotli-bytes") : Buffer.from("console.log('plannotator')");
@@ -544,6 +545,31 @@ test("activation keeps its routes, methods, headers and large body", async () =>
     assert.equal((await call(frontdoor.port, "POST", "/activation", { headers: { "content-type": "application/json" }, body: "y".repeat(512_001) })).status, 413);
     assert.equal((await call(frontdoor.port, "POST", "/api/decisions/action", { headers: { host: HOST, origin: ORIGIN, "content-type": "application/json", "x-review-action": "1" }, body: "z".repeat(16_385) })).status, 413);
     assert.equal(fake.calls.some((item) => item.body.length > MAX_ACTIVATION_BODY_BYTES || (item.path === "/api/decisions/action" && item.body.length > 16_384)), false, "an oversize body never reaches the checked backend");
+  });
+});
+
+// Another host's requester reaches the approval coordinator only through this frontdoor.
+test("the approval coordinator's routes are forwarded with their guard and an owner approval's large body", async () => {
+  const fake = await fakeBackend();
+  await withFrontdoor(fake, async (frontdoor) => {
+    await until(async () => (await readAvailability(frontdoor.port)).stale === false);
+    const write = { host: HOST, "content-type": "application/json", "x-review-action": "1" };
+    const claimId = "0199f0a1-2b3c-7d4e-8f50-123456789abc";
+    const record = JSON.stringify({ footprint: { files: Array.from({ length: 4_000 }, (_, index) => `server/module-${index}.ts`) } });
+    for (const [path, body] of [["/api/approval-claims", "{}"], ["/api/approval-claims/settle", "{}"], ["/api/approval-claims/record", record]]) {
+      const answer = await call(frontdoor.port, "POST", path, { headers: write, body });
+      assert.equal(answer.status, 200, path);
+      assert.equal(jsonBody(answer.text).received, Buffer.byteLength(body), `${path} reaches the backend whole`);
+      assert.equal(fake.calls.at(-1)?.headers["x-review-action"], "1");
+    }
+    for (const path of [`/api/approval-claims/${claimId}`, `/api/approval-claims/${claimId}/holder`]) {
+      assert.equal((await call(frontdoor.port, "GET", path, { headers: { host: HOST } })).status, 200, path);
+      assert.equal(fake.calls.at(-1)?.path, path);
+    }
+    const forwarded = fake.calls.length;
+    assert.equal((await call(frontdoor.port, "POST", "/api/approval-claims", { headers: { host: HOST, "content-type": "application/json" }, body: "{}" })).status, 403);
+    assert.equal((await call(frontdoor.port, "POST", "/api/approval-claims/record", { headers: write, body: "z".repeat(512_001) })).status, 413);
+    assert.equal(fake.calls.slice(forwarded).some((item) => item.path.startsWith("/api/approval-claims")), false, "a refused claim write never reaches the checked backend");
   });
 });
 

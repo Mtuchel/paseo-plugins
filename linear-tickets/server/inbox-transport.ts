@@ -33,6 +33,13 @@ export const INBOX_INSTANCE_HEADER = "x-paseo-inbox-instance";
 // It is not a secret and not a fence, so a page always sends the epoch it actually displayed (kept
 // with its own data and drafts) and the frontdoor forwards exactly that instance.
 export const INBOX_DISPLAYED_HEADER = "x-paseo-inbox-displayed";
+// The approval coordinator's host-to-host routes (approval-claims.ts). Their body limit is larger
+// than the 16 KB every other route keeps, on the frontdoor and the backend alike: an owner approval
+// is reported with its whole footprint.
+export const MAX_CLAIM_BODY_BYTES = 512_000;
+export function isApprovalClaimPath(path: string): boolean {
+  return path === "/api/approval-claims" || path.startsWith("/api/approval-claims/") || path.startsWith("/api/approval-claims?");
+}
 
 // starting: the listener answers but the plugin has not confirmed its checked handlers yet;
 // ready: mutations are admitted; draining: teardown began, nothing new is admitted.

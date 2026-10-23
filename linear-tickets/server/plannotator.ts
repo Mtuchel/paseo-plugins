@@ -24,6 +24,9 @@ import { orderProblems, parseRelatedWork, relatedWorkProblems } from "../shared/
 import type { PlanFollowUps } from "./plan-follow-ups";
 import type { PlanRelations } from "./plan-relations";
 import type { PlanRequests } from "./plan-requests";
+import type { RelatedWork } from "./related-work";
+import type { ClaimIntent, ClaimRequests, ClaimReviewState } from "./approval-claims";
+import { planFootprint } from "../shared/plan-footprint";
 import { hasSection, RELATED_WORK_SECTION } from "../shared/plan-sections";
 import { feedbackEntry, logQuietly, type DecisionLog } from "./owner-decisions";
 import { modelProblem, modelSteps, planTier, strongerTier, TIERS, type Tier } from "../shared/plan-model";
@@ -174,15 +177,22 @@ export function parseEvent(raw: string): PlannotatorEvent | null {
 // `round`: the review round of this plan (README, "Statuses and labels"), a header line the next
 // round reads back (planRound).
 export function planDocument(event: DecidedEvent, identifier: string, model?: string | null, round?: number): string {
-  const date = event.at.slice(0, 16).replace("T", " ");
+  // The exact instant (milliseconds): comparisons against a plan's approval need no guess about
+  // which second or minute the coarser headers used to leave open (review-outcome.ts `approvalInterval`).
+  const at = new Date(event.at);
+  const date = Number.isFinite(at.getTime()) ? at.toISOString().slice(0, 23).replace("T", " ") : event.at.slice(0, 16).replace("T", " ");
   const plan = (event.planContent ?? "").trim() || "_The plan text was not recorded._";
+  const truncated = plan.length > MAX_PLAN_CHARS;
   return [
     `> **${event.approved ? "Approved" : "Sent back with feedback"}** in Plannotator on ${date} UTC for ${identifier}. Replaced on every review round; the decision comments on the ticket keep the history.`,
     ...round ? [`> **Review round:** ${round}`] : [],
     model ? `> **Planned with:** \`${model}\`` : "",
+    // A truncated text no longer hashes to its plan: the hash of the whole plan is kept here
+    // (review-outcome.ts `documentPlanHash`).
+    ...truncated ? [`> **Plan hash:** ${planHash(plan)}`] : [],
     event.feedback ? `\n## Review feedback\n\n${event.feedback}` : "",
     "\n---\n",
-    plan.length > MAX_PLAN_CHARS ? `${plan.slice(0, MAX_PLAN_CHARS)}\n\n… (truncated)` : plan,
+    truncated ? `${plan.slice(0, MAX_PLAN_CHARS)}\n\n… (truncated)` : plan,
   ].join("\n");
 }
 
@@ -253,6 +263,15 @@ export class PlannotatorBridge {
   private relations: Pick<PlanRelations, "file" | "retryPending"> | null = null;
   // The requests delivered to a planner (plan-requests.ts), for the time its planning round began.
   private planRequests: Pick<PlanRequests, "roundStartedAt"> | null = null;
+  // The approved plans of other tickets that overlap this one (related-work.ts `approvedSince`):
+  // the risk policy turns them into reasons the owner decides.
+  private related: Pick<RelatedWork, "approvedSince"> | null = null;
+  // The approval coordinator (README, "Plan risk and auto-approval"): a plan that would otherwise be
+  // auto-approved claims it first; owner approvals leave through its outbox.
+  private claims: Pick<ClaimRequests, "claim" | "committed" | "ownerApproval" | "reconcile" | "holder"> | null = null;
+  // Reviews with a judgement in flight: a granted claim reaches `journal.begin` only after more
+  // awaits, and reconciliation must not withdraw it meanwhile (claimReviewState answers `pending`).
+  private readonly judging = new Map<string, number>();
   // Reviews already opened on this machine, so a retried event does not open a second tab.
   private readonly shown = new Set<string>();
   // Where the owner's review feedback is kept for the weekly decision candidates (owner-decisions.ts).
@@ -274,7 +293,7 @@ export class PlannotatorBridge {
     private readonly fetchPlan: (localUrl: string) => Promise<string> = readReviewPlan,
     private readonly handover?: Pick<Handover, "update" | "remember">,
     private readonly setMode: (agentId: string, modeId: string) => Promise<void> = setAgentMode,
-    private readonly reviews?: Pick<ReviewLinks, "opened" | "decided" | "described" | "describedFor"> & Partial<Pick<ReviewLinks, "requiresOwner">>,
+    private readonly reviews?: Pick<ReviewLinks, "opened" | "decided" | "described" | "describedFor"> & Partial<Pick<ReviewLinks, "requiresOwner" | "reviewOpen">>,
     private readonly decide: (localUrl: string, approve: boolean, feedback: string) => Promise<void> = decidePlannotatorReview,
     private readonly open: (url: string) => void = openInBrowser,
     private readonly parking?: Parking,
@@ -351,6 +370,8 @@ export class PlannotatorBridge {
       if (followUps && this.journal.active) void this.journal.run(() => followUps.retryPending()).catch((error: unknown) => { if (!(error instanceof FencedError)) console.error(`[linear-tickets] plan follow-up retries failed: ${message(error)}`); });
       const relations = this.relations;
       if (relations && this.journal.active) void this.journal.run(() => relations.retryPending()).catch((error: unknown) => { if (!(error instanceof FencedError)) console.error(`[linear-tickets] related-work retries failed: ${message(error)}`); });
+      // Claims left by a reload are reconciled and owner approvals reported, also before a journal.
+      void this.claims?.reconcile();
     }, SWEEP_MS);
     this.timer.unref?.();
     void this.drain();
@@ -380,6 +401,16 @@ export class PlannotatorBridge {
 
   usePlanRequests(requests: Pick<PlanRequests, "roundStartedAt">): void {
     this.planRequests = requests;
+  }
+
+  useRelated(related: Pick<RelatedWork, "approvedSince">): void {
+    this.related = related;
+  }
+
+  // The requester side of the approval coordinator, plus the reconciliation of claims a reload left.
+  useClaims(claims: Pick<ClaimRequests, "claim" | "committed" | "ownerApproval" | "reconcile" | "holder">): void {
+    this.claims = claims;
+    void claims.reconcile();
   }
 
   recordDecisions(log: Pick<DecisionLog, "append">): void {
@@ -620,8 +651,9 @@ export class PlannotatorBridge {
     return (await this.paseo?.agents.ref(agentId).refresh().catch(() => undefined))?.agent.createdAt ?? null;
   }
 
-  // What the risk policy needs to know about the ticket besides the plan.
-  private async reviewFacts(state: IssueState, verdict: string | null, settings: PluginSettings, plan: string): Promise<ReviewFacts> {
+  // What the risk policy needs to know about the ticket besides the plan. `round`: how the
+  // planning round is found; a parked plan passes the round it was parked in.
+  private async reviewFacts(state: IssueState, verdict: string | null, settings: PluginSettings, plan: string, round: { agentId: string; startedAt?: string | null }): Promise<ReviewFacts> {
     return {
       verdict,
       untrusted: isUntrusted(state, await this.linear.viewerId(), await this.linear.trustedAppIds()),
@@ -629,7 +661,25 @@ export class PlannotatorBridge {
       // D1 (README, "Plan risk and auto-approval"): a block line that makes this ticket wait for an
       // open ticket is the owner's call, whoever wrote it.
       waitsFor: await this.waitsFor(plan, state.identifier),
+      ...(await this.relatedFacts(state, plan, round)),
     };
+  }
+
+  // The plans of other tickets approved since this planning round began that overlap this plan
+  // (README, "Plan risk and auto-approval"): an overlap needs the owner. A check that cannot run
+  // keeps automatic approval off either way.
+  private async relatedFacts(state: IssueState, plan: string, round: { agentId: string; startedAt?: string | null }): Promise<Pick<ReviewFacts, "overlaps" | "overlapCheckFailed">> {
+    if (!this.related) return {};
+    const started = round.startedAt ?? await this.roundStart(round.agentId);
+    const since = started === null ? Number.NaN : Date.parse(started);
+    if (!Number.isFinite(since)) return { overlapCheckFailed: true };
+    try {
+      const overlaps = await this.related.approvedSince(state.id, since, plan, state.identifier);
+      return { overlaps: overlaps.map(({ identifier, overlap }) => ({ identifier, ...overlap })) };
+    } catch (error) {
+      console.error(`[linear-tickets] the related-work check for ${state.identifier} failed: ${message(error)}`);
+      return { overlapCheckFailed: true };
+    }
   }
 
   // The open tickets this plan's block lines make it wait for, that is `X blocks <this ticket>`
@@ -656,7 +706,22 @@ export class PlannotatorBridge {
   // approval it had when nothing else changed. A planner run's work order never comes here
   // (deliverWorkOrder). The approval is journaled before Plannotator is told.
   // null: the plan has no readable rating.
-  private async judge(review: ReviewGeneration, localUrl: string, agentId: string, issueId: string, planText: string, settings: PluginSettings): Promise<Judgement | null> {
+  private judge(review: ReviewGeneration, localUrl: string, agentId: string, issueId: string, planText: string, settings: PluginSettings): Promise<Judgement | null> {
+    return this.whileJudging(review.id, () => this.judgeNow(review, localUrl, agentId, issueId, planText, settings));
+  }
+
+  private async whileJudging<T>(reviewId: string, work: () => Promise<T>): Promise<T> {
+    this.judging.set(reviewId, (this.judging.get(reviewId) ?? 0) + 1);
+    try {
+      return await work();
+    } finally {
+      const left = (this.judging.get(reviewId) ?? 1) - 1;
+      if (left) this.judging.set(reviewId, left);
+      else this.judging.delete(reviewId);
+    }
+  }
+
+  private async judgeNow(review: ReviewGeneration, localUrl: string, agentId: string, issueId: string, planText: string, settings: PluginSettings): Promise<Judgement | null> {
     // A replayed `opened` event: the review's decision is in the journal already.
     const decided = this.journal.attempts(review.id).find((attempt) => attempt.state !== "void");
     if (decided) return { approved: decided.approved, line: decided.approved ? "Approved; the decision is being applied." : "Sent back; the decision is being applied.", reasons: [] };
@@ -669,8 +734,24 @@ export class PlannotatorBridge {
       const tierOnly = approvedBefore ? onlyTierAdded(approvedBefore.content, planText) : false;
       if (!tierOnly && "problem" in rated) return null;
       const advice = await this.advice(agentId);
-      const outcome = tierOnly || "problem" in rated ? { approve: tierOnly, reasons: [] } : autoApproval(rated.risk, settings.autoApprove, await this.reviewFacts(state, advice && advice.hash === planHash(planText) ? advice.verdict : null, settings, planText));
+      const outcome = tierOnly || "problem" in rated ? { approve: tierOnly, reasons: [] } : autoApproval(rated.risk, settings.autoApprove, await this.reviewFacts(state, advice && advice.hash === planHash(planText) ? advice.verdict : null, settings, planText, { agentId }));
       if (!outcome.approve) return { approved: false, line: `${rating} Needs your approval: ${outcome.reasons.join("; ")}.`, reasons: outcome.reasons };
+      // Every other check passed, so only a plan that would be approved automatically claims. The
+      // coordinator answers `granted` only when no overlapping plan holds or holds a newer approval;
+      // no coordinator, no answer and every terminal answer keep the plan with the owner.
+      if (!tierOnly && this.claims) {
+        const roundStartedAt = await this.roundStart(agentId);
+        const claim = roundStartedAt === null ? { state: "unreachable" as const } : await this.claims.claim({
+          issueId, identifier: state.identifier, planHash: planHash(planText), footprint: planFootprint(planText, state.identifier),
+          roundStartedAt, agentId, localUrl, reviewId: review.id,
+        });
+        if (claim.state !== "granted") {
+          const reason = claim.state === "unreachable" ? "the approval coordinator could not be reached"
+            : claim.state === "denied" ? claim.reason ?? "another plan overlaps this one"
+            : `its automatic approval was ${claim.state}`;
+          return { approved: false, line: `${rating} Needs your approval: ${reason}.`, reasons: [reason] };
+        }
+      }
       const feedback = tierOnly ? "Approved again: the owner approved this plan before; only its model tier was added." : `Auto-approved by the risk policy. ${rating}`;
       const attempt = await this.journal.begin({ review, agentId, planContent: planText, approved: true, feedback, source: "risk-policy", state: "deciding", snapshot: await this.snapshot(agentId, review) });
       const line = tierOnly ? `Approved without you: the plan you approved, with its model tier added. ${rating}`.trim() : `Auto-approved within your threshold. ${rating}`;
@@ -692,6 +773,32 @@ export class PlannotatorBridge {
     }
   }
 
+  // What became of a claimed plan's review (approval-claims.ts, reconciliation): its own decision
+  // with this plan's document written; a decision with another plan; a decision still being applied;
+  // the review still waiting; or gone with nothing recorded. `pending` while this instance does not
+  // hold the loaded journal, or a judgement of the review is still on its way to the journal.
+  async claimReviewState(record: ClaimIntent): Promise<ClaimReviewState> {
+    if (!this.journal.active || this.judging.has(record.reviewId)) return "pending";
+    const attempts = this.journal.attempts(record.reviewId);
+    const applied = attempts.filter((attempt) => attempt.state === "applied");
+    if (applied.length) return applied.some((attempt) => attempt.approved && attempt.planHash === record.planHash) ? "applied" : "other";
+    if (attempts.some((attempt) => attempt.state === "deciding" || attempt.state === "uncertain" || attempt.state === "pending")) return "pending";
+    // Only void attempts: Plannotator refused the decision because the review was already decided.
+    if (attempts.length) return "other";
+    const open = await this.reviews?.reviewOpen?.(record.localUrl).catch(() => null) ?? null;
+    return open === true ? "open" : "gone";
+  }
+
+  // A claim withdrawn with its review still waiting: judged again, which claims under a new id.
+  async rejudgeClaim(record: ClaimIntent): Promise<void> {
+    if (record.parked || this.stopped) return;
+    const review = this.journal.review(record.reviewId);
+    if (!review) return;
+    const plan = await this.fetchPlan(record.localUrl).catch(() => "");
+    if (!plan.trim() || planHash(plan) !== record.planHash) return;
+    await this.judge(review, record.localUrl, record.agentId, record.issueId, plan, await this.settings.read());
+  }
+
   // A parked plan whose advisor review was recorded after it was parked (README, "Parked plans"):
   // its planner, resumed for that, recorded the review for exactly the parked text. The plan is
   // judged again: within the threshold it is approved like the owner's approval on the central
@@ -702,25 +809,38 @@ export class PlannotatorBridge {
     const rated = parsePlanRisk(parked.plan);
     if ("problem" in rated) return;
     const settings = await this.settings.read();
-    const outcome = autoApproval(rated.risk, settings.autoApprove, await this.reviewFacts(await this.linear.issueState(parked.issueId), verdict, settings, parked.plan));
+    const outcome = autoApproval(rated.risk, settings.autoApprove, await this.reviewFacts(await this.linear.issueState(parked.issueId), verdict, settings, parked.plan, { agentId: parked.agentId, startedAt: parked.roundStartedAt }));
     const rating = `Risk: ${ratingText(rated.risk)}.`;
+    let reasons = outcome.reasons;
+    let approved = outcome.approve;
     if (outcome.approve) {
+      // The same claim every other automatic approval makes: a parked plan is no exception. A bridge
+      // without the requester side (tests, embedded use) has nothing to ask.
       const hosted = this.journal.latestReview(parked.agentId, { parked: true });
       const review = hosted && hosted.openedAt >= parked.parkedAt ? hosted : await this.journal.ensureReview({ agentId: parked.agentId, localUrl: `parked:${parked.issueId}`, openedAt: parked.parkedAt, parked: true, planHash: planHash(parked.plan), legacy: true });
-      try {
-        await this.journal.begin({ review, agentId: parked.agentId, planContent: parked.plan, approved: true, feedback: `Auto-approved by the risk policy. ${rating}`, source: "risk-policy", state: "pending", snapshot: await this.snapshot(parked.agentId, review) });
-        console.log(`[linear-tickets] ${parked.identifier}: parked plan auto-approved once its advisor review was recorded (${rating})`);
-      } catch (error) {
-        // The owner decided it meanwhile: theirs stands.
-        if (!(error instanceof DecisionPendingError)) throw error;
-      }
+      const roundStartedAt = parked.roundStartedAt ?? await this.roundStart(parked.agentId) ?? parked.parkedAt;
+      await this.whileJudging(review.id, async () => {
+        const claim = this.claims ? await this.claims.claim({ issueId: parked.issueId, identifier: parked.identifier, planHash: planHash(parked.plan), footprint: planFootprint(parked.plan, parked.identifier), roundStartedAt, agentId: parked.agentId, localUrl: review.localUrl, reviewId: review.id, parked: true }) : { state: "granted" as const };
+        if (claim.state === "granted") {
+          try {
+            await this.journal.begin({ review, agentId: parked.agentId, planContent: parked.plan, approved: true, feedback: `Auto-approved by the risk policy. ${rating}`, source: "risk-policy", state: "pending", snapshot: await this.snapshot(parked.agentId, review) });
+            console.log(`[linear-tickets] ${parked.identifier}: parked plan auto-approved once its advisor review was recorded (${rating})`);
+          } catch (error) {
+            // The owner decided it meanwhile: theirs stands.
+            if (!(error instanceof DecisionPendingError)) throw error;
+          }
+        } else {
+          approved = false;
+          reasons = [claim.state === "unreachable" ? "the approval coordinator could not be reached" : claim.state === "denied" ? claim.reason ?? "another plan overlaps this one" : `its automatic approval was ${claim.state}`];
+        }
+      });
     }
     await this.parking!.retire(null, parked.agentId, paseo, "The plan stays parked for the owner: stop now and do not implement anything.");
-    if (outcome.approve) return;
-    await this.parking!.plans.put({ ...parked, line: `${rating} Needs your approval: ${outcome.reasons.join("; ")}.`, reasons: outcome.reasons });
-    await this.reviews?.describedFor(parked.agentId, parked.plan, { approved: false, reasons: outcome.reasons })
+    if (approved) return;
+    await this.parking!.plans.put({ ...parked, line: `${rating} Needs your approval: ${reasons.join("; ")}.`, reasons });
+    await this.reviews?.describedFor(parked.agentId, parked.plan, { approved: false, reasons })
       .catch((error: unknown) => console.error(`[linear-tickets] inbox details for ${parked.identifier} skipped: ${message(error)}`));
-    console.log(`[linear-tickets] ${parked.identifier}: parked plan judged again with its advisor review, still for the owner (${outcome.reasons.join("; ")})`);
+    console.log(`[linear-tickets] ${parked.identifier}: parked plan judged again with its advisor review, still for the owner (${reasons.join("; ")})`);
   }
 
   // --- Intake ------------------------------------------------------------------------------
@@ -742,6 +862,9 @@ export class PlannotatorBridge {
         }
       } while (this.again);
       await this.applyDue();
+      // The requester side of the approval coordinator: resend a claim still unanswered, settle the
+      // one whose review was decided (throttled inside, so most sweeps return at once).
+      void this.claims?.reconcile();
       // Small-ticket route attempts: expired ones, accepted ones still being carried out, the owner's cancellations.
       const routes = this.smallRoutes;
       if (routes) await this.journal.run(() => routes.sweep()).catch((error: unknown) => {
@@ -1239,7 +1362,9 @@ export class PlannotatorBridge {
     const sessions = this.sessions;
     await steps.once("log", () => this.logFeedback(attempt.agentId, event, issue));
     const round = await roundStep(steps, this.linear, issue.id, issue.identifier);
+    if (attempt.approved && attempt.source !== "risk-policy") await steps.once("approval-outbox", () => this.claims?.ownerApproval({ issueId: issue.id, identifier: issue.identifier, plan: event.planContent ?? parked.plan, approvedAt: attempt.acceptedAt ?? attempt.at }) ?? Promise.resolve());
     const documentUrl = await steps.once("document", () => this.linear.upsertIssueDocument(issue.id, `Plan: ${issue.identifier}`, planDocument(event, issue.identifier, parked.model, round)));
+    if (attempt.approved && attempt.source === "risk-policy") await steps.once("approval-settled", () => this.claims?.committed(issue.id, event.planContent ?? parked.plan) ?? Promise.resolve());
     let preflight: "queueable" | "moved-on" | "none" = "queueable";
     if (attempt.approved) {
       await steps.once("follow-ups", async () => { await this.followUps?.file({ issueId: issue.id, identifier: issue.identifier, plan: event.planContent ?? parked.plan, documentUrl: documentUrl || null }); });
@@ -1355,7 +1480,12 @@ export class PlannotatorBridge {
         await this.linear[attempt.approved ? "removeLabel" : "addLabel"](issueId, PLAN_REWORK_LABEL);
       });
     }
+    // The owner's approval is in the coordinator's outbox before its document exists (also when the
+    // document write then fails: the outbox is reported either way). An automatic one settles its
+    // claim once the document is written.
+    if (attempt.approved && attempt.source !== "risk-policy") await steps.once("approval-outbox", () => this.claims?.ownerApproval({ issueId, identifier, plan: attempt.planContent, approvedAt: attempt.acceptedAt ?? attempt.at }) ?? Promise.resolve());
     const documentUrl = await steps.once("document", () => this.linear.upsertIssueDocument(issueId, `Plan: ${identifier}`, planDocument(event, identifier, attempt.model, round)));
+    if (attempt.approved && attempt.source === "risk-policy") await steps.once("approval-settled", () => this.claims?.committed(issueId, attempt.planContent) ?? Promise.resolve());
     if (attempt.approved) await steps.once("follow-ups", async () => { await this.followUps?.file({ issueId, identifier, plan: attempt.planContent, documentUrl: documentUrl || null }); });
     if (attempt.approved) await steps.once("relations", async () => { await this.relations?.file({ issueId, identifier, plan: attempt.planContent, documentUrl: documentUrl || null, roundStartedAt: await this.roundStart(attempt.agentId) }); });
     // With a session the panel shows the review, so the progress comment records it instead of new comments.
@@ -1420,6 +1550,7 @@ export class PlannotatorBridge {
       appUserId: () => this.linear.appUserId(),
       ...(this.followUps ? { followUps: this.followUps } : {}),
       ...(this.relations ? { relations: this.relations } : {}),
+      ...(this.claims ? { claims: this.claims } : {}),
       roundStartedAt: attempt.parked?.roundStartedAt ?? await this.roundStart(attempt.agentId),
       session: sessions && sessionId ? {
         hold: (offer) => sessions.holdSession(sessionId, offer),

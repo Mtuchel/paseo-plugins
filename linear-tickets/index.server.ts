@@ -71,6 +71,7 @@ import { PlanFollowUps } from "./server/plan-follow-ups";
 import { labelDaemon, StateLabels } from "./server/state-labels";
 import { LabelSync, PullRequestFiles } from "./server/label-sync";
 import { RelatedWork } from "./server/related-work";
+import { ApprovalClaims, ClaimRequests } from "./server/approval-claims";
 import { ProjectFlow, ProjectStore } from "./server/project-flow";
 import { ProjectIssueCache } from "./server/project-issues";
 import { Presence } from "./server/presence";
@@ -148,6 +149,11 @@ export default function contribute(server: PluginServerContext) {
   // The candidate list of related work in every planning launch's context file (README, "Overlap check").
   const relatedWork = new RelatedWork({ linear, pullRequests: pullRequestFiles });
   launcher.useCandidates((teamId) => relatedWork.candidates(teamId));
+  // The approval coordinator (README, "Plan risk and auto-approval"): the dispatch host grants every
+  // automatic approval and keeps the approval ledger; other hosts ask it. The requester side is
+  // built with the bridge below.
+  let claimRequests: ClaimRequests | null = null;
+  const approvalClaims = new ApprovalClaims({ linear, related: relatedWork, holder: (claimId) => claimRequests ? claimRequests.holder(claimId) : Promise.resolve(null) });
   // Present or away (README, "Present and away"): every start path asks the starter's scheduler.
   const presence = new Presence();
   // Model tiers (README, "Model tiers"): the tier each ticket implements on.
@@ -183,6 +189,7 @@ export default function contribute(server: PluginServerContext) {
   let planRequests: PlanRequests | null = null;
   const starter = new TicketStarter({ linear, launcher, handover, presence, tiers, acceptanceTests, routes: smallRoutes, deletions, shards, focus, parked: waitingPlans, doneTickets,
     requests: (issueId, identifier, since, hash) => planRequests!.requests(issueId, identifier, since, hash),
+    related: relatedWork,
     repairs: { exclusion, parked: { get: (issueId) => parking.plans.get(issueId) } } });
   // The decision journal (README, "Decision journal"): every owner decision on a plan is written
   // here first and carried out by the bridge's worker; the inbox lists what is being applied.
@@ -426,6 +433,12 @@ export default function contribute(server: PluginServerContext) {
     peers: async () => (await settings.read()).reviewPeers,
     inbox: { decisions: () => browserDecisions.view() },
     origin: () => tailnetOrigin(),
+    // Reported on `/api/inbox` so peers trust this host's replan comments (plan-requests.ts).
+    appUserId: () => linear.appUserId(),
+    // The coordinator's routes and `/api/inbox` `dispatch` (README, "Plan risk and auto-approval").
+    claims: async () => (await settings.read()).dispatch.enabled ? approvalClaims : null,
+    dispatch: async () => (await settings.read()).dispatch.enabled,
+    holder: (claimId) => claimRequests ? claimRequests.holder(claimId) : Promise.resolve(null),
     decide: decideReview,
     decisions: { applying: () => decisionJournal.applying(), resolve: (entryId, action): Promise<void> => plannotator.resolve(entryId, action) },
     linearWorkspace: () => linear.workspaceUrl(),
@@ -534,6 +547,19 @@ export default function contribute(server: PluginServerContext) {
   const planRelations = new PlanRelations(linear, (issueId, identifier, since, hash) => planRequests!.requests(issueId, identifier, since, hash), () => hostName);
   plannotator.useRelations(planRelations);
   plannotator.usePlanRequests(planRequests);
+  // The risk policy's overlap check (README, "Plan risk and auto-approval").
+  plannotator.useRelated(relatedWork);
+  // The requester side: a plan that would be auto-approved claims the coordinator's grant first,
+  // settles it once its `Plan:` document is written, and reports owner approvals from an outbox.
+  claimRequests = new ClaimRequests({
+    linear,
+    local: async () => (await settings.read()).dispatch.enabled ? approvalClaims : null,
+    peers: async () => (await settings.read()).reviewPeers,
+    origin: () => tailnetOrigin(),
+    state: (record) => plannotator.claimReviewState(record),
+    rejudge: (record) => plannotator.rejudgeClaim(record),
+  });
+  plannotator.useClaims(claimRequests);
   let commentWake: NodeJS.Timeout | null = null;
   const wakeComments = () => {
     if (commentWake) return;
@@ -721,6 +747,7 @@ export default function contribute(server: PluginServerContext) {
       });
       asCaller("drain", () => drain.start());
       asCaller("intake", () => intake.start());
+      asCaller("approval-claims", () => approvalClaims.start());
       if (first) asCaller("parked-plans", () => { void startHost(); });
     }
     asCaller("plan-pipeline", () => pipeline.attach(paseo));
@@ -864,7 +891,7 @@ export default function contribute(server: PluginServerContext) {
     // instead of forwarding a launch whose workspace the owner picked on this host.
     if (current.activation.mode === "remote") throw new Error(`This host forwards new Linear work to ${current.activation.peer ?? "the peer host"}; the agent starts there. Assign Paseo or add the trigger label on the ticket.`);
     const { template, agentLinearAccess } = current;
-    const setup = await planSetup(linear, input.id, input.provider, input.modeId, { tiers, routes: smallRoutes, settings: current });
+    const setup = await planSetup(linear, input.id, input.provider, input.modeId, { tiers, routes: smallRoutes, settings: current, related: relatedWork });
     const model = tierModel(current, input.provider.split("/")[0], setup.tier?.tier ?? null, { provider: input.provider, ...(input.thinkingOptionId ? { thinkingOptionId: input.thinkingOptionId } : {}) });
     const launch = { ...input, ...model, modeId: setup.modeId, instructions: [...setup.notes, QUESTIONS_NOTE, input.instructions.trim()].filter(Boolean).join("\n\n") };
     const markInProgress = input.markInProgress && setup.policy !== "required";
@@ -926,6 +953,10 @@ export default function contribute(server: PluginServerContext) {
     // bounded) before anything it uses closes; only then does the journal's lease move on.
     await exclusion.drain();
     await plannotator.stop();
+    // The requester, then the coordinator it may call in process: each finishes the claim in
+    // progress before the replacement plugin reads the same files.
+    await claimRequests?.stop();
+    await approvalClaims.stop();
     await replies.stop();
     clearTimeout(startSoon);
     clearInterval(usageTimer);

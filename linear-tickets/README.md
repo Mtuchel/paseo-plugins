@@ -644,6 +644,15 @@ runs on that app's host. The sweep takes only its own app's threads, since Linea
 app's sessions to each of them. Keep `dispatch.enabled` on one host only. Without activation
 routing, the label poll and project flow cannot see another host's agents.
 
+Automatic approvals are coordinated between the hosts: list each other in `reviewPeers`, because a
+host that asks its peers which one coordinates reads their `/api/inbox` `dispatch` field (always
+present). The host with `dispatch.enabled` grants them; the others ask it over the tailnet inbox
+channel and, when it cannot be found, times out, or more than one peer claims the role, keep the
+plan with the owner (`the approval coordinator could not be reached`) instead of approving alone.
+Every host answers `/api/approval-claims/<id>/holder` for its own claim records, with `503` while it
+cannot read them or before its claim requester has started; the coordinator's other
+`/api/approval-claims` routes answer `503` where dispatch is off.
+
 Tickets either host's app wrote count as yours: a host with an `activation.peer` asks the peer's
 authenticated `/activation/health` for its app user (`appUserId`) and trusts it like its own app,
 so tickets the other host's agents and planners file are not marked untrusted. The answer is kept
@@ -923,6 +932,22 @@ one that is done, is skipped with the reason, and a request never moves to a pla
 one it named. The ticket's `plan` label is removed once the approval's round has no newer request,
 and kept (or put back) when one arrives. A planner run gets its own work-order instructions (see
 **Projects** below).
+
+**Implementing an approved plan.** A launch that implements an approved plan (`plan-ready`, no newer
+replan request) first hears what moved since that plan was approved, so it does not code against
+work that already changed ([`server/related-work.ts`](server/related-work.ts) `changedSince`,
+[`server/starter.ts`](server/starter.ts) `sinceApprovalNote`). The cutoff is the plan's own approval
+instant, its earliest bound when the header is coarser. The note lists, newest first: every pull
+request of the team's open and done tickets merged since the cutoff whose files overlap the plan's
+(marked `merged <instant>`, with the overlapping paths), and every other ticket's approved plan
+whose footprint overlaps the plan's (`approved <instant>`, plus `done <instant>` for a finished
+ticket, with the files, `## Reach` places or tickets both name). It states the precedence rule
+above and what to do: where later implemented work contradicts the plan, adapt the details that
+leave the plan's acceptance criteria intact and say so in the final comment; otherwise stop before
+coding and ask you in a question request whether to re-plan, naming the ticket that wins. The pull
+request reads go through the same cache and limit as the candidate list. When the plan document or
+the check cannot be read, the note says the check could not run and asks the agent to compare with
+recent approvals and merged pull requests itself.
 
 **Reach and principles.** A decision made in one ticket should apply everywhere it belongs and not
 come back in the next one, so every plan carries two more sections before `## Risk and impact`, in
@@ -1240,6 +1265,62 @@ takes the higher of both ratings. For omp planners, `record_plan_advice` refuses
 readable section (or with `agreed`/`disagreements` but no advisor rating, or a `New rule` that
 disagrees with `## Principles and rules`) and tells the plugin which verdict was recorded for which
 plan text.
+
+The approval instant is recorded exactly: the `Plan: <ticket>` document's
+`> **Approved** in Plannotator on <date> UTC` header is written from the decision's timestamp with
+milliseconds (`2026-10-15 10:41:10.900 UTC`). Older headers without them cover the second, minute
+or day they name ([`server/review-outcome.ts`](server/review-outcome.ts) `approvalInterval`); a
+coarser header is never rounded down, so a plan approved somewhere in 10:41 is approved at the
+start of that minute for its own cutoff and at its end when it is somebody else's newer work.
+
+Nothing that overlaps the plan is approved on your behalf. Before approving, the policy reads the
+approved plans of other tickets approved since this plan's planning round began — the newest
+replan request delivered to the agent, or the agent's start — and turns each one that
+shares files, `## Reach` places or related tickets with this plan, or that names this ticket or is
+named by it, into a reason: `TUC-12's plan names the same files: server/x.ts`, also for shared
+places (`reaches the same places: …`) and tickets (`names the same tickets: …`). A read that fails
+gives `the related-work check failed` instead: the plan waits for you either way.
+
+**The approval coordinator.** Two hosts approving at the same time could both read Linear's
+approved plans before either wrote its document, so only one host approves automatically: the one
+with `dispatch.enabled` ([`server/approval-claims.ts`](server/approval-claims.ts)). A plan that
+passed every other check claims there before it is approved, by `POST /api/approval-claims` on the
+inbox server (behind the header the decision routes require) or in process on that host. The answer
+is `granted` only when no live grant and no approval since the planning round began, whether reported
+to the coordinator or shown by Linear, overlaps the plan — the same files, `## Reach` places or tickets, or
+both naming each other — and `denied` with the other ticket's own reason
+(`TUC-12's plan names the same files: server/x.ts`) otherwise. A ticket never overlaps itself: its
+earlier claim must settle before a re-plan claims, so two live approvals for one ticket cannot
+exist. A grant is written to `granted.json` before it is answered, and a repeated claim id gets that
+stored answer; a committed approval enters `ledger.json` before it leaves the grant table. A claim
+id is a uuid v7: one older than 30 days is `expired`, and a late retry never becomes a grant. A host
+that finds no coordinator, more than one peer answering `dispatch.enabled: true`, or no answer
+within the peer timeout keeps the plan with you: `the approval coordinator could not be reached`. A
+request that got no answer may still have been granted, so its id is resent every sweep until the
+coordinator answers; a late grant is then committed or given back like any other.
+Owner approvals take the same path from any host: the outbox entry is saved before the `Plan:`
+document is written, reported after it, and retried every sweep until the coordinator acknowledges
+it, so an approval is known before Linear's read shows it. It is reported with its whole footprint:
+the `/api/approval-claims` routes take bodies up to 512 KB on the inbox frontdoor and backend
+(every other route keeps 16 KB), while a claim names at most 300 files, 60 places and 60 tickets
+and a larger plan stays with you. A report the coordinator refuses outright (`400`, `413`) is
+logged and dropped, and Linear's read reports that approval from then on. The frontdoor forwards
+these routes as it forwards activation, writes behind the same header check, so it must be
+upgraded with this change (`tools/inbox-service-install.mjs install`, then `start`, on each host).
+A grant held an hour without a settlement or its own matching `Plan:` document raises one item on
+the ticket, **the automatic approval of TUC-N could not be confirmed**. Your answer makes the
+coordinator ask the requester's `/api/approval-claims/<id>/holder`; only a holder that no longer
+holds it (`none`, `unclear`, a withdrawal) releases the claim, while one still holding it, one that
+does not answer, and a closed ticket keep it blocking.
+An automatic approval counts from when it was settled, not from its grant, so a round that began
+while the grant was being written still sees it. A settled claim's answer (`answers.json`) is
+stored before its grant is removed: after a crash between the two, the claim id gets the stored
+answer and the next sweep removes the leftover grant, which blocks overlapping plans until then.
+The same plan claimed again from a newer review keeps its claim id and follows that review, so the
+older review's state no longer withdraws it. A plan longer than the `Plan:` document keeps
+(180,000 characters) is written truncated with a `> **Plan hash:**` header naming the whole plan,
+which is what a grant and a replan request compare against. On a plugin reload both sides close to
+new claims and finish the one in progress before the new plugin starts.
 
 It also refuses a ticket plan that does not follow the owner's plan layout
 ([`shared/plan-layout.ts`](shared/plan-layout.ts)). The layout is read at every record from

@@ -110,7 +110,7 @@ function cleanTitle(raw: string): string {
 }
 
 // The identifiers a line names, in order, without AC-N.
-const ticketRefs = (text: string): string[] => [...text.matchAll(TICKET_ID)].map((match) => match[0]);
+export const ticketRefs = (text: string): string[] => [...text.matchAll(TICKET_ID)].map((match) => match[0]);
 
 // The identifier a follow-up title defers to when it carries no finding of its own (README, "Reach
 // and principles"). It does when it is nothing but ticket identifiers, covered words and
@@ -138,7 +138,8 @@ function coveredFollowUp(title: string): string | null {
   return /^\W*(?:existing\s+tickets?|already\s+filed)\b/i.test(title) ? ids[0] : null;
 }
 
-function decisions(body: string): { place: string; kind: "include" | "follow-up" | "existing" | "n/a"; rest: string }[] {
+export type PlaceDecision = { place: string; kind: "include" | "follow-up" | "existing" | "n/a"; rest: string };
+export function decisions(body: string): PlaceDecision[] {
   return body.split("\n").flatMap((line) => {
     const match = DECISION.exec(line);
     return match ? [{ place: match[1].trim(), kind: match[2].toLowerCase() as "include" | "follow-up" | "existing" | "n/a", rest: match[3].trim() }] : [];

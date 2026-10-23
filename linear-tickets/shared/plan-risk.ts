@@ -138,7 +138,26 @@ export const DEFAULT_AUTO_APPROVE: AutoApprovePolicy = { enabled: true, maxImpac
 
 // What the plugin knows about the review besides the plan text. `verdict`: the advisor verdict the
 // omp extension recorded for exactly this text (null: none, so the rating is unverified).
-export type ReviewFacts = { verdict: string | null; untrusted: boolean; attended: boolean; waitsFor?: string[] };
+// `overlaps`: the approved plans of other tickets that overlap this one; `overlapCheckFailed`: the
+// related-work check could not run (no automatic approval either way).
+export type ReviewFacts = { verdict: string | null; untrusted: boolean; attended: boolean; waitsFor?: string[]; overlaps?: PlanOverlap[]; overlapCheckFailed?: boolean };
+
+// Another plan's footprint against this one (README, "Plan risk and auto-approval", "Related
+// work"): the files, places and tickets both name, and whether either names the other's ticket.
+// plan-footprint.ts computes it; the shape stays here so the reason text lives with the rule.
+export type FootprintMatch = { files: string[]; places: string[]; tickets: string[]; namesOther: boolean };
+export type PlanOverlap = FootprintMatch & { identifier: string };
+
+// What an overlap has in common, e.g. "names the same files: server/x.ts".
+export function overlapText(match: FootprintMatch): string {
+  return [
+    match.files.length ? `names the same files: ${match.files.join(", ")}` : "",
+    match.places.length ? `reaches the same places: ${match.places.join(", ")}` : "",
+    match.tickets.length ? `names the same tickets: ${match.tickets.join(", ")}` : "",
+    match.namesOther ? "names this ticket or is named by it" : "",
+  ].filter(Boolean).join("; ") || "names no file, place or ticket this plan does";
+}
+
 
 // Whether the plan is approved without the owner, and why (shown to the owner either way).
 export function autoApproval(risk: PlanRisk, policy: AutoApprovePolicy, facts: ReviewFacts): { approve: boolean; reasons: string[] } {
@@ -149,6 +168,8 @@ export function autoApproval(risk: PlanRisk, policy: AutoApprovePolicy, facts: R
     facts.untrusted ? "the ticket was not written by the owner" : "",
     facts.attended ? "the ticket is marked attended" : "",
     ...(facts.waitsFor ?? []).map((identifier) => `it waits for ${identifier}, still open`),
+    ...(facts.overlaps ?? []).map((other) => `${other.identifier}'s plan ${overlapText(other)}`),
+    facts.overlapCheckFailed ? "the related-work check failed" : "",
     facts.verdict === null ? "no advisor review was recorded for this plan text" : "",
     facts.verdict === "unavailable" || (facts.verdict !== null && !risk.advisor) ? "the advisor was unavailable" : "",
     facts.verdict === "disagreements" ? "the advisor review left open disagreements" : "",

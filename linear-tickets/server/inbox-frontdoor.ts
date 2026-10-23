@@ -5,7 +5,7 @@ import { z } from "zod";
 import { isActivationPath, MAX_ACTIVATION_BODY_BYTES } from "./activation";
 import { decisionPage } from "./decision-page";
 import { boardPage } from "./board-page";
-import { backendSecretPath, headerValue, INBOX_AUTH_HEADER, INBOX_BACKEND_PORT, INBOX_FRONTDOOR_PORT, INBOX_INSTANCE_HEADER, INBOX_DISPLAYED_HEADER, INBOX_PROTOCOL_VERSION, readBackendSecret, type InboxAvailability, type InboxBackendState, type InboxSnapshot } from "./inbox-transport";
+import { backendSecretPath, headerValue, INBOX_AUTH_HEADER, INBOX_BACKEND_PORT, INBOX_FRONTDOOR_PORT, INBOX_INSTANCE_HEADER, INBOX_DISPLAYED_HEADER, INBOX_PROTOCOL_VERSION, isApprovalClaimPath, MAX_CLAIM_BODY_BYTES, readBackendSecret, type InboxAvailability, type InboxBackendState, type InboxSnapshot } from "./inbox-transport";
 import { closedPage, inboxPage, MANIFEST, SERVICE_WORKER, type InboxView } from "./review-page";
 import { REVIEW_ICON_PNG } from "./review-icon";
 import type { DecisionView } from "../shared/decision-inbox";
@@ -163,13 +163,14 @@ class Frontdoor implements InboxFrontdoor {
       const chunks: Buffer[] = [];
       let size = 0;
       let refused = false;
-      const limit = isActivationPath(request.url ?? "") ? MAX_ACTIVATION_BODY_BYTES : MAX_BODY_BYTES;
+      const url = request.url ?? "";
+      const limit = isActivationPath(url) ? MAX_ACTIVATION_BODY_BYTES : isApprovalClaimPath(url) ? MAX_CLAIM_BODY_BYTES : MAX_BODY_BYTES;
       request.on("data", (chunk: Buffer) => {
         if (refused) return;
         size += chunk.length;
-        // The same limits the plugin serves: the activation routes keep their larger one. The
-        // refusal is written before the socket closes and the request is drained, so a caller
-        // streaming an oversize body reads the 413 instead of an opaque reset.
+        // The same limits the plugin serves: the activation and approval-claims routes keep their
+        // larger ones. The refusal is written before the socket closes and the request is drained,
+        // so a caller streaming an oversize body reads the 413 instead of an opaque reset.
         if (size > limit) {
           refused = true;
           response.writeHead(413, { connection: "close" }).end();
@@ -353,6 +354,15 @@ class Frontdoor implements InboxFrontdoor {
       if (refused) return refused;
       return this.forwardMutation(method, originForm, headers, body);
     }
+    // The approval coordinator's host-to-host protocol: its writes pass the same mutation guard and
+    // are forwarded once, without a displayed page's instance (a claim id makes a resend safe).
+    if (isApprovalClaimPath(path)) {
+      if (method !== "GET") {
+        const refused = this.mutationGuard(method, headers);
+        if (refused) return refused;
+      }
+      return this.forward("claim", method, originForm, headers, method === "GET" ? null : body);
+    }
     if (method !== "GET" && method !== "HEAD") return { status: 405, headers: { allow: "GET" } };
     if (path === "/" || path === "/decisions") return this.page(path);
     // The board shell is static: served here, outside the snapshot, so it survives a backend outage
@@ -508,7 +518,7 @@ class Frontdoor implements InboxFrontdoor {
     return null;
   }
 
-  private async forward(kind: "activation" | "read", method: string, target: string, headers: IncomingHttpHeaders, body: string | null): Promise<Answer> {
+  private async forward(kind: "activation" | "claim" | "read", method: string, target: string, headers: IncomingHttpHeaders, body: string | null): Promise<Answer> {
     const answer = await this.upstream(method, target, this.forwardHeaders(headers, { host: String(headers.host ?? this.publicHost) }), body === null ? null : Buffer.from(body, "utf8"), this.readDeadlineMs);
     if (!answer.response) {
       return json(503, { error: kind === "activation"
