@@ -30,9 +30,9 @@ export const CLAIM_SWEEP_MS = 60_000;
 export const RECONCILE_MS = 60_000;
 // How long a peer's `/api/inbox` answer is trusted for the coordinator lookup.
 export const COORDINATOR_TTL_MS = 60_000;
-// The review inbox's peer-read timeout. The inbox accepts 16 KB bodies, so a plan naming thousands
-// of entries goes to the owner instead of into a claim.
+// The review inbox's peer-read timeout.
 const PEER_TIMEOUT_MS = 4_000;
+// What an automatic claim may name; a larger plan goes to the owner instead of into a claim.
 const MAX_FILES = 300;
 const MAX_PLACES = 60;
 const MAX_TICKETS = 60;
@@ -85,12 +85,16 @@ export type ClaimIntent = {
   at: string;
 };
 
+const entry = z.string().min(1).max(MAX_ENTRY_CHARS);
 const FootprintBody = z.object({
-  files: z.array(z.string().min(1).max(MAX_ENTRY_CHARS)).max(MAX_FILES),
-  places: z.array(z.string().min(1).max(MAX_ENTRY_CHARS)).max(MAX_PLACES),
-  tickets: z.array(z.string().min(1).max(MAX_ENTRY_CHARS)).max(MAX_TICKETS),
-  ticket: z.string().min(1).max(MAX_ENTRY_CHARS).nullable(),
+  files: z.array(entry).max(MAX_FILES),
+  places: z.array(entry).max(MAX_PLACES),
+  tickets: z.array(entry).max(MAX_TICKETS),
+  ticket: entry.nullable(),
 });
+// An owner approval is recorded whole, bounded only by the route's body limit: leaving entries out
+// would let an overlapping plan be approved automatically.
+const OwnerFootprintBody = z.object({ files: z.array(z.string().min(1)), places: z.array(z.string().min(1)), tickets: z.array(z.string().min(1)), ticket: z.string().min(1).nullable() });
 const hash = z.string().regex(/^[0-9a-f]{64}$/);
 const identifier = z.string().min(1).max(100);
 const uuid = z.string().uuid().max(64);
@@ -100,7 +104,10 @@ export const ClaimBody = z.object({
   roundStartedAt: time, origin: z.string().url().max(500).nullable().optional(),
 }).strict();
 export const SettleBody = z.object({ claimId: uuid, state: z.enum(["committed", "withdrawn"]) }).strict();
-export const RecordBody = z.object({ issueId: z.string().min(1).max(200), identifier, planHash: hash, footprint: FootprintBody, approvedAt: time }).strict();
+export const RecordBody = z.object({ issueId: z.string().min(1).max(200), identifier, planHash: hash, footprint: OwnerFootprintBody, approvedAt: time }).strict();
+// `POST /api/approval-claims` (claim), `/settle` and `/record`; `GET /api/approval-claims/<id>` and
+// `/<id>/holder`.
+export const CLAIM_ROUTE = /^\/api\/approval-claims(?:\/(settle|record|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}))?(?:\/(holder))?\/?$/;
 const ClaimAnswerBody = z.object({ state: z.enum(["granted", "denied", "withdrawn", "committed", "expired"]), reason: z.string().max(500).optional(), other: z.string().max(100).optional() });
 const HolderBody = z.object({ claim: z.enum(["none", "claiming", "granted", "unclear"]), planHash: hash.optional() });
 // A peer's `/api/inbox` answer, read only for whether it is the approval coordinator. A peer from
@@ -498,6 +505,8 @@ export class ClaimRequests {
   // every terminal answer keep the plan with the owner.
   claim(input: Omit<ClaimIntent, "claimId" | "state" | "at">): Promise<ClaimAnswer> {
     return this.serial(async () => {
+      // The same bound in process and across hosts: a plan this large goes to the owner.
+      if (!FootprintBody.safeParse(input.footprint).success) return { state: "denied", reason: "the plan names more files, places or tickets than an automatic approval may", other: input.identifier };
       const now = this.deps.now?.() ?? Date.now();
       const existing = await this.read(input.issueId);
       let record: ClaimIntent;
@@ -686,15 +695,17 @@ export class ClaimRequests {
     } catch { return { state: "unreachable" }; }
   }
 
-  private async reportTo(origin: string, entry: OwnerApproval): Promise<boolean> {
+  // `refused` is a coordinator that will never take this report (400, 413): retrying cannot help, and
+  // its approval still reaches every check through Linear's read of committed approvals.
+  private async reportTo(origin: string, entry: OwnerApproval): Promise<"done" | "refused" | "retry"> {
     try {
       const response = await fetch(`${origin}/api/approval-claims/record`, {
         method: "POST", signal: AbortSignal.timeout(PEER_TIMEOUT_MS * 2),
         headers: { "content-type": "application/json", "x-review-action": "1" },
         body: JSON.stringify(entry),
       });
-      return response.ok;
-    } catch { return false; }
+      return response.ok ? "done" : response.status === 400 || response.status === 413 ? "refused" : "retry";
+    } catch { return "retry"; }
   }
 
   private async flushOnce(): Promise<void> {
@@ -703,10 +714,11 @@ export class ClaimRequests {
     const coordinator = await this.coordinator();
     if (!coordinator) return;
     for (const [key, entry] of Object.entries(entries)) {
-      const done = coordinator.kind === "local"
-        ? await coordinator.claims.record(entry).then(() => true, () => false)
+      const outcome = coordinator.kind === "local"
+        ? await coordinator.claims.record(entry).then(() => "done" as const, () => "retry" as const)
         : await this.reportTo(coordinator.origin, entry);
-      if (done) await this.outbox.update((current) => { delete current[key]; });
+      if (outcome === "refused") console.error(`[linear-tickets] the approval coordinator refused the owner approval of ${entry.identifier}; only Linear's read of approved plans reports it now`);
+      if (outcome !== "retry") await this.outbox.update((current) => { delete current[key]; });
     }
   }
 

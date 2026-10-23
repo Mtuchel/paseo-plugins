@@ -1299,7 +1299,13 @@ request that got no answer may still have been granted, so its id is resent ever
 coordinator answers; a late grant is then committed or given back like any other.
 Owner approvals take the same path from any host: the outbox entry is saved before the `Plan:`
 document is written, reported after it, and retried every sweep until the coordinator acknowledges
-it, so an approval is known before Linear's read shows it.
+it, so an approval is known before Linear's read shows it. It is reported with its whole footprint:
+the `/api/approval-claims` routes take bodies up to 512 KB on the inbox frontdoor and backend
+(every other route keeps 16 KB), while a claim names at most 300 files, 60 places and 60 tickets
+and a larger plan stays with you. A report the coordinator refuses outright (`400`, `413`) is
+logged and dropped, and Linear's read reports that approval from then on. The frontdoor forwards
+these routes as it forwards activation, writes behind the same header check, so it must be
+upgraded with this change (`tools/inbox-service-install.mjs install`, then `start`, on each host).
 A grant held an hour without a settlement or its own matching `Plan:` document raises one item on
 the ticket, **the automatic approval of TUC-N could not be confirmed**. Your answer makes the
 coordinator ask the requester's `/api/approval-claims/<id>/holder`; only a holder that no longer

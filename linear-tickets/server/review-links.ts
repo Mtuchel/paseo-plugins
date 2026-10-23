@@ -9,7 +9,7 @@ import { isActivationPath, MAX_ACTIVATION_BODY_BYTES, type ActivationRoute } fro
 import { DecisionPendingError, FencedError, StaleResolutionError, type ApplyingEntry, type ResolveAction } from "./decision-journal";
 import { FUNNEL_PORT } from "./funnel";
 import { InboxBackend, type InboxBackendOptions } from "./inbox-backend";
-import { INBOX_BACKEND_PORT, INBOX_DISPLAYED_HEADER } from "./inbox-transport";
+import { INBOX_BACKEND_PORT, INBOX_DISPLAYED_HEADER, isApprovalClaimPath, MAX_CLAIM_BODY_BYTES } from "./inbox-transport";
 import { plannotatorPaths, readReviewPlan, type OpenedEvent } from "./plannotator";
 import { ReviewBundles } from "./review-bundle";
 import { REVIEW_ICON_PNG } from "./review-icon";
@@ -23,7 +23,7 @@ import { ReviewDeletions } from "./review-deletions";
 import { type RepairExclusion, withEffect } from "./repair-exclusion";
 import type { ReviewIssueInfo } from "./review-issue-info";
 import type { PipelineReview } from "./plan-pipeline";
-import { ClaimBody, RecordBody, SettleBody, type ApprovalClaims, type HolderAnswer } from "./approval-claims";
+import { CLAIM_ROUTE, ClaimBody, RecordBody, SettleBody, type ApprovalClaims, type HolderAnswer } from "./approval-claims";
 import { withPriority } from "./rate-budget";
 import { ReviewClosedError } from "./sessions";
 
@@ -218,9 +218,6 @@ const ResolveRequest = z.object({ entryId: z.string().min(1).max(200), action: z
 const RecheckRequest = z.object({ reviewId: ReviewId, backendInstanceId: BackendInstanceId }).strict();
 const DeleteRequest = z.object({ identifier: z.string(), reviewId: ReviewId, backendInstanceId: BackendInstanceId }).strict();
 const ErrorAnswer = z.object({ error: z.string(), outcomeUnknown: z.boolean().optional() });
-// The approval coordinator's routes (README, "Plan risk and auto-approval"): the collection, its
-// `settle` and `record` writes, one claim's status and one claim's holder record.
-const CLAIM_ROUTE = /^\/api\/approval-claims(?:\/(settle|record|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}))?(?:\/(holder))?\/?$/;
 type PeerInboxSnapshot = { peer: string; host: string; pipeline: HostPipeline } & (
   | { backendInstanceId?: string; appUserId?: string | null; dispatch: boolean; open: InboxRow[]; decided: InboxRow[]; applying: InboxRow[] }
   | { unreachable: true; applying: InboxRow[] }
@@ -368,9 +365,11 @@ export class ReviewLinks {
       const server = createServer((request, response) => {
         const chunks: Buffer[] = [];
         let size = 0;
-        // The activation protocol carries a whole prompt and a handover note, so its routes have
-        // their own (larger) limit; every other route keeps the small one.
-        const limit = isActivationPath(request.url ?? "") ? MAX_ACTIVATION_BODY_BYTES : MAX_BODY_BYTES;
+        // The activation protocol carries a whole prompt and a handover note, and an owner approval
+        // reported to the approval coordinator its whole footprint, so those routes have their own
+        // (larger) limits; every other route keeps the small one.
+        const url = request.url ?? "";
+        const limit = isActivationPath(url) ? MAX_ACTIVATION_BODY_BYTES : isApprovalClaimPath(url) ? MAX_CLAIM_BODY_BYTES : MAX_BODY_BYTES;
         request.on("data", (chunk: Buffer) => {
           size += chunk.length;
           if (size > limit) { response.writeHead(413).end(); request.destroy(); return; }

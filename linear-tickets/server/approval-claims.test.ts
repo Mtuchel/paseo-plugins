@@ -183,6 +183,16 @@ test("AC-18: plans that share nothing are both granted, and the coordinator does
   });
 });
 
+test("AC-18: a plan naming more than a claim may goes to the owner in process as across hosts", async () => {
+  await withWorld(async (world) => {
+    const one = world.ticket("TUC-1");
+    world.setLocal(world.claims());
+    const large = `# Plan\n\n${Array.from({ length: 301 }, (_, index) => `${index + 1}. Change \`server/module-${index}.ts\`.`).join("\n")}\n`;
+    assert.equal((await world.claim(world.requester({ directory: join(world.root, "first") }), one, large)).state, "denied");
+    assert.equal(await world.file(join(world.root, "first"), `${one.issueId}.json`), null, "nothing is held for it");
+  });
+});
+
 test("AC-18: a grant is committed by its own approved document, never by an older one, and the ledger then blocks without Linear", async () => {
   await withWorld(async (world) => {
     const one = world.ticket("TUC-1"), five = world.ticket("TUC-5");
@@ -553,6 +563,29 @@ test("AC-18: a requester on another host claims through the real inbox route, wh
       const refused = await fetch(`${origin}/api/approval-claims`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(world.request(one, X)) });
       assert.equal(refused.status, 403);
       assert.deepEqual(await (await fetch(`${origin}/api/approval-claims/${claimId}`)).json(), { state: "granted" });
+    } finally { links.stop(); }
+  });
+});
+
+test("AC-18: an owner approval naming more than a claim may is recorded whole through the real inbox route", async () => {
+  await withWorld(async (world) => {
+    const three = world.ticket("TUC-3"), five = world.ticket("TUC-5");
+    const claims = world.claims();
+    const links = new ReviewLinks({
+      port: 0, proxyPort: 0, file: join(world.root, "reviews.json"), sweepMs: 3_600_000, alive: async () => false, origin: async () => null,
+      claims: async () => claims, dispatch: async () => true, holder: async () => ({ claim: "none" }),
+    });
+    await links.start();
+    try {
+      const peers = [`http://127.0.0.1:${links.listeningPort}`];
+      const large = `# Plan\n\n${Array.from({ length: 1_000 }, (_, index) => `${index + 1}. Change \`server/module-${index}.ts\`.`).join("\n")}\n`;
+      const owner = world.requester({ directory: join(world.root, "owner"), local: async () => null, peers });
+      await owner.ownerApproval({ issueId: three.issueId, identifier: three.identifier, plan: large, approvedAt: new Date(world.clock.now()).toISOString() });
+      await owner.flushOwnerApprovals();
+      assert.deepEqual(await world.file(join(world.root, "owner"), "outbox.json"), {}, "the coordinator acknowledged the report");
+      const last = "# Plan\n\n1. Change `server/module-999.ts`.\n";
+      const second = world.requester({ directory: join(world.root, "second"), local: async () => null, peers, origin: "http://127.0.0.1:49999" });
+      assert.equal((await world.claim(second, five, last)).state, "denied", "the approval's last file still blocks an overlapping plan");
     } finally { links.stop(); }
   });
 });
