@@ -126,6 +126,18 @@ function failedChecks(view: PullRequestView): PullRequestView["checks"] {
   return view.checks.filter((check) => check.state === "failed" && check.name !== QUEUE_CHECK);
 }
 
+// Whether a recorded check signature (pr-watch.ts `Seen.ci`: sorted [name, state, conclusion]
+// triples on the head) has a failing check the agent can fix, by the same rule as `red` above.
+export function recordedCiFails(ci: string | null | undefined): boolean {
+  if (!ci) return false;
+  try {
+    const checks: unknown = JSON.parse(ci);
+    return Array.isArray(checks) && checks.some((check) => Array.isArray(check) && check[1] === "failed" && check[0] !== QUEUE_CHECK);
+  } catch {
+    return false;
+  }
+}
+
 // Each reviewer's latest decisive review counts (a dismissed one reads DISMISSED), on any commit:
 // new commits do not settle a change request, the reviewer does.
 function changeRequests(view: PullRequestView): PullRequestView["reviews"] {

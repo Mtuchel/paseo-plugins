@@ -21,6 +21,7 @@ import { EXCLUSION_CLOSED_MESSAGE, REPAIR_BUSY_MESSAGE, RepairBusyError } from "
 import type { ReviewDeletions } from "./review-deletions";
 import { RESPONSIBILITY_GRACE_MS, type ResponsibilityCheck, type ResponsibilityTicket } from "./responsibility";
 import { AWAY_REASON } from "./scheduler";
+import { recordedCiFails } from "./pr-nudge";
 import type { HostOwnership, RestartResult, SessionRouter, Succession } from "./sessions";
 import type { PluginSettings, Settings } from "./settings";
 import { classifyTicketAgents, issueAgents, WAITING_PLAN_REASON, type TicketStarter } from "./starter";
@@ -1850,15 +1851,19 @@ export class Steward {
     if (!pull) return { state: "failed", reason: "no pull request to continue", permanent: true };
     const now = this.clock();
     const record = (await this.deps.handover.all()).find((item) => item.issueId === issue.id) ?? null;
-    const lead = facts.openPulls.some((entry) => entry.url === pull!.url) ? successorText(issue.identifier, pull) : replayText(issue.identifier, pull, record?.worktreePath ?? null);
+    const open = facts.openPulls.some((entry) => entry.url === pull!.url);
+    const lead = open ? successorText(issue.identifier, pull) : replayText(issue.identifier, pull, record?.worktreePath ?? null);
     const attempt = facts.restarts + 1;
     await this.deps.store.update((file) => {
       const ticket = this.deps.store.ticket(file, issue.id, issue.identifier, this.iso(now));
       ticket.restarts = [...recent(ticket.restarts, now), this.iso(now)];
     });
+    // A closed pull request is replayed; an open one whose recorded checks fail is a CI repair. A
+    // green open one is the ticket's plain continuation and carries no repair label.
+    const repair = !open ? "replay" : recordedCiFails(pull.ci) ? "ci" : null;
     const result: Succession = await this.deps.sessions.succeed(issue.id, issue.identifier, record?.agentId ?? null, lead, async () => {
       console.log(`[linear-tickets] ${issue.identifier}: steward: successor ${attempt} of ${RESTART_CAP}`);
-    }).catch((error: unknown): Succession => ({ kind: "impossible", reason: message(error) }));
+    }, repair).catch((error: unknown): Succession => ({ kind: "impossible", reason: message(error) }));
     if (result.kind === "wait" || result.kind === "impossible") {
       const reason = result.kind === "wait" ? `the successor waits: ${result.reason}` : `no successor can start: ${successionReason(result)}`;
       if (result.kind === "wait" && queueWait(result.reason)) {

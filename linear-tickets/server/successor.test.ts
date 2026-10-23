@@ -13,7 +13,7 @@ import { Dispatcher } from "./dispatch";
 import { Handover } from "./handover";
 import { Launcher, LEAD_INTRO, type ResumeTarget } from "./launch";
 import type { AdmissionState, IssueCore, IssueState, LabeledIssue } from "./linear";
-import { SessionRouter, SessionStore, type HostOwnership, type SessionLink, type Succession } from "./sessions";
+import { REPAIR_LABEL, SessionRouter, SessionStore, type HostOwnership, type SessionLink, type Succession } from "./sessions";
 import { DEFAULT_WORKTREE_SHARDS, DEFAULT_ACTIVATION, DEFAULT_BACKSTOP, DEFAULT_DISPATCH, DEFAULT_WRITEBACK, DEFAULT_WATCHDOG, DEFAULT_STEWARD, DEFAULT_DEPUTY, type PluginSettings } from "./settings";
 import { ResumeUnavailableError, TicketStarter, runningTicketAgents, type Started } from "./starter";
 import { REPAIR_BUSY_MESSAGE, RepairBusyError, RepairExclusion } from "./repair-exclusion";
@@ -674,7 +674,7 @@ test("an imported resume continues only the exact recorded commit; dirty work, a
 
 // --- Composed: real Launcher + real TicketStarter + real SessionRouter -------------------------
 
-test("the claimed instruction is the last part of the created agent's first prompt, on the recorded worktree", async () => {
+test("the claimed instruction is the last part of the created agent's first prompt, on the recorded worktree, labelled with its repair", async () => {
   const worktree = await mkdtemp(join(tmpdir(), "paseo-successor-worktree-"));
   const directory = await mkdtemp(join(tmpdir(), "paseo-successor-handover-"));
   try {
@@ -702,7 +702,7 @@ test("the claimed instruction is the last part of the created agent's first prom
     });
     Object.assign(router, { paseo: daemon.paseo });
 
-    const succession: Succession = await router.succeed(ISSUE.id, ISSUE.identifier, "agent-gone", "The pull request's checks fail now.", async () => { calls.push("claim"); });
+    const succession: Succession = await router.succeed(ISSUE.id, ISSUE.identifier, "agent-gone", "The pull request's checks fail now.", async () => { calls.push("claim"); }, "ci");
     assert.equal(succession.kind, "started");
     assert.deepEqual(calls, ["claim"]);
     assert.equal(daemon.created.length, 1);
@@ -710,6 +710,8 @@ test("the claimed instruction is the last part of the created agent's first prom
     assert.ok(created.prompt?.endsWith(`${LEAD_INTRO}\n\nThe pull request's checks fail now.`), `lead is the last part of the prompt:\n${created.prompt?.slice(-200)}`);
     assert.match(created.prompt ?? "", /continuing work on Linear ticket TUC-1/);
     assert.equal(created.env?.LINEAR_TICKETS_ISSUE, ISSUE.identifier);
+    assert.equal(created.labels?.[REPAIR_LABEL], "ci", "the board's repair slot reads why the successor runs");
+    assert.equal(created.labels?.["linear.issueId"], ISSUE.id, "the repair successor is the ticket's agent, not a second role");
     assert.deepEqual(daemon.sources[0].source, { kind: "directory", projectId: "p1", path: worktree }, "the recorded worktree is reopened, not a new one");
     assert.equal((await handover.read(ISSUE.id))?.agentId, "agent-created-1", "the record moved to the created agent");
     assert.deepEqual((await handover.read(ISSUE.id))?.status, "working");

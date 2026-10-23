@@ -2338,6 +2338,15 @@ comment mentioning you. The same happens for a pull request labelled `do-not-mer
 start (the plugin stops in that second) loses the message: the log names the claim, and it is not
 repeated.
 
+**Repair label.** A successor started because the pull request is broken carries the agent label
+`linear-tickets.repair=<kind>`, so boards and `paseo ls` can tell repair work from ordinary work:
+`ci` (failing checks, the merge queue's own check not counted), `conflict`, `draft`, `changes`
+(changes requested), `findings` (unresolved review threads), `drop` (dropped from the merge
+queue) and `replay` (closed without merging; its work is replayed onto a new pull request). The
+steward's successor for an open pull request whose recorded checks fail is labelled `ci`, one
+for a closed pull request `replay`. A crash successor, a policy message and a successor that only
+continues a green pull request carry no repair label.
+
 **Native process ownership.** `CLOSED`, archive and a closed-process error do not prove an OMP
 worker exited. Native thread starts, automatic resumes, successor dispatch
 and recovery prompts check all same-ticket root snapshots, including archived ones, while

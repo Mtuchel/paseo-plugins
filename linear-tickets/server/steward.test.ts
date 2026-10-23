@@ -934,6 +934,25 @@ test("a successor continues the pull request that is still open, not a stale one
   assert.doesNotMatch(leads[0], /3868/, "the closed pull request is not the successor's work");
 });
 
+test("a steward successor is labelled a CI repair only while the open pull request's recorded checks fail", async (t) => {
+  const url = "https://github.com/o/r/pull/7";
+  for (const [ci, expected] of [['[["Graphite / mergeability_check","failed","failure"],["unit","failed","failure"]]', "ci"], ['[["Graphite / mergeability_check","failed","failure"],["unit","passed","success"]]', null], [null, null]] as const) {
+    const repairs: (string | null)[] = [];
+    const f = await passFixture(t, {
+      issues: [ticketIssue()],
+      records: [recordFor("i1", "ENG-1", [url])],
+      pullStates: new Map([[url, pull(url, { ci })]]),
+      succeed: async (...args: Parameters<SessionRouter["succeed"]>) => {
+        repairs.push(args[5] ?? null);
+        return { kind: "started", agent: { id: "a10", title: null, cwd: "" } };
+      },
+    });
+    await f.seed("i1", "ENG-1", { situation: "open-pr", since: at(60) });
+    await f.pass();
+    assert.deepEqual(repairs, [expected], `ci ${ci}: the queue check alone is no repair the agent can do`);
+  }
+});
+
 test("a verdict never starts a successor beside a deliberate wait", async (t) => {
   const url = "https://github.com/o/r/pull/7";
   const f = await passFixture(t, {
