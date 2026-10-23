@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
 import { z } from "zod";
 import { githubCli } from "./github-cli";
+import { loadProbe } from "./load-probe";
 import { githubUsage } from "./github-usage";
 import type { GreptileOutage, RetriggerResult } from "./greptile-outage";
 import { CONTEXT_TOO_LARGE } from "./context";
@@ -1488,7 +1489,7 @@ export class PullRequestWatch {
   // per pool); unsaved records are retried on the next poll. One poll at a time: a tick while the
   // last one still runs joins it. Each poll and backstop run is one run of the GitHub usage meter.
   poll(): Promise<void> {
-    this.running ??= this.exclusive(() => withPriority("background", "pr-watch", () => githubUsage.run("pr-watch", () => this.watch()))).finally(() => { this.running = null; });
+    this.running ??= this.exclusive(() => loadProbe.time("pr-watch", () => withPriority("background", "pr-watch", () => githubUsage.run("pr-watch", () => this.watch())))).finally(() => { this.running = null; });
     return this.running;
   }
 
@@ -1537,7 +1538,7 @@ export class PullRequestWatch {
 
   // One queue backstop run at a time (see queueBackstop); a tick while one runs joins it.
   backstop(): Promise<void> {
-    this.backstopping ??= this.exclusive(() => withPriority("background", "queue backstop", () => githubUsage.run("queue backstop", () => this.queueBackstop()))).finally(() => { this.backstopping = null; });
+    this.backstopping ??= this.exclusive(() => loadProbe.time("queue-backstop", () => withPriority("background", "queue backstop", () => githubUsage.run("queue backstop", () => this.queueBackstop())))).finally(() => { this.backstopping = null; });
     return this.backstopping;
   }
 
