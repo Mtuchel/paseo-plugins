@@ -1582,8 +1582,10 @@ export class LinearService {
 
   // The tickets the steward reconciles (steward.ts): one read per filter — the teams' open tickets
   // with any Paseo label, those delegated to a Paseo app, the teams' tickets in the `states` asked
-  // for (the plan-stages migration), and the tracked ids (any state) — merged by id, every page. A
-  // ticket Linear does not return is missing from the result; the caller then keeps no state for it.
+  // for (the plan-stages migration) — then the tracked ids (any state) those reads did not return,
+  // merged by id, every page. A tracked ticket a filter already returned is not read again by id:
+  // it is the same query, so the second copy would carry the same facts. A ticket Linear does not
+  // return is missing from the result; the caller then keeps no state for it.
   // `queueBlockers`: every one of those filters asks for the queue-blocker alerts only
   // (queueBlockerFilter ANDs in), so that pass reads its tickets in the same one query per filter.
   async stewardIssues(input: { teamKeys: string[]; labels: string[]; appIds: string[]; ids: string[]; states?: string[]; queueBlockers?: boolean }): Promise<StewardIssue[]> {
@@ -1594,29 +1596,32 @@ export class LinearService {
       ...input.teamKeys.length && input.appIds.length ? [{ ...stewardDelegateFilter(input.appIds, input.teamKeys), ...blockers }] : [],
       ...input.teamKeys.length && input.states?.length ? [{ ...stewardStateFilter(input.states, input.teamKeys), ...blockers }] : [],
     ];
-    const ids = [...new Set(input.ids)].sort();
-    for (let start = 0; start < ids.length; start += STEWARD_IDS_BATCH) filters.push({ id: { in: ids.slice(start, start + STEWARD_IDS_BATCH) }, ...blockers });
-    for (const filter of filters) {
-      let after: string | null = null;
-      for (let pageNumber = 0; ; pageNumber++) {
-        if (pageNumber >= STEWARD_MAX_PAGES) throw new Error(`The steward read took more than ${STEWARD_MAX_PAGES} pages of ${STEWARD_PAGE} tickets.`);
-        const data = record(await this.read(STEWARD_ISSUES_QUERY, { first: STEWARD_PAGE, after, filter }));
-        const page = record(data.issues ?? {});
-        for (const node of connection(page).nodes.map((item) => record(item))) {
-          const children = stewardChildren(node);
-          const issue = parseStewardIssue(node, children);
-          if (!issue) continue;
-          found.set(issue.id, issue);
-          // A ticket whose sub-issues ran past the first page: read the rest before the pass judges
-          // it, so a truncated list never looks like a parent whose children all finished.
-          if (!children.complete) await this.stewardChildPages(issue, children.cursor);
-        }
-        const info = record(page.pageInfo ?? {});
-        after = info.hasNextPage === true && label(info.endCursor) ? label(info.endCursor) : null;
-        if (!after) break;
-      }
-    }
+    for (const filter of filters) await this.stewardPages(filter, found);
+    const ids = [...new Set(input.ids)].filter((id) => !found.has(id)).sort();
+    for (let start = 0; start < ids.length; start += STEWARD_IDS_BATCH) await this.stewardPages({ id: { in: ids.slice(start, start + STEWARD_IDS_BATCH) }, ...blockers }, found);
     return [...found.values()];
+  }
+
+  // Every page of one steward filter, into `found` by id.
+  private async stewardPages(filter: Record<string, unknown>, found: Map<string, StewardIssue>): Promise<void> {
+    let after: string | null = null;
+    for (let pageNumber = 0; ; pageNumber++) {
+      if (pageNumber >= STEWARD_MAX_PAGES) throw new Error(`The steward read took more than ${STEWARD_MAX_PAGES} pages of ${STEWARD_PAGE} tickets.`);
+      const data = record(await this.read(STEWARD_ISSUES_QUERY, { first: STEWARD_PAGE, after, filter }));
+      const page = record(data.issues ?? {});
+      for (const node of connection(page).nodes.map((item) => record(item))) {
+        const children = stewardChildren(node);
+        const issue = parseStewardIssue(node, children);
+        if (!issue) continue;
+        found.set(issue.id, issue);
+        // A ticket whose sub-issues ran past the first page: read the rest before the pass judges
+        // it, so a truncated list never looks like a parent whose children all finished.
+        if (!children.complete) await this.stewardChildPages(issue, children.cursor);
+      }
+      const info = record(page.pageInfo ?? {});
+      after = info.hasNextPage === true && label(info.endCursor) ? label(info.endCursor) : null;
+      if (!after) return;
+    }
   }
 
   // The rest of one ticket's sub-issues, page by page, after the first page STEWARD_ISSUES_QUERY
