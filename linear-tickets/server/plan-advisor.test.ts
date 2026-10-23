@@ -437,7 +437,8 @@ test("omp ticket agents get the linear_ticket tools, run through the plugin's se
       method: "POST", headers: { authorization }, body: JSON.stringify({ query, variables }), signal,
     }) });
   await broker.start();
-  const server = ticketMcpServer(await writeTicketMcpScript(root), "ticket-1", root);
+  const script = await writeTicketMcpScript(root);
+  const server = ticketMcpServer(script, "ticket-1", root);
   process.env.LINEAR_TICKETS_MCP = JSON.stringify({ ...server, env: { LINEAR_API_KEY: "k" } });
   const tools: (Tool & { loadMode?: string })[] = [];
   const field = (): object => ({ describe: field, optional: () => ({}) });
@@ -450,6 +451,15 @@ test("omp ticket agents get the linear_ticket tools, run through the plugin's se
     assert.equal(posted.posted, true);
     assert.deepEqual(calls.at(-1)?.variables, { input: { issueId: "other-1", body: "FYI" } });
     await assert.rejects(mounted.linear_ticket_set_status.execute("c2", { issue: "ENG-7", status: "Todo" }), /ENG-7 is neither this agent's ticket nor an issue it created/);
+    // A recovery diagnostic's gate refuses `write`, so its verdict cannot go through an xd://
+    // device: a verifier's server mounts every tool it lists, steward_verdict included, as direct.
+    process.env.LINEAR_TICKETS_MCP = JSON.stringify({ ...ticketMcpServer(script, "ticket-1", root, undefined, "marker-1"), env: { LINEAR_API_KEY: "k" } });
+    const verifier: (Tool & { loadMode?: string })[] = [];
+    extension({ on: () => {}, events: { emit: () => {} }, appendEntry: () => {}, sendMessage: () => {}, registerTool: (tool: Tool) => { verifier.push(tool); }, zod: { object: () => ({}), string: field, number: field, enum: field } } as never);
+    assert.deepEqual(verifier.filter((tool) => tool.name.startsWith("linear_ticket_")).map((tool) => `${tool.name}:${tool.loadMode}`).sort(), [
+      "linear_ticket_get_comments:essential", "linear_ticket_get_issue:essential", "linear_ticket_get_ticket:essential",
+      "linear_ticket_search_issues:essential", "linear_ticket_steward_verdict:essential",
+    ]);
   } finally {
     delete process.env.LINEAR_TICKETS_MCP;
     await broker.stop();
