@@ -5,7 +5,7 @@ import type { RpcInput } from "@getpaseo/plugin";
 import type { launchAgentRpc, TicketDetail } from "../shared/contracts";
 import { Dispatcher, type GroupHandoff } from "./dispatch";
 import { Launcher } from "./launch";
-import { MISSED_REACH_NOTE, MODEL_NOTE, OVERLAP_NOTE, QUESTIONS_NOTE, TicketStarter, WAITING_PLAN_REASON } from "./starter";
+import { MISSED_REACH_NOTE, MODEL_NOTE, RELATED_WORK_NOTE, QUESTIONS_NOTE, TicketStarter, WAITING_PLAN_REASON } from "./starter";
 import { advisorNote, PLAN_REQUIRED_NOTE, PLAN_SECTIONS_NOTE, PLAN_SLICING_NOTE } from "./plan-policy";
 import { RepairBusyError } from "./repair-exclusion";
 import type { IssueGroup, LabeledIssue } from "./linear";
@@ -106,7 +106,7 @@ test("a labeled ticket is claimed before its agent launches, and is not launched
   assert.equal(launches.length, 1);
   assert.deepEqual(launches[0], {
     id: "eng-1", projectId: "p1", baseBranch: "refs/heads/dev", provider: "claude/opus", modeId: "plan", thinkingOptionId: undefined,
-    instructions: `${PLAN_REQUIRED_NOTE}\n\n${OVERLAP_NOTE}\n\n${PLAN_SECTIONS_NOTE}\n\n${PLAN_SLICING_NOTE}\n\n${MODEL_NOTE}\n\n${advisorNote("claude")}\n\n${MISSED_REACH_NOTE}\n\n${QUESTIONS_NOTE}`, markInProgress: false, requestId: launches[0].requestId,
+    instructions: `${PLAN_REQUIRED_NOTE}\n\n${RELATED_WORK_NOTE}\n\n${PLAN_SECTIONS_NOTE}\n\n${PLAN_SLICING_NOTE}\n\n${MODEL_NOTE}\n\n${advisorNote("claude")}\n\n${MISSED_REACH_NOTE}\n\n${QUESTIONS_NOTE}`, markInProgress: false, requestId: launches[0].requestId,
   });
   assert.deepEqual(linear.writes.slice(1, 3), ["-paseo eng-1", "+paseo-running eng-1"]);
   assert.deepEqual([...linear.labels.get("eng-1")!].sort(), ["bug", "paseo-running"]);

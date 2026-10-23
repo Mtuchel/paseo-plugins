@@ -1,4 +1,4 @@
-// The candidate list (README, "Overlap check"): one markdown snapshot of a team's work that every
+// The candidate list (README, "Related work"): one markdown snapshot of a team's work that every
 // planner of the team reads from its context file instead of searching Linear on its own. Built when
 // a planner starts, at most once per team every CANDIDATE_TTL_MS, at background priority.
 

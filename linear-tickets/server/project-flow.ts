@@ -22,6 +22,7 @@ import { activeModel } from "./model";
 import { candidates, normalizeModel } from "../shared/model-fallbacks";
 import { availability, LIMIT_DAY, LIMIT_SPACING, limitError, limitSchedule, limitTime, type UsageReader } from "./limit-resume";
 import { PLAN_APPROVED_STATE, planStage } from "./plan-policy";
+import { orderLine, parseOrder } from "../shared/work-order";
 
 // Projects carrying the trigger label move forward on their own (README, "Projects"):
 // 1. Whenever a project has had unplanned tickets long enough, the plugin starts a planner run of
@@ -265,58 +266,6 @@ export class ProjectStore {
       await rename(temporary, this.path);
     } finally { await rm(temporary, { force: true }); }
   }
-}
-
-// One line of the planner's `project-order` block.
-export type OrderStep = { kind: "blocks"; blocker: string; blocked: string }
-  | { kind: "duplicates" | "relates"; ticket: string; other: string; reason: string }
-  | { kind: "hold" | "release" | "attended" | "unattended"; ticket: string; reason: string };
-
-const TICKET = "[A-Z][A-Z0-9]*-\\d+";
-// A reason may follow the tickets after `:`, `(`, `#` or a dash, and a line may end in a period;
-// anything else (`and TUC-3`, a list) makes the line unreadable rather than half-read.
-const BLOCKS_LINE = new RegExp(`^(${TICKET})\\s+blocks\\s+(${TICKET})\\s*(?:\\.?$|[:(#]|[—–-]\\s)`, "i");
-const LINK_LINE = new RegExp(`^(${TICKET})\\s+(duplicates|relates\\s+to)\\s+(${TICKET})\\s*(?:\\.?$|[:—–-]\\s*(.*)$)`, "i");
-const MARK_LINE = new RegExp(`^(hold|release|attended|unattended)\\s+(${TICKET})\\s*(?:\\.?$|[:—–-]\\s*(.*)$)`, "i");
-
-function orderBlock(plan: string): string | null {
-  return /```project-order\s*\n([\s\S]*?)```/i.exec(plan)?.[1] ?? null;
-}
-
-function orderLines(block: string): string[] {
-  return block.split("\n").map((item) => item.replace(/^\s*[-*]\s*/, "").trim()).filter(Boolean);
-}
-
-function orderStep(line: string): OrderStep | null {
-  const blocks = BLOCKS_LINE.exec(line);
-  if (blocks) return { kind: "blocks", blocker: blocks[1].toUpperCase(), blocked: blocks[2].toUpperCase() };
-  const link = LINK_LINE.exec(line);
-  if (link) return { kind: link[2].toLowerCase() === "duplicates" ? "duplicates" : "relates", ticket: link[1].toUpperCase(), other: link[3].toUpperCase(), reason: (link[4] ?? "").trim() };
-  const mark = MARK_LINE.exec(line);
-  return mark ? { kind: mark[1].toLowerCase() as "hold" | "release" | "attended" | "unattended", ticket: mark[2].toUpperCase(), reason: (mark[3] ?? "").trim() } : null;
-}
-
-// The approved plan's ```project-order block: `TUC-1 blocks TUC-2`, `TUC-3 duplicates TUC-9: reason`,
-// `TUC-4 relates to TUC-8: reason`, `hold TUC-3: reason`, `release TUC-4`, `attended TUC-5: reason`,
-// `unattended TUC-6`. Unreadable lines are left out (see `orderProblems`).
-export function parseOrder(plan: string): OrderStep[] {
-  return orderLines(orderBlock(plan) ?? "").map(orderStep).filter((step): step is OrderStep => step !== null);
-}
-
-// Why a submitted work order cannot be applied as written: no ```project-order block, or lines in
-// it that are not one change each. Empty when it can (an empty block is an order with no changes).
-export function orderProblems(plan: string): string[] {
-  const block = orderBlock(plan);
-  if (block === null) return ["The plan has no ```project-order block."];
-  return orderLines(block).filter((line) => !orderStep(line)).map((line) => `Not one work-order change: "${line}"`);
-}
-
-function orderLine(step: OrderStep): string {
-  if (step.kind === "blocks") return `${step.blocker} blocks ${step.blocked}`;
-  const reason = step.reason ? `: ${step.reason}` : "";
-  if (step.kind === "duplicates") return `${step.ticket} duplicates ${step.other}${reason}`;
-  if (step.kind === "relates") return `${step.ticket} relates to ${step.other}${reason}`;
-  return `${step.kind} ${step.ticket}${reason}`;
 }
 
 type Deps = {

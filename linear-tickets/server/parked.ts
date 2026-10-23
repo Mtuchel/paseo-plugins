@@ -27,6 +27,9 @@ export type ParkedPlan = {
   parkedAt: string;
   announced: boolean;
   staged?: boolean;
+  // When the planning round that produced this plan began (a replan request's time, or the agent's
+  // creation): a request older than it was answered by this plan (README, "Related work").
+  roundStartedAt?: string | null;
   // The responsibility check's repair that parked this plan again (README, "Responsibility
   // check"); absent on an ordinary parked plan.
   responsibilityRepairId?: string;

@@ -913,6 +913,26 @@ export const CREATE_COMMENT_QUERY = `mutation comment($input: CommentCreateInput
 export const COMMENT_BY_ID_QUERY = `query commentById($id: String!) {
   comment(id: $id) { id body }
 }`;
+// A replan request on a ticket (server/plan-relations.ts writes it, server/plan-requests.ts reads
+// it): an app comment carrying the `<!-- replan-op: -->` marker.
+export const REPLAN_COMMENTS_QUERY = `query replanComments($id: String!, $since: DateTimeOrDuration!, $after: String) {
+  issue(id: $id) {
+    comments(first: 100, after: $after, filter: { body: { contains: "<!-- replan-op:" }, createdAt: { gte: $since } }) {
+      nodes { id body createdAt user { id } }
+      pageInfo { hasNextPage endCursor }
+    }
+  }
+}`;
+export type ReplanComment = { id: string; at: string; authorId: string | null; body: string };
+// A ticket's relations in both directions: `out` relations start at this ticket, `in` relations at
+// the other one. Finished tickets included, so a link written earlier is recognised.
+export const ISSUE_RELATIONS_QUERY = `query issueRelations($id: String!) {
+  issue(id: $id) {
+    relations(first: 100) { nodes { type relatedIssue { id identifier } } }
+    inverseRelations(first: 100) { nodes { type issue { id identifier } } }
+  }
+}`;
+export type IssueRelation = { type: string; direction: "out" | "in"; id: string; identifier: string };
 export const UPDATE_COMMENT_QUERY = `mutation commentUpdate($id: String!, $input: CommentUpdateInput!) {
   commentUpdate(id: $id, input: $input) { success }
 }`;
@@ -2017,6 +2037,101 @@ export class LinearService {
     if (!data) return null;
     succeeded(record(data), "issueRelationCreate", "link the tickets");
     return true;
+  }
+
+  // The app-only writes for a plan's relations (server/plan-relations.ts). Each follows
+  // `relateAsApp`: null when the app cannot be used here (the caller retries), never the key.
+
+  async addBlockerAsApp(blockerId: string, blockedId: string): Promise<true | null> {
+    const data = this.app ? await this.app.mutate(RELATION_QUERY, { input: { issueId: blockerId, relatedIssueId: blockedId, type: "blocks" } }) : null;
+    if (!data) return null;
+    succeeded(record(data), "issueRelationCreate", "link the tickets");
+    return true;
+  }
+
+  // A label by name, read only: an app write never creates one (that would need the key). A cached
+  // id is reused, like `labelId`. Also the label's id for reading its add history, whatever labels
+  // the ticket carries now.
+  async existingLabelId(name: string): Promise<string | null> {
+    const wanted = name.trim().toLowerCase();
+    const cached = this.labelIds.get(wanted);
+    if (cached) return cached;
+    const found = labelNodes(record(await this.withKey((key) => this.post(key, LABEL_BY_NAME_QUERY, { name }))).issueLabels)[0];
+    if (!found?.id) return null;
+    this.labelIds.set(wanted, found.id);
+    return found.id;
+  }
+
+  async addLabelAsApp(issueId: string, name: string): Promise<true | null> {
+    const labelId = await this.existingLabelId(name);
+    if (!labelId) return null;
+    const data = this.app ? await this.app.mutate(ADD_LABEL_QUERY, { id: issueId, labelId }) : null;
+    if (!data) return null;
+    try { succeeded(record(data), "issueAddLabel", `add the "${name}" label`); } catch (error) {
+      // Already there is the goal: a retried step, or the owner set it meanwhile.
+      if (!/Label already on issue/i.test(error instanceof Error ? error.message : String(error))) throw error;
+    }
+    return true;
+  }
+
+  async removeLabelAsApp(issueId: string, name: string, current?: { id: string; name: string }[]): Promise<true | null> {
+    if (!this.app) return null;
+    const labels = current ?? (await this.issueCore(issueId)).labels;
+    const wanted = name.trim().toLowerCase();
+    for (const { id } of labels.filter((item) => item.name.trim().toLowerCase() === wanted)) {
+      const data = await this.app.mutate(REMOVE_LABEL_QUERY, { id: issueId, labelId: id });
+      if (!data) return null;
+      try { succeeded(record(data), "issueRemoveLabel", `remove the "${name}" label`); } catch (error) {
+        // `current` can be stale: another write removed the label meanwhile, which is the goal.
+        if (!/Label not on issue/i.test(error instanceof Error ? error.message : String(error))) throw error;
+      }
+    }
+    return true;
+  }
+
+  // `id`: a client-chosen UUID, so a request whose answer was lost is posted only once.
+  async commentAsApp(issueId: string, body: string, id?: string): Promise<true | null> {
+    const data = this.app ? await this.app.mutate(CREATE_COMMENT_QUERY, { input: { issueId, body, ...(id ? { id } : {}) } }) : null;
+    if (!data) return null;
+    succeeded(record(data), "commentCreate", "create the comment");
+    return true;
+  }
+
+  // The ticket's replan comments created at or after `since`, oldest first. Linear's filter is
+  // coarse; the caller parses each `opId` and `replan-for`.
+  async replanComments(issueId: string, since: string): Promise<ReplanComment[]> {
+    const comments: ReplanComment[] = [];
+    let after: string | null = null;
+    for (let page = 0; page < HISTORY_PAGES; page++) {
+      const data = record(await this.read(REPLAN_COMMENTS_QUERY, { id: issueId, since, after }, (found) => Boolean(found.issue && typeof found.issue === "object")));
+      const found = connection(record(record(data.issue ?? {}).comments ?? {}));
+      for (const node of found.nodes.map((item) => record(item))) {
+        const id = label(node.id);
+        if (id) comments.push({ id, at: label(node.createdAt), authorId: label(record(node.user ?? {}).id) || null, body: label(node.body) });
+      }
+      if (!found.hasNextPage) break;
+      after = found.endCursor;
+    }
+    return comments.sort((a, b) => a.at.localeCompare(b.at));
+  }
+
+  // Every relation of the ticket, both directions. Used to recognise a link that is already there,
+  // including one to a finished ticket that `issueState.blockedBy` leaves out.
+  async issueRelations(issueId: string): Promise<IssueRelation[]> {
+    const data = record(await this.read(ISSUE_RELATIONS_QUERY, { id: issueId }, (found) => Boolean(found.issue && typeof found.issue === "object")));
+    const issue = record(data.issue ?? {});
+    const relations: IssueRelation[] = [];
+    for (const node of connection(issue.relations ?? { nodes: [] }).nodes.map((item) => record(item))) {
+      const other = record(node.relatedIssue ?? {});
+      const id = label(other.id);
+      if (id) relations.push({ type: label(node.type), direction: "out", id, identifier: label(other.identifier) });
+    }
+    for (const node of connection(issue.inverseRelations ?? { nodes: [] }).nodes.map((item) => record(item))) {
+      const other = record(node.issue ?? {});
+      const id = label(other.id);
+      if (id) relations.push({ type: label(node.type), direction: "in", id, identifier: label(other.identifier) });
+    }
+    return relations;
   }
 
   async ping(): Promise<void> {

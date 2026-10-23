@@ -138,7 +138,7 @@ export const DEFAULT_AUTO_APPROVE: AutoApprovePolicy = { enabled: true, maxImpac
 
 // What the plugin knows about the review besides the plan text. `verdict`: the advisor verdict the
 // omp extension recorded for exactly this text (null: none, so the rating is unverified).
-export type ReviewFacts = { verdict: string | null; untrusted: boolean; attended: boolean };
+export type ReviewFacts = { verdict: string | null; untrusted: boolean; attended: boolean; waitsFor?: string[] };
 
 // Whether the plan is approved without the owner, and why (shown to the owner either way).
 export function autoApproval(risk: PlanRisk, policy: AutoApprovePolicy, facts: ReviewFacts): { approve: boolean; reasons: string[] } {
@@ -148,6 +148,7 @@ export function autoApproval(risk: PlanRisk, policy: AutoApprovePolicy, facts: R
     policy.enabled ? "" : "auto-approval is off",
     facts.untrusted ? "the ticket was not written by the owner" : "",
     facts.attended ? "the ticket is marked attended" : "",
+    ...(facts.waitsFor ?? []).map((identifier) => `it waits for ${identifier}, still open`),
     facts.verdict === null ? "no advisor review was recorded for this plan text" : "",
     facts.verdict === "unavailable" || (facts.verdict !== null && !risk.advisor) ? "the advisor was unavailable" : "",
     facts.verdict === "disagreements" ? "the advisor review left open disagreements" : "",

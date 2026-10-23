@@ -3,6 +3,7 @@ import { CODING_STATE, planDocument, roundStep } from "./plannotator";
 import { PLAN_READY_LABEL, PLAN_REWORK_LABEL } from "./plan-policy";
 import { MAX_SPLIT, planSteps } from "./sessions";
 import type { PlanFollowUps } from "./plan-follow-ups";
+import type { PlanRelations } from "./plan-relations";
 import { planTier, strongStepNumbers } from "../shared/plan-model";
 import { writeTierLabel } from "./model-tiers";
 
@@ -20,6 +21,9 @@ export type PanelWork = {
   linear: Pick<LinearService, "issueState" | "createIssue" | "issueById" | "addBlocker" | "delegate" | "upsertIssueDocument" | "issueDocument" | "moveToStateNamed" | "moveToReady" | "addLabel" | "removeLabel" | "changeLabels" | "labelCatalog" | "createLabel">;
   appUserId: () => Promise<string | null>;
   followUps?: Pick<PlanFollowUps, "file">;
+  relations?: Pick<PlanRelations, "file">;
+  // When the planning round behind the approved plan began (README, "Related work").
+  roundStartedAt: string | null;
   // The session is held first (offer "later" / "split"), so retiring the planner offers no Resume
   // and starts no agent while the decision is applied.
   session: {
@@ -41,6 +45,7 @@ async function approvedDocument(steps: Steps, work: PanelWork, decision: Approve
   const round = await roundStep(steps, work.linear, decision.issueId, decision.identifier);
   const documentUrl = await steps.once("document", () => work.linear.upsertIssueDocument(decision.issueId, `Plan: ${decision.identifier}`, planDocument({ type: "decided", agentId: decision.agentId, approved: true, planContent: decision.plan, at: decision.at }, decision.identifier, decision.model, round)));
   await steps.once("follow-ups", async () => { await work.followUps?.file({ issueId: decision.issueId, identifier: decision.identifier, plan: decision.plan, documentUrl: documentUrl || null }); });
+  await steps.once("relations", async () => { await work.relations?.file({ issueId: decision.issueId, identifier: decision.identifier, plan: decision.plan, documentUrl: documentUrl || null, roundStartedAt: work.roundStartedAt }); });
   return documentUrl;
 }
 

@@ -65,7 +65,8 @@ import { LimitResumeStore, UsageReader } from "./server/limit-resume";
 import { isUntrusted, planSetup, QUESTIONS_NOTE, TicketStarter } from "./server/starter";
 import { ShardAssignor } from "./server/worktree-shards";
 import { AgentEnvs } from "./server/agent-env";
-import { PlanRequests } from "./server/plan-requests";
+import { PlanRequests, TrustedApps } from "./server/plan-requests";
+import { PlanRelations } from "./server/plan-relations";
 import { PlanFollowUps } from "./server/plan-follow-ups";
 import { labelDaemon, StateLabels } from "./server/state-labels";
 import { LabelSync, PullRequestFiles } from "./server/label-sync";
@@ -177,7 +178,11 @@ export default function contribute(server: PluginServerContext) {
   // plugin writes, so a ticket Paseo reopens counts its agent again at once.
   const doneTickets = new DoneTickets();
   linear.onStateWritten((issueId, state) => doneTickets.written(issueId, state.type, Date.now()));
+  // Requests that send a planning ticket back to planning (plan-requests.ts), read when its
+  // approved plan would be implemented; built below, once the inbox peers are known.
+  let planRequests: PlanRequests | null = null;
   const starter = new TicketStarter({ linear, launcher, handover, presence, tiers, acceptanceTests, routes: smallRoutes, deletions, shards, focus, parked: waitingPlans, doneTickets,
+    requests: (issueId, identifier, since, hash) => planRequests!.requests(issueId, identifier, since, hash),
     repairs: { exclusion, parked: { get: (issueId) => parking.plans.get(issueId) } } });
   // The decision journal (README, "Decision journal"): every owner decision on a plan is written
   // here first and carried out by the bridge's worker; the inbox lists what is being applied.
@@ -508,7 +513,27 @@ export default function contribute(server: PluginServerContext) {
       const current = steward, paseo = attachedPaseo;
       if (current && paseo) await loadProbe.time("steward", async () => current.tick(paseo, await settings.read()));
     }, stop: () => steward?.stop() } });
-  const planRequests = new PlanRequests({ linear, prompt: (agentId, text) => sessions.prompt(agentId, text), routes: smallRoutes });
+  // The Paseo app users whose replan comments count: this host's app and every listed peer's,
+  // asked for on `/api/inbox` and kept per origin in `trusted-apps.json` (README, "Related work").
+  const trustedApps = new TrustedApps({
+    appUserId: () => linear.appUserId(),
+    peerApps: async () => Promise.all((await settings.read()).reviewPeers.map(async (peer) => {
+      const origin = peer.replace(/\/+$/, "");
+      try {
+        const response = await fetch(`${origin}/api/inbox`, { signal: AbortSignal.timeout(5_000) });
+        const body = response.ok ? await response.json() as { appUserId?: unknown } : null;
+        return { origin, reachable: true, appUserId: typeof body?.appUserId === "string" ? body.appUserId : null };
+      } catch {
+        return { origin, reachable: false, appUserId: null };
+      }
+    })),
+  });
+  planRequests = new PlanRequests({ linear, apps: trustedApps, prompt: (agentId, text) => sessions.prompt(agentId, text), routes: smallRoutes });
+  // An approved plan's `## Related work` written into Linear (README, "Related work"), and the
+  // requests it leaves on other tickets' plans.
+  const planRelations = new PlanRelations(linear, (issueId, identifier, since, hash) => planRequests!.requests(issueId, identifier, since, hash), () => hostName);
+  plannotator.useRelations(planRelations);
+  plannotator.usePlanRequests(planRequests);
   let commentWake: NodeJS.Timeout | null = null;
   const wakeComments = () => {
     if (commentWake) return;

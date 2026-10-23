@@ -100,6 +100,9 @@ export type ReviewLinksOptions = {
   // Points one review's tailnet route at the compressing proxy.
   route?: (port: number, proxyPort: number) => Promise<void>;
   proxyPort?: number;
+  // This host's Paseo app user, reported to peer hosts (`/api/inbox` `appUserId`) so their replan
+  // requests from this host's app are trusted (server/plan-requests.ts).
+  appUserId?: () => Promise<string | null>;
   // The plan text of a running review (Plannotator's /api/plan); "" when it cannot be read.
   fetchPlan?: (localUrl: string) => Promise<string>;
   // The time zone the inbox shows clock times and days in; the host's when absent.
@@ -201,14 +204,14 @@ const PeerRow = z.object({
 });
 const BackendInstanceId = z.string().uuid().optional();
 const ReviewId = z.string().min(1).max(200);
-const PeerInbox = z.object({ host: text(100), backendInstanceId: BackendInstanceId, open: z.array(z.unknown()), decided: z.array(z.unknown()), applying: z.array(z.unknown()).optional(), pipeline: z.unknown().optional() });
+const PeerInbox = z.object({ host: text(100), backendInstanceId: BackendInstanceId, appUserId: text(200).nullable().optional(), open: z.array(z.unknown()), decided: z.array(z.unknown()), applying: z.array(z.unknown()).optional(), pipeline: z.unknown().optional() });
 const DecisionRequest = z.object({ approve: z.boolean(), feedback: z.string().optional(), reviewId: ReviewId, backendInstanceId: BackendInstanceId }).strict();
 const ResolveRequest = z.object({ entryId: z.string().min(1).max(200), action: z.enum(["carry-out", "drop", "keep", "other", "dismiss"]), backendInstanceId: BackendInstanceId }).strict();
 const RecheckRequest = z.object({ reviewId: ReviewId, backendInstanceId: BackendInstanceId }).strict();
 const DeleteRequest = z.object({ identifier: z.string(), reviewId: ReviewId, backendInstanceId: BackendInstanceId }).strict();
 const ErrorAnswer = z.object({ error: z.string(), outcomeUnknown: z.boolean().optional() });
 type PeerInboxSnapshot = { peer: string; host: string; pipeline: HostPipeline } & (
-  | { backendInstanceId?: string; open: InboxRow[]; decided: InboxRow[]; applying: InboxRow[] }
+  | { backendInstanceId?: string; appUserId?: string | null; open: InboxRow[]; decided: InboxRow[]; applying: InboxRow[] }
   | { unreachable: true; applying: InboxRow[] }
 );
 
@@ -283,6 +286,7 @@ export class ReviewLinks {
   private readonly timeZone: string | undefined;
   private readonly host: string;
   private readonly peers: () => Promise<string[]>;
+  private readonly appUserId: (() => Promise<string | null>) | null;
   private readonly decide: DecideReview | null;
   private readonly decisions: ReviewDecisions | null;
   private readonly issueInfo: ReviewLinksOptions["issueInfo"];
@@ -315,6 +319,7 @@ export class ReviewLinks {
     this.timeZone = options.timeZone;
     this.host = options.host ?? hostname().replace(/\.local$/, "");
     this.peers = options.peers ?? (async () => []);
+    this.appUserId = options.appUserId ?? null;
     this.decide = options.decide ?? null;
     this.decisions = options.decisions ?? null;
     this.linearWorkspace = options.linearWorkspace ?? null;
@@ -691,7 +696,10 @@ export class ReviewLinks {
       return { status: 200, headers: { "content-type": file.type, "cache-control": "public, max-age=31536000, immutable", "access-control-allow-origin": "*", vary: "Accept-Encoding", ...(br ? { "content-encoding": "br" } : {}) }, body: br ?? file.raw };
     }
     if (path === "/") return { status: 200, headers: { "content-type": "text/html; charset=utf-8" }, body: inboxPage(await this.view(), this.now(), this.timeZone) };
-    if (path === "/api/inbox") return json(200, { host: this.host, backendInstanceId: this.seam?.instanceId, ...await this.rows() });
+    if (path === "/api/inbox") {
+      const appUserId = await Promise.resolve(this.appUserId ? this.appUserId() : null).catch(() => null);
+      return json(200, { host: this.host, backendInstanceId: this.seam?.instanceId, ...(appUserId ? { appUserId } : {}), ...await this.rows() });
+    }
     if (path === "/api/push/key") return json(200, { publicKey: await this.push.publicKey() });
     if (path === "/manifest.webmanifest") return { status: 200, headers: { "content-type": "application/manifest+json" }, body: MANIFEST };
     if (path === "/sw.js") return { status: 200, headers: { "content-type": "text/javascript; charset=utf-8", "service-worker-allowed": "/" }, body: SERVICE_WORKER };
@@ -878,7 +886,7 @@ export class ReviewLinks {
       const pipeline: HostPipeline = status.success
         ? { ...status.data, host: answer.host, rows: status.data.rows.map((row) => ({ ...row, host: answer.host })) }
         : { host: answer.host, checkedAt: null, lastArrivalAt: null, rows: [], error: "Plan monitoring is unavailable on this host." };
-      return { peer, host: answer.host, backendInstanceId: answer.backendInstanceId, open: peerRows(answer.open, answer.host, answer.backendInstanceId), decided: peerRows(answer.decided, answer.host, answer.backendInstanceId), applying: peerRows(answer.applying ?? [], answer.host, answer.backendInstanceId), pipeline };
+      return { peer, host: answer.host, backendInstanceId: answer.backendInstanceId, appUserId: answer.appUserId ?? null, open: peerRows(answer.open, answer.host, answer.backendInstanceId), decided: peerRows(answer.decided, answer.host, answer.backendInstanceId), applying: peerRows(answer.applying ?? [], answer.host, answer.backendInstanceId), pipeline };
     } catch { return this.unavailablePeer(peer); }
   }
 

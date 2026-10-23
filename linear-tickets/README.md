@@ -840,7 +840,7 @@ approved plan later replaces the route: every unfinished attempt is closed, the 
 `no-plan` are removed. The tier report (`npm run tier-report`) counts the route's tier as the
 ticket's first.
 
-**Overlap check.** Tickets are filed (by you, by agents, by intake) without a look at what else is
+**Related work.** Tickets are filed (by you, by agents, by intake) without a look at what else is
 open, so every plan starts with one, from one shared **candidate list**. Every planning launch (a
 ticket planner on any provider, and a project's planner run) gets the list of its ticket's team
 at the end of the context file `LINEAR_TICKETS_CONTEXT` names, under `# Candidate list`
@@ -875,12 +875,54 @@ about 10 seconds and the list runs to some 1.8 million characters, so the planne
 could not be built and asks the agent to search Linear instead, and the next planner tries again.
 The list covers the ticket's own team: the prompt has the agent search Linear (`search_issues`,
 or another Linear read tool) only for other teams' tickets and for what the list marks
-incomplete, read each candidate in full and follow the precedence rule. The plan gets an
-`## Overlapping tickets` section (each overlap and what the plan does about it, or "None found"
-with what was checked). With [agent access to Linear](#agent-access-to-linear) on, real overlaps
-are linked with `add_relation related` while the agent plans; a ticket another one fully covers
-gets a plan that proposes closing it as that ticket's duplicate. A planner run gets its own
-overlap instructions (see **Projects** below).
+incomplete, read each candidate in full and follow the precedence rule.
+
+The plan's own `## Related work` section says in prose which related tickets matter and what the
+plan does about them, followed by one fenced ```` ```related-work ```` block with one line per
+ticket and a reason after a colon, in the fixed format of
+[`shared/work-order.ts`](shared/work-order.ts):
+
+````markdown
+```related-work
+TUC-9 blocks TUC-7: the parser lands first
+TUC-7 blocks TUC-10: the report reads its output
+TUC-7 relates to TUC-20: same files
+TUC-7 duplicates TUC-30: nobody started it
+replan TUC-40: its plan is out of date
+```
+````
+
+`related` and `related to` mean `relates to`; a reason may follow `:`, `(`, `#` or a dash, and a
+line may end in a period. Every link line names this ticket, in either position, except `replan`,
+which names the other ticket's approved plan (D2). A line naming only other tickets,
+`hold`/`release`/`attended`/`unattended`, and a line with two changes
+(`TUC-7 relates to TUC-8 and TUC-9`) are
+unreadable: the plan has a `## Related work` section but no block is a problem too, and such a plan
+is sent back to its planner before it reaches you, like a plan that fails the section layout. An
+empty block is a valid plan with nothing related; an old plan with neither the section nor the
+block is not sent back. Relations are no longer written while the planner works: they reach
+Linear only through an approved plan.
+
+Approving the plan applies the block as the [Paseo app](#who-linear-shows-as-the-author) (never
+the owner's key), on every approval path — your decision, an automatic approval, an approve-later
+or a split, and a parked plan approved on the central host: it adds the blocking relations,
+the related and duplicate links (a duplicate line's first ticket is the one it closes: that ticket
+gets `paseo-hold`, a comment saying why, and the duplicate link, and only a ticket nobody has
+started and no agent works on is closed; a started ticket is listed as skipped instead), and asks
+another ticket to plan again. Each line is recorded as it goes
+through, so a restart repeats nothing and a re-approval of the same plan writes nothing new; a
+write the app cannot make leaves the record retrying every ten minutes, up to five rounds, and
+then stopped until a revised plan is approved — the approval itself moves on. If this ticket was not
+written by you or Paseo, or a line is refused, nothing is written through it: you get one comment
+saying what needs a hand review. Otherwise the ticket gets one summary comment naming the approved
+plan, the lines applied and the lines skipped with their reason. A `replan TUC-9` line asks
+TUC-9's agent to plan again when that ticket is open with an approved plan (`plan-ready`): it posts
+a request comment carrying an operation id and the hash of the plan it is about, adds the `plan`
+label as the visible indicator, and TUC-9's agent plans again; a ticket without `plan-ready`, or
+one that is done, is skipped with the reason, and a request never moves to a plan that replaced the
+one it named. The ticket's `plan` label is removed once the approval's round has no newer request,
+and kept (or put back) when one arrives. A planner run gets its own work-order instructions (see
+**Projects** below).
 
 **Reach and principles.** A decision made in one ticket should apply everywhere it belongs and not
 come back in the next one, so every plan carries two more sections before `## Risk and impact`, in
@@ -1094,15 +1136,37 @@ writing. Other profiles and instructions are preserved. Apply after plugin rollo
 
 **Plan on a running agent.** Add `plan` to the ticket while its agent implements an approved plan:
 within a minute the plugin asks the agent for a new plan. An omp agent enters the planning phase at
-its next tool call (that call is stopped and the reason follows as a message) or prompt. Other
-providers only get the message. A label that was there when the agent started does nothing;
-remove and add it again to ask once more.
+its next tool call (that call is stopped and the reason follows as a message) or prompt; other
+providers only get the message. The request is delivered once: for an omp agent as a file under
+`$PASEO_HOME/linear-tickets/plan-requests/<agent>` that the omp extension turns into planning, and
+`revisePlanNote` tells the agent to start from the approved plan and answer every request. A
+provider without that extension has only the message, so a request the agent cannot take yet
+(busy, waiting or unavailable) stays pending and the next poll sends it again; no request file is
+written for it.
+
+The owner's `plan` label add is a request once its agent exists; a label that was already on the
+ticket when the agent started is not a new request. Remove and add it again to ask once more, also
+between two polls: the plugin reads the label's add history, so an add an app removed again before
+the poll still counts, and the approval's cleanup puts the label back. Another ticket's approved
+plan asks the same way, with a
+`🔁 **Replan requested**` comment instead of a label add: it carries an operation id, and counts
+only for the exact plan hash it names ([`server/plan-requests.ts`](server/plan-requests.ts)). The
+app-written comment counts only when its author is this host's Paseo app or a peer's app: the
+`appUserId` every host listed in `reviewPeers` reports on its `/api/inbox`, kept per peer origin in
+`$PASEO_HOME/linear-tickets/trusted-apps.json`. A listed peer that is unreachable keeps its last
+verified id; a peer that answers without one, or is removed from `reviewPeers`, loses its trust at
+once. A comment with the right first line from another user or an unknown app, and a label add by
+another user, ask for nothing. The `plan` label is removed after the approved plan's round when no
+request is newer than the round's start, and kept when one is; a request that lands while the
+label is being removed puts the label back and is delivered at the next poll. A request the plugin
+records while its agent restarts, or one whose label was lost in a crash, is still delivered: the
+label is only the indicator, the request itself is the comment or the label add as recorded.
 
 **Plan advisor.** Every plan a ticket agent writes gets a second opinion before it reaches you.
 The planner (the model you launch tickets with; the model guard keeps it there) creates a GPT-6
 Astra advisor (`omp/openai-codex/gpt-6-astra`, thinking `medium`) with Paseo's `create_agent`, in
 its own workspace, so the advisor can read the same code. Both work from the same ticket context:
-each launch saves the agent's first prompt (with the candidate list, see **Overlap check**) to
+each launch saves the agent's first prompt (with the candidate list, see **Related work**) to
 `$PASEO_HOME/linear-tickets/plan-context/<request>.md` and passes the path in
 `LINEAR_TICKETS_CONTEXT`, and the advisor reads that file first (when the save fails, the launch
 warns and the planner pastes the ticket into the advisor's prompt). Besides the plan's scope,
@@ -1216,7 +1280,11 @@ When the review opens, the plugin approves it on your behalf only if all of thes
   unavailable advisor or open disagreements send it to you; the recorded verdict is kept in
   `$PASEO_HOME/linear-tickets/plannotator/advised/<agent>.json` until the review is decided, so a
   plugin reload in between does not);
-- the ticket is yours (not someone else's, not `feedback`) and not marked attended.
+- the ticket is yours (not someone else's, not `feedback`) and not marked attended;
+- no open ticket blocks it: a `TUC-9 blocks TUC-25` line in its block makes TUC-25 wait for TUC-9,
+  and while TUC-9 is not finished the plan comes to you ("it waits for TUC-9, still open"). A
+  blocker that cannot be read does too. A line that makes another ticket wait for this one does
+  not; nor does a blocker that is done.
 
 A planner run's work order never goes through this policy: it only orders the project's
 tickets (blocking relations and labels), and every ticket still plans and is judged on its own
@@ -1743,7 +1811,7 @@ the ticket itself changing, or a deleted ticket, shows up with the next full rea
   also given in full (up to 4,000 characters each and 30,000 in all; past that the agent reads
   them in Linear) — a follow-up Paseo filed in Backlog is listed but never marked new (see
   **Plan follow-ups**). The team's other work is not in the brief: the run's context file ends
-  with the team's candidate list (see **Overlap check**). The brief stays within 120,000
+  with the team's candidate list (see **Related work**). The brief stays within 120,000
   characters, so it fits any project size (the ticket planners before it rode Linear's
   200,000-character agent context, and ERP's 409 open tickets went past it: TUC-1094 never
   started); every new ticket is always listed, and when the room runs out the other project
@@ -1768,8 +1836,12 @@ the ticket itself changing, or a deleted ticket, shows up with the next full rea
   ```
   ````
 
-  The plan is approved the moment the agent submits it: no risk check, no inbox, no parking, and
-  no Linear read that could fail and send it to you. A plan whose block is missing, or has a line
+  The `project-order` block is read by the same parser as a ticket plan's `related-work` block
+  ([`shared/work-order.ts`](shared/work-order.ts)): the same `blocks`, `duplicates` and `relates`
+  forms and synonyms, the same reason punctuation, and the same refusal of a line that is not
+  exactly one change. A work order cannot ask for a `replan`; only a ticket plan may. The plan is
+  approved the moment the agent submits it: no risk check, no inbox, no parking, and no Linear
+  read that could fail and send it to you. A plan whose block is missing, or has a line
   that is not exactly one change (`TUC-1 blocks TUC-2, TUC-3`), is sent back to the planner with
   the unreadable lines instead of closing as an empty order. Paseo then adds the blocking
   relations, links related tickets, puts `paseo-hold` on held tickets (removes it from released

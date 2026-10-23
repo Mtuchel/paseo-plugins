@@ -15,6 +15,7 @@ import { Handover, PARKED_PLAN_LINE, type HandoverRecord } from "./handover";
 import { Writeback } from "./writeback";
 import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
 import { planHash } from "./review-outcome";
+import { PlanRelations } from "./plan-relations";
 import { DecisionLog, type LogEntry } from "./owner-decisions";
 import { ReviewDeletions } from "./review-deletions";
 import { AgentApi } from "./agent-app";
@@ -115,6 +116,16 @@ function setup(labels: Record<string, string>, ticket: { creatorId: string; labe
     // The durable record's one progress comment (Handover) and the ticket read the archive
     // write-back needs (Writeback.archived).
     async upsertComment(issueId: string, body: string, commentId: string | null) { calls.push(`progress ${issueId}${commentId ? ` (${commentId})` : ""}: ${body}`); return commentId ?? "comment-1"; },
+    async issueRef(identifier: string) { calls.push(`ref ${identifier}`); return { id: `id-${identifier}`, identifier, title: identifier }; },
+    async blockerStates(ids: string[]) { calls.push(`blockers ${ids.join(",")}`); return ids.map((id) => ({ id, identifier: id, status: "Todo", statusType: "unstarted", delegateId: null, finished: false })); },
+    // The app-only writes of a plan's related work (server/plan-relations.ts).
+    async issueRelations() { return []; },
+    async addBlockerAsApp(blockerId: string, blockedId: string) { calls.push(`block ${blockerId} ${blockedId}`); return true as const; },
+    async relateAsApp(issueId: string, relatedId: string, type: string) { calls.push(`relate ${issueId} ${relatedId} ${type}`); return true as const; },
+    async addLabelAsApp(issueId: string, name: string) { calls.push(`+${name} ${issueId}`); return true as const; },
+    async removeLabelAsApp(issueId: string, name: string) { calls.push(`-${name} ${issueId}`); return true as const; },
+    async commentAsApp(issueId: string, body: string) { calls.push(`commentAsApp ${issueId}: ${body}`); return true as const; },
+    async replanComments() { return []; },
     async issueCore(issueId: string) { calls.push(`core ${issueId}`); return { id: issueId, identifier: labels["linear.identifier"], creatorId: ticket.creatorId, status: "Plan review", statusId: "plan-review", statusType: "started", labels: [], attachmentUrls: [] }; },
   };
   const paseo = {
@@ -483,6 +494,171 @@ test("a work order Paseo cannot read line by line is sent back to the planner, n
   }
 });
 
+test("AC-2: a broken related-work block goes back to the planner in one send-back naming every problem", async () => {
+  const plan = "# Plan\n\n## Related work\n\n```related-work\nTUC-1 blocks TUC-2: neither is this ticket\nhold TUC-3: not in a ticket plan\n```\n";
+  const { calls, linear, paseo } = setup({ "linear.issueId": "issue-1", "linear.identifier": "TUC-25" });
+  const decisions: string[] = [];
+  await withEvents([{ type: "opened", agentId: "agent-1", localUrl: "http://localhost:4000/", remoteUrl: "https://host.ts.net:4000/", at: "2026-01-01T10:00:00Z" }], async (directory) => {
+    const decide = async (_url: string, approve: boolean, feedback: string) => { decisions.push(`${approve} ${feedback}`); };
+    const bridge = new PlannotatorBridge(linear, { read: async () => settings }, directory, undefined, async () => plan, undefined, undefined, undefined, decide);
+    bridge.attach(paseo);
+    await bridge.drain();
+    bridge.stop();
+  });
+  assert.equal(decisions.length, 1);
+  assert.match(decisions[0], /^false /);
+  const reason = decisions[0];
+  assert.match(reason, /Every line names TUC-25/);
+  assert.match(reason, /Not allowed in a ticket plan: "hold TUC-3/);
+  assert.match(reason, /missing|Model/i, "one send-back names the model problem too");
+  assert.deepEqual(calls, [], "nothing was staged, parked or applied");
+});
+
+test("a submitted ticket plan with only `## Overlapping tickets` is not sent back for a related-work block", async () => {
+  const plan = "# Plan\n\n## Overlapping tickets\n\nTUC-9 overlaps.\n\n## Risk and impact\n\n- Areas: Sales\n- Processes: order report\n- Impact: 1 — read-only\n- Reversibility: revert — nothing written\n- Feature flag: no\n- Migration: no\n- Auth: no\n- New rule: no — one-off\n- Failure mode: a wrong column\n- Advisor rating: impact 1, reversibility revert\n- Recommendation: auto — routine\n\n## Model\n\n- Tier: standard — routine\n";
+  const { linear, paseo } = setup({ "linear.issueId": "issue-1", "linear.identifier": "TUC-25" });
+  const decisions: string[] = [];
+  const { parking } = parkingFake([]);
+  await withEvents([{ type: "opened", agentId: "agent-1", localUrl: "http://localhost:4000/", remoteUrl: "https://host.ts.net:4000/", at: "2026-01-01T10:00:00Z" }], async (directory) => {
+    const decide = async (_url: string, approve: boolean, feedback: string) => { decisions.push(`${approve} ${feedback}`); };
+    const bridge = new PlannotatorBridge(linear, { read: async () => settings }, directory, undefined, async () => plan, undefined, undefined, undefined, decide, undefined, parking);
+    bridge.attach(paseo);
+    await bridge.drain();
+    bridge.stop();
+  });
+  assert.ok(!decisions.some((decision) => /related-work block/.test(decision)), "the catch-up covers plans from before the rollout");
+});
+
+test("AC-8: an approval files the plan's related work with the round's start, after the plan document", async () => {
+  const plan = "# Plan\n\n```related-work\nTUC-25 blocks TUC-2: it lands first\nTUC-25 relates to TUC-9: same files\n```\n";
+  const { calls, linear, paseo } = setup({ "linear.issueId": "issue-1", "linear.identifier": "TUC-25" });
+  await withEvents([
+    { type: "opened", agentId: "agent-1", localUrl: "http://localhost:4000/", remoteUrl: "https://host.ts.net:4000/", at: "2026-01-01T10:00:00Z" },
+    { type: "decided", agentId: "agent-1", approved: true, planContent: plan, at: "2026-01-01T10:05:00Z" },
+  ], async (directory) => {
+    const bridge = new PlannotatorBridge(linear, { read: async () => settings }, directory);
+    const since: (string | null)[] = [];
+    bridge.useRelations(new PlanRelations(linear as never, async (_id, _identifier, asked) => { since.push(asked); return []; }, () => "server087", join(directory, "relations")));
+    bridge.usePlanRequests({ roundStartedAt: async () => "2026-01-01T09:30:00Z" });
+    bridge.attach(paseo);
+    await bridge.drain();
+    bridge.stop();
+    assert.ok(since.length >= 1 && since.every((asked) => asked === "2026-01-01T09:30:00Z"), "the label cleanup asks about the round's start");
+  });
+  assert.ok(calls.includes("block id-TUC-25 id-TUC-2"), "the TUC-2 blocker is in the fake Linear");
+  assert.ok(calls.includes("relate id-TUC-25 id-TUC-9 related"));
+  assert.ok(calls.indexOf("document issue-1 Plan: TUC-25") < calls.indexOf("block id-TUC-25 id-TUC-2"), "the plan document is written first");
+  assert.equal(calls.filter((call) => call.startsWith("commentAsApp issue-1: Related work applied from the approved plan")).length, 1, "one summary comment");
+});
+
+// A plan with its related-work block, for the tests that only differ in how the plan is approved.
+const withBlock = (plan: string) => plan.replace(/^# Plan\n/, "# Plan\n\n## Related work\n\nThe parser lands first.\n\n```related-work\nTUC-25 blocks TUC-2: it lands first\n```\n");
+const blockCalls = (calls: string[]) => calls.filter((call) => call.startsWith("block ") || call.startsWith("relate "));
+
+// The app-only relation writes of every approval path run against the same fake Linear, so each
+// path's TUC-2 blocker is checked in one place.
+function relationsCase(linear: ReturnType<typeof setup>["linear"], directory: string) {
+  return new PlanRelations(linear as never, async () => [], () => "server087", join(directory, "relations"));
+}
+
+test("AC-8: an auto-approved plan files its related work", async () => {
+  const plan = withBlock(RISKY(1));
+  const { calls, linear, paseo } = setup({ "linear.issueId": "issue-1", "linear.identifier": "TUC-25" });
+  const decisions: string[] = [];
+  await withEvents([
+    { type: "advised", agentId: "agent-1", verdict: "agreed", hash: planHash(plan), at: "2026-01-01T09:59:00Z" },
+    { type: "opened", agentId: "agent-1", localUrl: "http://localhost:4000/", remoteUrl: "https://host.ts.net:4000/", at: "2026-01-01T10:00:00Z" },
+  ], async (directory) => {
+    const bridge = new PlannotatorBridge(linear, { read: async () => settings }, directory, undefined, async () => plan, undefined, undefined, undefined, async (url, approve) => { decisions.push(`${url} ${approve}`); });
+    bridge.useRelations(relationsCase(linear, directory));
+    bridge.attach(paseo);
+    await bridge.drain();
+    await bridge.drain();
+    bridge.stop();
+  });
+  assert.equal(decisions.length, 1, "the risk policy approved the plan");
+  assert.deepEqual(blockCalls(calls), ["block id-TUC-25 id-TUC-2"]);
+  assert.equal(calls.filter((call) => call.startsWith("commentAsApp issue-1: Related work applied")).length, 1);
+});
+
+test("AC-8: a parked decision files the related work with the round the plan was parked in", async () => {
+  const plan = withBlock(RISKY(2));
+  const { calls, linear, paseo } = setup({ "linear.issueId": "issue-1", "linear.identifier": "TUC-25" });
+  const { plans, parking } = parkingFake(calls);
+  plans.set("issue-1", { issueId: "issue-1", identifier: "TUC-25", agentId: "agent-1", plan, line: "", reasons: [], model: null, parkedAt: "2026-01-01T10:00:00Z", announced: true, roundStartedAt: "2026-01-01T11:00:00Z" });
+  const since: (string | null)[] = [];
+  await withEvents([{ type: "decided", agentId: "agent-1", approved: true, parked: true, planContent: plan, at: "2026-01-01T12:00:00Z" }], async (directory) => {
+    const bridge = new PlannotatorBridge(linear, { read: async () => settings }, directory, undefined, async () => plan, undefined, undefined, undefined, async () => {}, () => {}, parking);
+    bridge.useRelations(new PlanRelations(linear as never, async (_id, _identifier, asked) => { since.push(asked); return []; }, () => "server087", join(directory, "relations")));
+    // A round start read now would be later: the parked record's is the one the decision answers.
+    bridge.usePlanRequests({ roundStartedAt: async () => "2026-01-01T13:00:00Z" });
+    bridge.attach(paseo);
+    await bridge.drain();
+    bridge.stop();
+  });
+  assert.deepEqual(blockCalls(calls), ["block id-TUC-25 id-TUC-2"]);
+  assert.ok(since.length >= 1 && since.every((asked) => asked === "2026-01-01T11:00:00Z"), "a request after the agent started but before the parked round's start is not newer");
+});
+
+test("AC-8: approve-later files the related work", async () => {
+  const plan = withBlock("# Plan\n1. Step");
+  const { calls, linear, paseo } = setup({ "linear.issueId": "issue-1", "linear.identifier": "TUC-25" });
+  const { sessions } = panelFakes(calls);
+  const { parking } = parkingFake(calls);
+  await withEvents([], async (directory) => {
+    const bridge = new PlannotatorBridge(linear, { read: async () => settings }, directory, sessions as never, async () => plan, undefined, undefined, undefined, async () => {}, () => {}, parking);
+    bridge.useRelations(relationsCase(linear, directory));
+    bridge.attach(paseo);
+    assert.equal(await bridge.decidePanel(PANEL as never, "later"), null);
+    await bridge.stop();
+  });
+  assert.deepEqual(blockCalls(calls), ["block id-TUC-25 id-TUC-2"]);
+});
+
+test("AC-8: approve & split files the related work", async () => {
+  const plan = withBlock(SPLIT_PLAN);
+  const { calls, linear, paseo } = setup({ "linear.issueId": "issue-1", "linear.identifier": "TUC-25" });
+  const { sessions, subIssues } = panelFakes(calls);
+  const { parking } = parkingFake(calls);
+  Object.assign(linear, subIssues);
+  await withEvents([], async (directory) => {
+    const bridge = new PlannotatorBridge(linear, { read: async () => settings }, directory, sessions as never, async () => plan, undefined, undefined, undefined, async () => {}, () => {}, parking);
+    bridge.useRelations(relationsCase(linear, directory));
+    bridge.attach(paseo);
+    await bridge.decidePanel(PANEL as never, "split");
+    await bridge.stop();
+  });
+  assert.deepEqual(blockCalls(calls), ["block id-TUC-25 id-TUC-2"]);
+  assert.equal(calls.filter((call) => call.startsWith("create ")).length, 3, "the split still ran");
+});
+
+test("AC-12: a plan that waits for an open ticket needs the owner; a done one is approved automatically", async () => {
+  const plan = withBlock(RISKY(1)).replace("TUC-25 blocks TUC-2", "TUC-9 blocks TUC-25");
+  const run = async (finished: boolean) => {
+    const { calls, linear, paseo } = setup({ "linear.issueId": "issue-1", "linear.identifier": "TUC-25" });
+    linear.blockerStates = async (ids: string[]) => ids.map((id) => ({ id, identifier: id === "id-TUC-9" ? "TUC-9" : id, status: "Done", statusType: finished ? "completed" : "started", delegateId: null, finished }));
+    const decisions: string[] = [];
+    let comment = "";
+    await withEvents([
+      { type: "advised", agentId: "agent-1", verdict: "agreed", hash: planHash(plan), at: "2026-01-01T09:59:00Z" },
+      { type: "opened", agentId: "agent-1", localUrl: "http://localhost:4000/", remoteUrl: "https://host.ts.net:4000/", at: "2026-01-01T10:00:00Z" },
+    ], async (directory) => {
+      const bridge = new PlannotatorBridge(linear, { read: async () => settings }, directory, undefined, async () => plan, undefined, undefined, undefined, async (url, approve) => { decisions.push(`${url} ${approve}`); });
+      bridge.attach(paseo);
+      await bridge.drain();
+      await bridge.drain();
+      bridge.stop();
+      comment = calls.find((call) => call.startsWith("comment issue-1: 📋")) ?? "";
+    });
+    return { decisions, comment };
+  };
+  const open = await run(false);
+  assert.deepEqual(open.decisions, []);
+  assert.match(open.comment, /it waits for TUC-9, still open/);
+  const done = await run(true);
+  assert.equal(done.decisions.length, 1, "no waits-for reason: the ticket finished");
+});
+
 // In-memory parked plans; `available` is the central host running.
 function parkingFake(calls: string[], available = true) {
   const plans = new Map<string, ParkedPlan>();
@@ -520,7 +696,7 @@ test("a plan that needs the owner is parked and its agent retired; the central h
   await run([{ type: "opened", agentId: "agent-1", localUrl: "http://localhost:4000/", remoteUrl: "https://host.ts.net:4000/", at: "2026-01-01T10:00:00Z" }]);
   assert.deepEqual(calls, ["retire agent-1 http://localhost:4000/"], "AC-2: the parking host's serve writes the stage, not the retired agent's host");
   assert.deepEqual({ decisions, tabs }, { decisions: [], tabs: [] }, "the agent's own review is neither decided nor opened");
-  assert.deepEqual({ ...plans.get("issue-1"), parkedAt: "" }, { issueId: "issue-1", identifier: "TUC-25", agentId: "agent-1", plan: RISKY(2), line: "Risk: impact 2/4, revert. Needs your approval: no advisor review was recorded for this plan text; impact 2 is above the threshold 1.", reasons: ["no advisor review was recorded for this plan text", "impact 2 is above the threshold 1"], model: null, parkedAt: "", announced: false });
+  assert.deepEqual({ ...plans.get("issue-1"), parkedAt: "" }, { issueId: "issue-1", identifier: "TUC-25", agentId: "agent-1", plan: RISKY(2), line: "Risk: impact 2/4, revert. Needs your approval: no advisor review was recorded for this plan text; impact 2 is above the threshold 1.", reasons: ["no advisor review was recorded for this plan text", "impact 2 is above the threshold 1"], model: null, parkedAt: "", announced: false, roundStartedAt: null });
 
   // The central host serves it; a restart of the host opens it again without a second announcement.
   calls.length = 0;
@@ -1130,7 +1306,7 @@ async function submit(plan: string, approvedDocument?: string) {
 
 test("a ticket plan without a usable model tier goes back to its planner, never to the owner", async () => {
   const cases: [string, string, RegExp][] = [
-    ["no section", RISKY(1).replace(MODEL("strong"), ""), /^false Paseo sent this plan back before review\. The plan has no "## Model" section\./],
+    ["no section", RISKY(1).replace(MODEL("strong"), ""), /^false Paseo sent this plan back before review\.\n\nThe plan has no "## Model" section\./],
     ["no tier line", RISKY(1).replace("- Tier: strong — one report column\n", ""), /has no readable "- Tier: <cheap \| strong> — <why>" line/],
     ["no strong steps line", RISKY(1).replace("- Strong steps: none — routine\n", ""), /has no "- Strong steps: <none \| step numbers> — <why>" line/],
     ["no acceptance tests line", RISKY(1).replace("- Acceptance tests: server\/report.test.ts — the new column\n", ""), /has no "- Acceptance tests: <none \| test file paths> — <why>" line/],
@@ -1394,6 +1570,8 @@ function tracked(agentLabels: Record<string, string> = {}, ticket: { creatorId: 
     async viewerId() { return "owner"; },
     async appUserId() { return "paseo-app"; },
     async trustedAppIds() { return ["paseo-app"]; },
+    async issueRef(identifier: string) { return { id: `id-${identifier}`, identifier, title: identifier }; },
+    async blockerStates(ids: string[]) { return ids.map((id) => ({ id, identifier: id, status: "Todo", statusType: "unstarted", delegateId: null, finished: false })); },
   };
   const paseo = {
     agents: {

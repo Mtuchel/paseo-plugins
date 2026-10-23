@@ -19,8 +19,12 @@ import { planHash, reviewOutcome, type PendingReview, type ReviewOutcome } from 
 import { isUntrusted } from "./starter";
 import type { RouteEvent, SmallRoutes } from "./small-route";
 import { dispatchLabels } from "./dispatch";
-import { orderProblems, type ProjectFlow } from "./project-flow";
+import type { ProjectFlow } from "./project-flow";
+import { orderProblems, parseRelatedWork, relatedWorkProblems } from "../shared/work-order";
 import type { PlanFollowUps } from "./plan-follow-ups";
+import type { PlanRelations } from "./plan-relations";
+import type { PlanRequests } from "./plan-requests";
+import { hasSection, RELATED_WORK_SECTION } from "../shared/plan-sections";
 import { feedbackEntry, logQuietly, type DecisionLog } from "./owner-decisions";
 import { modelProblem, modelSteps, planTier, strongerTier, TIERS, type Tier } from "../shared/plan-model";
 import { labelTier, onlyTierAdded, tierModel, writeTierLabel, type TierStore } from "./model-tiers";
@@ -82,7 +86,7 @@ type PlannotatorEvent = OpenedEvent | DecidedEvent | AdvisedEvent | EscalatedEve
 // Model tiers (README, "Model tiers"): where tier decisions are recorded, the model guard's
 // immediate switch of one agent, and sending a working agent back to planning (plan-requests.ts).
 export type Tiers = { store: Pick<TierStore, "record">; apply: (agentId: string) => Promise<unknown>; replan: (agent: { id: string; issueId: string; identifier: string }, message: string) => Promise<void>; tests?: Pick<AcceptanceTestsStore, "save" | "clear"> };
-type Linear = Pick<LinearService, "comment" | "commentById" | "upsertIssueDocument" | "issueDocument" | "moveToStateNamed" | "moveToReady" | "moveToPlanStage" | "issueStatus" | "addLabel" | "removeLabel" | "changeLabels" | "labelCatalog" | "createLabel" | "issueState" | "viewerId" | "appUserId" | "trustedAppIds" | "createIssue" | "issueById" | "addBlocker" | "delegate">;
+type Linear = Pick<LinearService, "comment" | "commentById" | "upsertIssueDocument" | "issueDocument" | "moveToStateNamed" | "moveToReady" | "moveToPlanStage" | "issueStatus" | "addLabel" | "removeLabel" | "changeLabels" | "labelCatalog" | "createLabel" | "issueState" | "viewerId" | "appUserId" | "trustedAppIds" | "createIssue" | "issueById" | "addBlocker" | "delegate" | "issueRef" | "blockerStates">;
 type Sessions = Pick<SessionRouter, "sessionFor" | "plan" | "ask" | "say" | "said" | "expectReview" | "clearReview" | "parked" | "queueable" | "requeueSession" | "holdSession" | "groupSession">;
 // What the risk policy made of an opened review: `line` tells the owner, in the panel and on Linear;
 // `reasons` why it needs the owner (empty when approved).
@@ -244,6 +248,11 @@ export class PlannotatorBridge {
   private projectPlans: ProjectPlans | null = null;
   // Files an approved plan's follow-ups (plan-follow-ups.ts); its retries run on this bridge's sweep.
   private followUps: Pick<PlanFollowUps, "file" | "retryPending"> | null = null;
+  // Writes an approved plan's related work into Linear (plan-relations.ts); its retries run on
+  // this bridge's sweep too.
+  private relations: Pick<PlanRelations, "file" | "retryPending"> | null = null;
+  // The requests delivered to a planner (plan-requests.ts), for the time its planning round began.
+  private planRequests: Pick<PlanRequests, "roundStartedAt"> | null = null;
   // Reviews already opened on this machine, so a retried event does not open a second tab.
   private readonly shown = new Set<string>();
   // Where the owner's review feedback is kept for the weekly decision candidates (owner-decisions.ts).
@@ -340,6 +349,8 @@ export class PlannotatorBridge {
       void this.drain();
       const followUps = this.followUps;
       if (followUps && this.journal.active) void this.journal.run(() => followUps.retryPending()).catch((error: unknown) => { if (!(error instanceof FencedError)) console.error(`[linear-tickets] plan follow-up retries failed: ${message(error)}`); });
+      const relations = this.relations;
+      if (relations && this.journal.active) void this.journal.run(() => relations.retryPending()).catch((error: unknown) => { if (!(error instanceof FencedError)) console.error(`[linear-tickets] related-work retries failed: ${message(error)}`); });
     }, SWEEP_MS);
     this.timer.unref?.();
     void this.drain();
@@ -361,6 +372,14 @@ export class PlannotatorBridge {
 
   useFollowUps(followUps: Pick<PlanFollowUps, "file" | "retryPending">): void {
     this.followUps = followUps;
+  }
+
+  useRelations(relations: Pick<PlanRelations, "file" | "retryPending">): void {
+    this.relations = relations;
+  }
+
+  usePlanRequests(requests: Pick<PlanRequests, "roundStartedAt">): void {
+    this.planRequests = requests;
   }
 
   recordDecisions(log: Pick<DecisionLog, "append">): void {
@@ -462,7 +481,7 @@ export class PlannotatorBridge {
     const sessionId = link?.sessionId ?? null;
     const parked = this.parking ? await this.parking.plans.forAgent(agentId) : null;
     if (parked && (review?.parked ?? true)) {
-      return { route: "parked", issueId: parked.issueId, identifier: parked.identifier, sessionId, model: parked.model, parked: { issueId: parked.issueId, identifier: parked.identifier, plan: parked.plan, model: parked.model, parkedAt: parked.parkedAt, reasons: parked.reasons, line: parked.line } };
+      return { route: "parked", issueId: parked.issueId, identifier: parked.identifier, sessionId, model: parked.model, parked: { issueId: parked.issueId, identifier: parked.identifier, agentId: parked.agentId, plan: parked.plan, model: parked.model, parkedAt: parked.parkedAt, reasons: parked.reasons, line: parked.line, roundStartedAt: parked.roundStartedAt ?? null } };
     }
     if (!this.paseo) throw new FencedError();
     const agent = (await this.paseo.agents.ref(agentId).refresh())?.agent;
@@ -593,13 +612,41 @@ export class PlannotatorBridge {
     } finally { await rm(temporary, { force: true }); }
   }
 
+  // When the planning round behind this agent's plan began: the newest replan request delivered to
+  // it (plan-requests.ts), or its creation. A request older than this was answered by this plan.
+  private async roundStart(agentId: string): Promise<string | null> {
+    const asked = await this.planRequests?.roundStartedAt(agentId).catch(() => null) ?? null;
+    if (asked) return asked;
+    return (await this.paseo?.agents.ref(agentId).refresh().catch(() => undefined))?.agent.createdAt ?? null;
+  }
+
   // What the risk policy needs to know about the ticket besides the plan.
-  private async reviewFacts(state: IssueState, verdict: string | null, settings: PluginSettings): Promise<ReviewFacts> {
+  private async reviewFacts(state: IssueState, verdict: string | null, settings: PluginSettings, plan: string): Promise<ReviewFacts> {
     return {
       verdict,
       untrusted: isUntrusted(state, await this.linear.viewerId(), await this.linear.trustedAppIds()),
       attended: hasLabel(state.labels, dispatchLabels(settings.dispatch.label).attended.toLowerCase()),
+      // D1 (README, "Plan risk and auto-approval"): a block line that makes this ticket wait for an
+      // open ticket is the owner's call, whoever wrote it.
+      waitsFor: await this.waitsFor(plan, state.identifier),
     };
+  }
+
+  // The open tickets this plan's block lines make it wait for, that is `X blocks <this ticket>`
+  // lines whose X has not finished. A ticket that cannot be read here makes the whole check fail:
+  // the caller then needs the owner (the reason says the check failed).
+  private async waitsFor(plan: string, identifier: string): Promise<string[]> {
+    const waiting: string[] = [];
+    for (const step of parseRelatedWork(plan)) {
+      if (step.kind !== "blocks" || step.blocked !== identifier) continue;
+      const ref = await this.linear.issueRef(step.blocker);
+      if (!ref) { waiting.push(step.blocker); continue; }
+      const [blocker] = await this.linear.blockerStates([ref.id]);
+      // A ticket Linear does not return for an id it gave is named as waiting, not dropped: the
+      // owner decides rather than the plan passing on an unread link.
+      if (!blocker || !blocker.finished) waiting.push(step.blocker);
+    }
+    return waiting;
   }
 
   // The risk policy (README, "Plan risk and auto-approval"): approves the plan on the owner's
@@ -622,7 +669,7 @@ export class PlannotatorBridge {
       const tierOnly = approvedBefore ? onlyTierAdded(approvedBefore.content, planText) : false;
       if (!tierOnly && "problem" in rated) return null;
       const advice = await this.advice(agentId);
-      const outcome = tierOnly || "problem" in rated ? { approve: tierOnly, reasons: [] } : autoApproval(rated.risk, settings.autoApprove, await this.reviewFacts(state, advice && advice.hash === planHash(planText) ? advice.verdict : null, settings));
+      const outcome = tierOnly || "problem" in rated ? { approve: tierOnly, reasons: [] } : autoApproval(rated.risk, settings.autoApprove, await this.reviewFacts(state, advice && advice.hash === planHash(planText) ? advice.verdict : null, settings, planText));
       if (!outcome.approve) return { approved: false, line: `${rating} Needs your approval: ${outcome.reasons.join("; ")}.`, reasons: outcome.reasons };
       const feedback = tierOnly ? "Approved again: the owner approved this plan before; only its model tier was added." : `Auto-approved by the risk policy. ${rating}`;
       const attempt = await this.journal.begin({ review, agentId, planContent: planText, approved: true, feedback, source: "risk-policy", state: "deciding", snapshot: await this.snapshot(agentId, review) });
@@ -655,7 +702,7 @@ export class PlannotatorBridge {
     const rated = parsePlanRisk(parked.plan);
     if ("problem" in rated) return;
     const settings = await this.settings.read();
-    const outcome = autoApproval(rated.risk, settings.autoApprove, await this.reviewFacts(await this.linear.issueState(parked.issueId), verdict, settings));
+    const outcome = autoApproval(rated.risk, settings.autoApprove, await this.reviewFacts(await this.linear.issueState(parked.issueId), verdict, settings, parked.plan));
     const rating = `Risk: ${ratingText(rated.risk)}.`;
     if (outcome.approve) {
       const hosted = this.journal.latestReview(parked.agentId, { parked: true });
@@ -870,16 +917,30 @@ export class PlannotatorBridge {
     const planText = await this.fetchPlan(event.localUrl).catch(() => "");
     // The plan text tells a report on this review from one on another (decision-journal.ts, `unbound`).
     if (planText.trim()) review = await this.journal.ensureReview({ agentId, localUrl: event.localUrl, openedAt: event.at, planHash: planHash(planText) });
-    // A ticket plan without a complete `## Model` section (README, "Model tiers") goes back to its
-    // planner before anyone reviews it; it never reaches the owner or a default tier. The closing
-    // is journaled first, so its report is never taken as the owner's send-back.
+    // A ticket plan without a complete `## Model` section (README, "Model tiers") or with an
+    // unusable `## Related work` block (README, "Related work") goes back to its planner before
+    // anyone reviews it; it never reaches the owner or a default tier, and one send-back names
+    // every problem. The closing is journaled first, so its report is never taken as the owner's
+    // send-back. A plan from before the rollout (only `## Overlapping tickets`) is not sent back:
+    // the catch-up covers it.
     if (issueId) {
-      const problem = planText.trim() ? modelProblem(planText) : null;
-      if (problem) {
-        const reason = `Paseo sent this plan back before review. ${problem}\n\nAdd or fix the section and submit the plan again.`;
+      const own = labels["linear.identifier"] ?? "";
+      const model = planText.trim() ? modelProblem(planText) : null;
+      const related = planText.trim() && own ? relatedWorkProblems(planText, own) : [];
+      if (model || related.length) {
+        const reason = [
+          "Paseo sent this plan back before review.",
+          model ?? "",
+          related.length ? [
+            "Its related work cannot be written into Linear as it is:",
+            related.map((problem) => `- ${problem}`).join("\n"),
+            `Write one line per related ticket in the fenced \`\`\`related-work block of a "## ${RELATED_WORK_SECTION}" section, and name ${own} in every line but \`replan\`: \`TUC-1 blocks ${own}: reason\`, \`${own} blocks TUC-1: reason\`, \`${own} relates to TUC-1: reason\`, \`${own} duplicates TUC-1: reason\` or \`replan TUC-1: reason\`.`,
+          ].join("\n\n") : "",
+          "Fix these and submit the plan again.",
+        ].filter(Boolean).join("\n\n");
         await this.journal.addClosing(review, false, reason);
         await this.decide(event.localUrl, false, reason);
-        console.log(`[linear-tickets] ${identifier}: plan sent back to the planner: its model tier is missing or not allowed`);
+        console.log(`[linear-tickets] ${identifier}: plan sent back to the planner: ${[model ? "its model tier is missing or not allowed" : "", related.length ? "its related work is not usable" : ""].filter(Boolean).join("; ")}`);
         return;
       }
     }
@@ -941,7 +1002,7 @@ export class PlannotatorBridge {
       if (agent) await this.handover.remember({ id: plan.issueId, identifier: plan.identifier }, agent, { plan: PARKED_PLAN_LINE, summary: await this.submissionReport(plan) });
       else console.error(`[linear-tickets] ${plan.identifier}: the parked submission was not recorded: agent ${plan.agentId.slice(0, 8)} could not be refreshed`);
     }
-    await this.parking!.plans.put(plan);
+    await this.parking!.plans.put(plan.roundStartedAt === undefined ? { ...plan, roundStartedAt: await this.roundStart(plan.agentId) } : plan);
     await this.sessions?.parked(plan.agentId);
     await this.journal.addClosing(review, false, reason);
     await this.parking!.retire(event.localUrl, plan.agentId, paseo, reason);
@@ -1182,6 +1243,7 @@ export class PlannotatorBridge {
     let preflight: "queueable" | "moved-on" | "none" = "queueable";
     if (attempt.approved) {
       await steps.once("follow-ups", async () => { await this.followUps?.file({ issueId: issue.id, identifier: issue.identifier, plan: event.planContent ?? parked.plan, documentUrl: documentUrl || null }); });
+      await steps.once("relations", async () => { await this.relations?.file({ issueId: issue.id, identifier: issue.identifier, plan: event.planContent ?? parked.plan, documentUrl: documentUrl || null, roundStartedAt: parked.roundStartedAt ?? await this.roundStart(attempt.agentId) }); });
       await steps.once("plan-ready", async () => {
         await this.linear.addLabel(issue.id, PLAN_READY_LABEL);
         await this.linear.removeLabel(issue.id, PLAN_REWORK_LABEL);
@@ -1295,6 +1357,7 @@ export class PlannotatorBridge {
     }
     const documentUrl = await steps.once("document", () => this.linear.upsertIssueDocument(issueId, `Plan: ${identifier}`, planDocument(event, identifier, attempt.model, round)));
     if (attempt.approved) await steps.once("follow-ups", async () => { await this.followUps?.file({ issueId, identifier, plan: attempt.planContent, documentUrl: documentUrl || null }); });
+    if (attempt.approved) await steps.once("relations", async () => { await this.relations?.file({ issueId, identifier, plan: attempt.planContent, documentUrl: documentUrl || null, roundStartedAt: await this.roundStart(attempt.agentId) }); });
     // With a session the panel shows the review, so the progress comment records it instead of new comments.
     const via = await steps.once("report-via", async () => {
       const agent = attempt.sessionId && this.handover ? (await this.paseo?.agents.ref(attempt.agentId).refresh())?.agent : null;
@@ -1356,6 +1419,8 @@ export class PlannotatorBridge {
       linear: this.linear,
       appUserId: () => this.linear.appUserId(),
       ...(this.followUps ? { followUps: this.followUps } : {}),
+      ...(this.relations ? { relations: this.relations } : {}),
+      roundStartedAt: attempt.parked?.roundStartedAt ?? await this.roundStart(attempt.agentId),
       session: sessions && sessionId ? {
         hold: (offer) => sessions.holdSession(sessionId, offer),
         group: () => sessions.groupSession(sessionId),

@@ -20,7 +20,7 @@ import { DEFAULT_WORKTREE_SHARDS, DEFAULT_ACTIVATION, DEFAULT_BACKSTOP, DEFAULT_
 import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
 import { AWAY_REASON, type Candidate } from "./scheduler";
 import { TierStore } from "./model-tiers";
-import { isUntrusted, MISSED_REACH_NOTE, MODEL_NOTE, OVERLAP_NOTE, QUESTIONS_NOTE, TicketStarter, tierMissingNote, UNTRUSTED_NOTE } from "./starter";
+import { isUntrusted, MISSED_REACH_NOTE, MODEL_NOTE, RELATED_WORK_NOTE, QUESTIONS_NOTE, TicketStarter, tierMissingNote, UNTRUSTED_NOTE } from "./starter";
 import { advisorNote, PLAN_REQUIRED_NOTE, PLAN_SECTIONS_NOTE, PLAN_SLICING_NOTE, planPolicy } from "./plan-policy";
 import { REPAIR_BUSY_MESSAGE, RepairBusyError } from "./repair-exclusion";
 import type { ProcessInspector } from "./process-liveness";
@@ -1119,12 +1119,12 @@ test("every ticket starts plan-first; someone else's ticket is marked untrusted;
   const h = starterHarness({ creatorId: "customer", labels: [], blockedBy: [] }, 0);
   const started = await h.starter.start("i1", h.paseo, settings, { retryHint: "retry" });
   assert.deepEqual({ untrusted: started.untrusted, plan: started.plan }, { untrusted: true, plan: "required" });
-  assert.deepEqual(h.launches[0], { provider: "omp/opus", thinkingOptionId: undefined, modeId: "full", instructions: `${UNTRUSTED_NOTE}\n\n${OVERLAP_NOTE}\n\n${PLAN_SECTIONS_NOTE}\n\n${PLAN_SLICING_NOTE}\n\n${MODEL_NOTE}\n\n${advisorNote("omp")}\n\n${MISSED_REACH_NOTE}\n\n${QUESTIONS_NOTE}`, labels: { "linear.plan": "required" }, env: { LINEAR_TICKETS_PLAN: "required", LINEAR_TICKETS_STRONG_MODEL: "omp/opus" }, markInProgress: false });
+  assert.deepEqual(h.launches[0], { provider: "omp/opus", thinkingOptionId: undefined, modeId: "full", instructions: `${UNTRUSTED_NOTE}\n\n${RELATED_WORK_NOTE}\n\n${PLAN_SECTIONS_NOTE}\n\n${PLAN_SLICING_NOTE}\n\n${MODEL_NOTE}\n\n${advisorNote("omp")}\n\n${MISSED_REACH_NOTE}\n\n${QUESTIONS_NOTE}`, labels: { "linear.plan": "required" }, env: { LINEAR_TICKETS_PLAN: "required", LINEAR_TICKETS_STRONG_MODEL: "omp/opus" }, markInProgress: false });
   const mine = starterHarness({ creatorId: OWNER, labels: [], blockedBy: [] }, 0);
   const own = await mine.starter.start("i1", mine.paseo, settings, { retryHint: "retry" });
   assert.deepEqual({ untrusted: own.untrusted, plan: own.plan }, { untrusted: false, plan: "required" });
   // The owner's own ticket is offered the small-ticket route (README, "Small-ticket route").
-  assert.deepEqual(mine.launches[0], { provider: "omp/opus", thinkingOptionId: undefined, modeId: "full", instructions: `${PLAN_REQUIRED_NOTE}\n\n${OVERLAP_NOTE}\n\n${PLAN_SECTIONS_NOTE}\n\n${PLAN_SLICING_NOTE}\n\n${smallRouteNote()}\n\n${MODEL_NOTE}\n\n${advisorNote("omp")}\n\n${MISSED_REACH_NOTE}\n\n${QUESTIONS_NOTE}`, labels: { "linear.plan": "required" }, env: { LINEAR_TICKETS_PLAN: "required", LINEAR_TICKETS_SMALL_ROUTE: "1", LINEAR_TICKETS_STRONG_MODEL: "omp/opus" }, markInProgress: false });
+  assert.deepEqual(mine.launches[0], { provider: "omp/opus", thinkingOptionId: undefined, modeId: "full", instructions: `${PLAN_REQUIRED_NOTE}\n\n${RELATED_WORK_NOTE}\n\n${PLAN_SECTIONS_NOTE}\n\n${PLAN_SLICING_NOTE}\n\n${smallRouteNote()}\n\n${MODEL_NOTE}\n\n${advisorNote("omp")}\n\n${MISSED_REACH_NOTE}\n\n${QUESTIONS_NOTE}`, labels: { "linear.plan": "required" }, env: { LINEAR_TICKETS_PLAN: "required", LINEAR_TICKETS_SMALL_ROUTE: "1", LINEAR_TICKETS_STRONG_MODEL: "omp/opus" }, markInProgress: false });
 });
 
 test("AC-3: only an omp planner of an eligible ticket is offered the small-ticket route", async () => {
@@ -1187,7 +1187,7 @@ test("a plan starts in the provider's safe mode, and not in progress", async () 
   const h = starterHarness({ creatorId: OWNER, labels: [], blockedBy: [] }, 0);
   const started = await h.starter.start("i1", h.paseo, { ...settings, markInProgress: true, lastProvider: "claude", launchPreferences: { claude: { model: "claude/opus", modeId: "default" } } }, { retryHint: "retry" });
   assert.deepEqual({ untrusted: started.untrusted, plan: started.plan }, { untrusted: false, plan: "required" });
-  assert.deepEqual(h.launches[0], { provider: "claude/opus", thinkingOptionId: undefined, modeId: "plan", instructions: `${PLAN_REQUIRED_NOTE}\n\n${OVERLAP_NOTE}\n\n${PLAN_SECTIONS_NOTE}\n\n${PLAN_SLICING_NOTE}\n\n${MODEL_NOTE}\n\n${advisorNote("claude")}\n\n${MISSED_REACH_NOTE}\n\n${QUESTIONS_NOTE}`, labels: { "linear.plan": "required" }, env: { LINEAR_TICKETS_PLAN: "required", LINEAR_TICKETS_STRONG_MODEL: "claude/opus" }, markInProgress: false });
+  assert.deepEqual(h.launches[0], { provider: "claude/opus", thinkingOptionId: undefined, modeId: "plan", instructions: `${PLAN_REQUIRED_NOTE}\n\n${RELATED_WORK_NOTE}\n\n${PLAN_SECTIONS_NOTE}\n\n${PLAN_SLICING_NOTE}\n\n${MODEL_NOTE}\n\n${advisorNote("claude")}\n\n${MISSED_REACH_NOTE}\n\n${QUESTIONS_NOTE}`, labels: { "linear.plan": "required" }, env: { LINEAR_TICKETS_PLAN: "required", LINEAR_TICKETS_STRONG_MODEL: "claude/opus" }, markInProgress: false });
 });
 
 test("a plan-first ticket is not marked in progress; once its plan is approved (plan-ready) the next agent implements it in the usual mode", async () => {
@@ -1246,7 +1246,7 @@ test("an approved plan that names no tier goes back to planning for its model se
   assert.deepEqual({ provider: h.launches[0].provider, labels: h.launches[0].labels, env: h.launches[0].env, markInProgress: h.launches[0].markInProgress }, { provider: "omp/opus", labels: { "linear.plan": "required" }, env: { LINEAR_TICKETS_PLAN: "required", LINEAR_TICKETS_STRONG_MODEL: "omp/opus" }, markInProgress: false });
   assert.ok(h.launches[0].instructions.startsWith(tierMissingNote("TUC-1", { url: "https://linear.app/doc/plan", content: "# Plan\n1. Add the table" })));
   assert.ok(h.launches[0].instructions.includes(MODEL_NOTE));
-  assert.ok(!h.launches[0].instructions.includes(OVERLAP_NOTE), "the approved plan already looked for overlaps");
+  assert.ok(!h.launches[0].instructions.includes(RELATED_WORK_NOTE), "the approved plan already looked for overlaps");
 });
 
 const PR: PullRequestView = { state: "OPEN", isDraft: false, headSha: "h", headBranch: "tuc-1", baseBranch: "main", updatedAt: "", reviewDecision: "", labels: [], mergeActivity: null, comments: [], reviews: [], lastCommitAt: null, checks: [], mergeable: null };
