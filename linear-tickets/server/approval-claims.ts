@@ -516,11 +516,15 @@ export class ClaimRequests {
       }
       const answer = await this.sendClaim(record);
       if (!answer) {
-        // Fail closed, and forget the id: this plan goes to the owner now, and a late grant must not
-        // decide it afterwards.
+        // Nothing was granted (no coordinator, or it refused the request): forget the id, so a host
+        // without a coordinator keeps no record per plan.
         await this.remove(record.issueId);
         return { state: "unreachable" };
       }
+      // Sent, but no answer came back: the coordinator may have granted it. The record stays
+      // `claiming`, so reconciliation resends the same id, and a late grant is then committed or
+      // given back like any other instead of blocking overlapping plans until the owner answers.
+      if (answer.state === "unreachable") return answer;
       if (answer.state === "granted") {
         await this.write({ ...record, state: "granted" });
         return { state: "granted" };
@@ -656,32 +660,30 @@ export class ClaimRequests {
     })();
   }
 
+  // The coordinator's answer; `null` when nothing can have been granted (no coordinator, no origin,
+  // a refused request or a local check that failed), `unreachable` when a sent request got no answer.
   private async sendClaim(record: ClaimIntent): Promise<ClaimAnswer | null> {
     const coordinator = await this.coordinator();
     if (!coordinator) return null;
+    const request = { claimId: record.claimId, issueId: record.issueId, identifier: record.identifier, planHash: record.planHash, footprint: record.footprint, roundStartedAt: record.roundStartedAt };
+    if (coordinator.kind === "local") return await coordinator.claims.claim({ ...request, origin: null }).catch(() => null);
+    // The coordinator has to be able to ask this host back, so a host without a published origin
+    // cannot claim: it falls back to the owner.
+    const origin = await this.deps.origin().then((value) => value?.replace(/\/+$/, "") ?? null).catch(() => null);
+    if (!origin) return null;
+    let response: Response;
     try {
-      if (coordinator.kind === "local") {
-        return await coordinator.claims.claim({
-          claimId: record.claimId, issueId: record.issueId, identifier: record.identifier, planHash: record.planHash,
-          footprint: record.footprint, roundStartedAt: record.roundStartedAt, origin: null,
-        });
-      }
-      // The coordinator has to be able to ask this host back, so a host without a published origin
-      // cannot claim: it falls back to the owner.
-      const origin = await this.deps.origin().then((value) => value?.replace(/\/+$/, "") ?? null).catch(() => null);
-      if (!origin) return null;
-      const response = await fetch(`${coordinator.origin}/api/approval-claims`, {
+      response = await fetch(`${coordinator.origin}/api/approval-claims`, {
         method: "POST", signal: AbortSignal.timeout(PEER_TIMEOUT_MS * 2),
         headers: { "content-type": "application/json", "x-review-action": "1" },
-        body: JSON.stringify({
-          claimId: record.claimId, issueId: record.issueId, identifier: record.identifier, planHash: record.planHash,
-          footprint: record.footprint, roundStartedAt: record.roundStartedAt, origin,
-        }),
+        body: JSON.stringify({ ...request, origin }),
       });
-      if (!response.ok) return null;
+    } catch { return { state: "unreachable" }; }
+    if (!response.ok) return null;
+    try {
       const answer = ClaimAnswerBody.safeParse(await response.json());
-      return answer.success ? answer.data : null;
-    } catch { return null; }
+      return answer.success ? answer.data : { state: "unreachable" };
+    } catch { return { state: "unreachable" }; }
   }
 
   private async reportTo(origin: string, entry: OwnerApproval): Promise<boolean> {

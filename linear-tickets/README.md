@@ -1294,7 +1294,9 @@ exist. A grant is written to `granted.json` before it is answered, and a repeate
 stored answer; a committed approval enters `ledger.json` before it leaves the grant table. A claim
 id is a uuid v7: one older than 30 days is `expired`, and a late retry never becomes a grant. A host
 that finds no coordinator, more than one peer answering `dispatch.enabled: true`, or no answer
-within the peer timeout keeps the plan with you: `the approval coordinator could not be reached`.
+within the peer timeout keeps the plan with you: `the approval coordinator could not be reached`. A
+request that got no answer may still have been granted, so its id is resent every sweep until the
+coordinator answers; a late grant is then committed or given back like any other.
 Owner approvals take the same path from any host: the outbox entry is saved before the `Plan:`
 document is written, reported after it, and retried every sweep until the coordinator acknowledges
 it, so an approval is known before Linear's read shows it.

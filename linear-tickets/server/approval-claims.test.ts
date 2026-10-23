@@ -472,6 +472,50 @@ test("AC-18: no coordinator, two hosts answering dispatch, or no answer keep the
   }
 });
 
+test("AC-18: a claim granted after its requester stopped waiting is resent with the same id, not left blocking", { timeout: 20_000 }, async () => {
+  await withWorld(async (world) => {
+    const one = world.ticket("TUC-1");
+    const claims = world.claims();
+    let hang = true;
+    // The coordinator grants (its Linear read was slow) but the answer never reaches the requester.
+    const server = createServer((request, response) => {
+      let body = "";
+      request.on("data", (chunk: Buffer) => { body += chunk; });
+      request.on("end", () => {
+        void (async () => {
+          const json = (value: unknown) => response.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(value));
+          if (request.url === "/api/inbox") return json({ dispatch: { enabled: true } });
+          if (request.url === "/api/approval-claims/settle") {
+            const { claimId, state } = JSON.parse(body) as { claimId: string; state: "committed" | "withdrawn" };
+            return json(await claims.settle(claimId, state));
+          }
+          const answer = await claims.claim(JSON.parse(body) as ClaimRequest);
+          if (hang) { response.on("error", () => {}); return; }
+          json(answer);
+        })();
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    try {
+      const origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+      let rejudged = 0;
+      const directory = join(world.root, "remote");
+      const remote = world.requester({ directory, local: async () => null, peers: [origin], origin: "http://127.0.0.1:49999", rejudge: async () => { rejudged += 1; } });
+      assert.deepEqual(await world.claim(remote, one, X), { state: "unreachable" });
+      const claimId = await claimIdOf(world, directory, one);
+      assert.equal(await claims.status(claimId), "granted");
+      hang = false;
+      world.clock.tick(61_000);
+      await remote.reconcile();
+      assert.equal((await world.file(directory, `${one.issueId}.json`))?.state, "granted", "the resent id gets the stored grant");
+      world.clock.tick(61_000);
+      await remote.reconcile();
+      assert.equal(await claims.status(claimId), "withdrawn", "the review still waits, so the grant is given back and the plan judged again");
+      assert.equal(rejudged, 1);
+    } finally { server.close(); }
+  });
+});
+
 test("AC-18: a requester on another host claims through the real inbox route, which refuses a request without the custom header", async () => {
   await withWorld(async (world) => {
     const one = world.ticket("TUC-1");
