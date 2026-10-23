@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
-import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -12,7 +12,7 @@ import type { PaseoApi, PaseoWorkspaceAgentCreateOptions } from "@getpaseo/clien
 import { LINEAR_ACCESS_NOTE, NO_LINEAR_ACCESS_NOTE } from "../shared/contracts";
 import { buildPrompt, normalizeIssue } from "./context";
 import { Launcher } from "./launch";
-import { LinearBroker } from "./linear-broker";
+import { LinearBroker, type BrokerOptions } from "./linear-broker";
 import { LinearUsage } from "./linear-usage";
 import { RateBudget } from "./rate-budget";
 import { Settings } from "./settings";
@@ -206,8 +206,8 @@ async function fakeLinear(respond: (call: Call) => unknown, options: { status?: 
   return { url, calls, close: () => new Promise<void>((resolve) => server.close(() => resolve())) };
 }
 
-function runServer(script: string, args: string[], env: Record<string, string>) {
-  const child = spawn(process.execPath, [script, ...args], { env: { PATH: process.env.PATH ?? "", ...env }, stdio: ["pipe", "pipe", "pipe"] });
+function runServer(script: string, args: string[], env: Record<string, string>, cwd?: string) {
+  const child = spawn(process.execPath, [script, ...args], { env: { PATH: process.env.PATH ?? "", ...env }, cwd, stdio: ["pipe", "pipe", "pipe"] });
   const pending = new Map<number, (value: Record<string, unknown>) => void>();
   createInterface({ input: child.stdout }).on("line", (line) => {
     const message = JSON.parse(line);
@@ -258,7 +258,7 @@ test("the MCP server reads, comments, moves and links only its own ticket over s
     const init = (await mcp.request("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "t", version: "1" } })).result as { protocolVersion: string };
     assert.equal(init.protocolVersion, "2025-06-18");
     const list = (await mcp.request("tools/list")).result as { tools: { name: string }[] };
-    assert.deepEqual(list.tools.map((tool) => tool.name), ["get_ticket", "get_issue", "get_comments", "search_issues", "add_comment", "set_status", "link_url", "add_relation", "create_issue", "update_issue", "add_manual_task"], "an ordinary ticket agent never sees the steward's verdict tool");
+    assert.deepEqual(list.tools.map((tool) => tool.name), ["get_ticket", "get_issue", "get_comments", "search_issues", "add_comment", "set_status", "link_url", "attach_file", "add_relation", "create_issue", "update_issue", "add_manual_task"], "an ordinary ticket agent never sees the steward's verdict tool");
 
     const ticket = JSON.parse((await mcp.call("get_ticket")).text);
     assert.equal(ticket.identifier, "ENG-42");
@@ -540,6 +540,123 @@ test("writes follow the issue's scope: own ticket, issues the agent created, any
   } finally { mcp.stop(); await broker.stop(); await linear.close(); await rm(home, { recursive: true, force: true }); }
 });
 
+const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x01]);
+
+test("attach_file uploads an evidence file as the Paseo app, forwards Linear's headers verbatim and links the asset", async () => {
+  const { home, script } = await host("paseo-linear-mcp-attach-");
+  const evidence = await mkdtemp(join(tmpdir(), "paseo-linear-mcp-evidence-"));
+  const file = join(evidence, "login-before.png");
+  await writeFile(file, PNG);
+  const stores: { url: string; headers: Record<string, string>; body: Buffer }[] = [];
+  const linear = await fakeLinear((call) => {
+    if (call.query.includes("query ticket")) return { issue };
+    if (call.query.includes("fileUpload")) return { fileUpload: { success: true, uploadFile: { uploadUrl: "https://storage.test/put/1", assetUrl: "https://uploads.linear.app/ws/asset-1", headers: [{ key: "x-goog-content-length-range", value: `${PNG.length},${PNG.length}` }, { key: "cache-control", value: "private" }] } } };
+    if (call.query.includes("attachmentCreate")) return { attachmentCreate: { success: true, attachment: { id: "att-1", url: "https://linear.app/x/issue/ENG-42#att-1" } } };
+    return {};
+  });
+  writeToken(home, "app-1");
+  const { broker, budget } = await brokerOn(home, linear, async (url, headers, bytes) => {
+    stores.push({ url, headers, body: bytes });
+    return new Response(null, { status: 200 });
+  });
+  samples(budget);
+  const mcp = startOn(home, script);
+  try {
+    const attached = await mcp.call("attach_file", { path: file, title: "Login before", subtitle: "Chrome, 1440px" });
+    assert.equal(attached.isError, false, attached.text);
+    const result = JSON.parse(attached.text);
+    assert.deepEqual(result, { attached: true, issue: "ENG-42", title: "Login before", assetUrl: "https://uploads.linear.app/ws/asset-1", attachmentId: "att-1" });
+    assert.equal(stores.length, 1);
+    assert.equal(stores[0].url, "https://storage.test/put/1");
+    assert.deepEqual(stores[0].headers, { "Content-Type": "image/png", "x-goog-content-length-range": `${PNG.length},${PNG.length}`, "cache-control": "private" }, "the file's type is sent, and Linear's headers reach the storage address unchanged and win over the defaults");
+    assert.deepEqual(stores[0].body, PNG);
+    assert.deepEqual(linear.calls.find((call) => call.query.includes("fileUpload"))!.variables, { contentType: "image/png", filename: "login-before.png", size: PNG.length });
+    assert.deepEqual(linear.calls.find((call) => call.query.includes("attachmentCreate"))!.variables, { input: { issueId: ISSUE_ID, url: "https://uploads.linear.app/ws/asset-1", title: "Login before", subtitle: "Chrome, 1440px" } });
+    assert.ok(linear.calls.every((call) => call.authorization === "Bearer app-1"));
+    assert.ok(stores.every((store) => !JSON.stringify(store.headers).includes("app-1")), "the storage PUT carries no credential");
+  } finally { mcp.stop(); await broker.stop(); await linear.close(); await rm(home, { recursive: true, force: true }); await rm(evidence, { recursive: true, force: true }); }
+});
+
+test("attach_file refuses a foreign ticket but accepts this ticket's sub-issue", async () => {
+  const { home, script } = await host("paseo-linear-mcp-attach-scope-");
+  const evidence = await mkdtemp(join(tmpdir(), "paseo-linear-mcp-evidence-"));
+  const file = join(evidence, "shot.png");
+  await writeFile(file, PNG);
+  const child = { ...issue, id: "child-1", identifier: "ENG-43", parent: { id: ISSUE_ID, identifier: "ENG-42", title: "Fix sign-in" } };
+  const other = { ...issue, id: "other-1", identifier: "ENG-7", title: "Someone else's", parent: null };
+  const linear = await fakeLinear((call) => {
+    if (call.query.includes("query ticket")) return { issue: call.variables.id === "ENG-7" ? other : call.variables.id === "ENG-43" ? child : issue };
+    if (call.query.includes("fileUpload")) return { fileUpload: { success: true, uploadFile: { uploadUrl: "https://storage.test/put/1", assetUrl: "https://uploads.linear.app/ws/asset-1", headers: [] } } };
+    if (call.query.includes("attachmentCreate")) return { attachmentCreate: { success: true, attachment: { id: "att-1", url: "https://linear.app/x/issue/ENG-43#att-1" } } };
+    return {};
+  });
+  const { broker, budget } = await brokerOn(home, linear, async () => new Response(null, { status: 200 }));
+  samples(budget);
+  const mcp = startOn(home, script);
+  try {
+    const refused = await mcp.call("attach_file", { path: file, issue: "ENG-7" });
+    assert.equal(refused.isError, true);
+    assert.match(refused.text, /ENG-7 is neither this agent's ticket nor one of its sub-issues/);
+    assert.equal(linear.calls.filter((call) => call.query.includes("fileUpload")).length, 0, "a foreign ticket never reaches Linear's file storage");
+
+    const attached = await mcp.call("attach_file", { path: file, issue: "ENG-43" });
+    assert.equal(attached.isError, false, attached.text);
+    const allowed = JSON.parse(attached.text);
+    assert.equal(allowed.issue, "ENG-43");
+    const attachmentInput = linear.calls.find((call) => call.query.includes("attachmentCreate"))!.variables.input;
+    assert.ok(attachmentInput && typeof attachmentInput === "object" && "issueId" in attachmentInput);
+    assert.equal(attachmentInput.issueId, "child-1");
+  } finally { mcp.stop(); await broker.stop(); await linear.close(); await rm(home, { recursive: true, force: true }); await rm(evidence, { recursive: true, force: true }); }
+});
+
+test("attach_file refuses a relative path, a credential directory, an escaping symlink and a file whose bytes are not its type", async () => {
+  const { home, script } = await host("paseo-linear-mcp-attach-guard-");
+  const work = await mkdtemp(join(tmpdir(), "paseo-linear-mcp-worktree-"));
+  const outside = await mkdtemp(join(tmpdir(), "paseo-linear-mcp-outside-"));
+  await writeFile(join(work, "shot.png"), PNG);
+  await writeFile(join(work, "notes.png"), "not a png");
+  await writeFile(join(work, "setup.exe"), PNG);
+  await writeFile(join(outside, "secret.png"), PNG);
+  await symlink(join(outside, "secret.png"), join(work, "escape.png"));
+  const credential = join(home, "linear-tickets", "secret.png");
+  await writeFile(credential, PNG);
+  const linear = await fakeLinear(() => ({ issue }));
+  const { broker, budget } = await brokerOn(home, linear);
+  samples(budget);
+  const mcp = runServer(script, ["--issue", ISSUE_ID, "--paseo-home", home], {}, work);
+  try {
+    assert.match((await mcp.call("attach_file", { path: "shot.png" })).text, /absolute path/);
+    assert.match((await mcp.call("attach_file", { path: join(work, "notes.png") })).text, /does not contain PNG data/);
+    assert.match((await mcp.call("attach_file", { path: join(work, "setup.exe") })).text, /not an allowed evidence type/);
+    assert.match((await mcp.call("attach_file", { path: join(work, "escape.png") })).text, /symbolic link that leaves the agent's worktree/);
+    assert.match((await mcp.call("attach_file", { path: credential })).text, /credential directory/);
+    assert.equal(linear.calls.filter((call) => call.query.includes("fileUpload")).length, 0, "a refused file never reaches Linear");
+  } finally { mcp.stop(); await broker.stop(); await linear.close(); await rm(home, { recursive: true, force: true }); await rm(work, { recursive: true, force: true }); await rm(outside, { recursive: true, force: true }); }
+});
+
+test("a failed storage PUT creates no attachment", async () => {
+  const { home, script } = await host("paseo-linear-mcp-attach-fail-");
+  const evidence = await mkdtemp(join(tmpdir(), "paseo-linear-mcp-evidence-"));
+  const file = join(evidence, "shot.png");
+  await writeFile(file, PNG);
+  const linear = await fakeLinear((call) => {
+    if (call.query.includes("query ticket")) return { issue };
+    if (call.query.includes("fileUpload")) return { fileUpload: { success: true, uploadFile: { uploadUrl: "https://storage.test/put/1", assetUrl: "https://uploads.linear.app/ws/asset-1", headers: [] } } };
+    if (call.query.includes("attachmentCreate")) return { attachmentCreate: { success: true, attachment: { id: "att-1", url: "https://linear.app/x/issue/ENG-42#att-1" } } };
+    return {};
+  });
+  const { broker, budget } = await brokerOn(home, linear, async () => new Response(null, { status: 500 }));
+  samples(budget);
+  const mcp = startOn(home, script);
+  try {
+    const failed = await mcp.call("attach_file", { path: file });
+    assert.equal(failed.isError, true);
+    assert.match(failed.text, /file storage answered HTTP 500; nothing was attached/);
+    assert.equal(linear.calls.filter((call) => call.query.includes("fileUpload")).length, 1);
+    assert.equal(linear.calls.filter((call) => call.query.includes("attachmentCreate")).length, 0);
+  } finally { mcp.stop(); await broker.stop(); await linear.close(); await rm(home, { recursive: true, force: true }); await rm(evidence, { recursive: true, force: true }); }
+});
+
 test("the MCP server prefers LINEAR_API_KEY and reports a missing key", async () => {
   const home = await mkdtemp(join(tmpdir(), "paseo-linear-mcp-key-"));
   const linear = await fakeLinear(() => ({ issue }));
@@ -718,10 +835,10 @@ function samples(budget: RateBudget, overrides: Partial<Record<"app" | "key", He
 
 // The daemon's broker on this home; the fake Linear server is injected here, at construction,
 // never through the child's environment.
-async function brokerOn(home: string, linear: { url: string }) {
+async function brokerOn(home: string, linear: { url: string }, store?: BrokerOptions["store"]) {
   const usage = new LinearUsage(() => Date.now(), { path: join(home, "usage.json") });
   const budget = new RateBudget(() => Date.now(), usage);
-  const broker = new LinearBroker({ home, budget, usage, upstream: (authorization, query, variables, signal) =>
+  const broker = new LinearBroker({ home, budget, usage, ...(store ? { store } : {}), upstream: (authorization, query, variables, signal) =>
     fetch(linear.url, { method: "POST", headers: { authorization, "content-type": "application/json" }, body: JSON.stringify({ query, variables }), signal }) });
   await broker.start();
   return { broker, budget };
@@ -1054,7 +1171,7 @@ test("without the broker the tools stay available and every request fails closed
     const init = (await mcp.request("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "t", version: "1" } })).result as { protocolVersion: string };
     assert.equal(init.protocolVersion, "2025-06-18");
     const list = (await mcp.request("tools/list")).result as { tools: { name: string }[] };
-    assert.equal(list.tools.length, 11, "the tools stay mounted when the broker is down");
+    assert.equal(list.tools.length, 12, "the tools stay mounted when the broker is down");
     for (const call of [() => mcp.call("get_ticket"), () => mcp.call("add_comment", { body: "Started." })]) {
       const result = await call();
       assert.equal(result.isError, true);

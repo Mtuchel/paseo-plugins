@@ -172,3 +172,34 @@ test("corrupt recovery state fails closed instead of using elapsed time to disca
   assert.equal((await call(recovered.broker.socketPath)).kind, "unsent");
   assert.deepEqual(recovered.calls, []);
 });
+
+function upload(socketPath: string, url: string, headers: { key: string; value: string }[], body: string): Promise<BrokerReply> {
+  return new Promise((resolve, reject) => {
+    const client = request({ socketPath, path: "/upload", method: "POST", headers: {
+      "x-paseo-upload-url": Buffer.from(url, "utf8").toString("base64url"),
+      "x-paseo-upload-headers": Buffer.from(JSON.stringify(headers), "utf8").toString("base64url"),
+    } }, (response) => {
+      let answer = "";
+      response.setEncoding("utf8");
+      response.on("data", (chunk) => { answer += chunk; });
+      response.on("end", () => { try { resolve(JSON.parse(answer)); } catch (error) { reject(error); } });
+    });
+    client.on("error", reject);
+    client.end(body);
+  });
+}
+
+test("the upload route forwards Linear's headers and bytes to an https address and refuses anything else", async (t) => {
+  const stores: { url: string; headers: Record<string, string>; body: string }[] = [];
+  const { broker } = await fixture(t, { store: async (url, headers, bytes) => {
+    stores.push({ url, headers, body: bytes.toString("utf8") });
+    return new Response(null, { status: 200 });
+  } });
+  const reply = await upload(broker.socketPath, "https://storage.test/put/1", [{ key: "x-goog-meta-test", value: "v1" }], "png-bytes");
+  assert.deepEqual(reply, { kind: "answer", status: 200, payload: null });
+  assert.deepEqual(stores, [{ url: "https://storage.test/put/1", headers: { "x-goog-meta-test": "v1" }, body: "png-bytes" }]);
+  assert.equal((await upload(broker.socketPath, "http://storage.test/put/1", [], "png-bytes")).kind, "unsent");
+  assert.equal((await upload(broker.socketPath, "https://user:pass@storage.test/put/1", [], "png-bytes")).kind, "unsent");
+  assert.equal((await upload(broker.socketPath, "https://storage.test/put/1", [{ key: "bad header", value: "v" }], "png-bytes")).kind, "unsent");
+  assert.equal(stores.length, 1, "the storage address sees only the valid upload");
+});
