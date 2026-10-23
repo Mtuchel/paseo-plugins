@@ -4022,9 +4022,12 @@ No tokens, query bodies or ticket text appear in the report.
   sources per batch; model extraction remains limited to two. No source or history is dropped.
   A cold start still waits for the complete Linear history; these local bounds do not promise
   a sub-30-second initial network collection.
-- **Review card metadata refreshes every 15 minutes per identifier.** The label catalog still
-  refreshes every five minutes. Decisions and deletion always bypass display metadata and
-  check the exact current issue identity from Linear.
+- **Review card metadata refreshes every 15 minutes per identifier, in batches.** The rows of one
+  inbox refresh share one request per 50 tickets of a team instead of one request each (about 290
+  requests an hour for 73 rows on server087 on 2026-10-23). A ticket that request does not return
+  (deleted, moved, invisible) shows no metadata until its 15 minutes pass, rather than being asked
+  for again every 30 seconds. The label catalog still refreshes every five minutes. Decisions and
+  deletion always bypass display metadata and check the exact current issue identity from Linear.
 - **Waiting threads are read in batches.** Every sweep checks each queued thread (waiting for
   blockers, a slot, or a live OMP worker of its ticket to exit) for a session that ended in Linear
   and, once nothing local holds it, for a ticket moved to Done or Canceled. These reads used to

@@ -1,8 +1,8 @@
 import { areaLabels, type AreaLabels } from "./area-labels";
-import { UUID, type LinearService } from "./linear";
+import { UUID, type IssueMetadata, type LinearService } from "./linear";
 
 export type ReviewIssueInfo = { issueId: string; areas: string[] };
-type Reader = Pick<LinearService, "issueMetadata" | "labelCatalog">;
+type Reader = Pick<LinearService, "issueMetadata" | "issuesMetadata" | "labelCatalog">;
 type Entry = { value: ReviewIssueInfo | null; expiresAt: number; retryAt: number };
 const INFO_TTL = 15 * 60_000;
 const CATALOG_TTL = 5 * 60_000;
@@ -19,6 +19,7 @@ export class ReviewIssueInfos {
   private catalog: { areasOf: AreaLabels; expiresAt: number } | null = null;
   private catalogPending: Promise<AreaLabels> | null = null;
   private catalogRetryAt = 0;
+  private batch: { keys: Set<string>; read: Promise<Map<string, IssueMetadata>> } | null = null;
 
   constructor(private readonly linear: Reader, private readonly now: () => number = Date.now) {}
 
@@ -53,10 +54,23 @@ export class ReviewIssueInfos {
     }
   }
 
+  // Display reads started in the same turn (the inbox enriches all its rows at once) share one
+  // batched request per 50 tickets of a team. A ticket the batch does not return is cached as
+  // unknown like a mismatched one. Fresh reads stay single reads of exactly this identifier.
+  private metadata(key: string, fresh: boolean): Promise<IssueMetadata | null> {
+    if (fresh) return this.linear.issueMetadata(key);
+    if (!this.batch) {
+      const keys = new Set<string>();
+      this.batch = { keys, read: Promise.resolve().then(() => { this.batch = null; return this.linear.issuesMetadata([...keys]); }) };
+    }
+    this.batch.keys.add(key);
+    return this.batch.read.then((found) => found.get(key) ?? null);
+  }
+
   private async read(key: string, fresh: boolean): Promise<ReviewIssueInfo | null> {
     try {
-      const state = await this.linear.issueMetadata(key);
-      if (state.identifier !== key || !UUID.test(state.id)) {
+      const state = await this.metadata(key, fresh);
+      if (!state || state.identifier !== key || !UUID.test(state.id)) {
         this.save(key, { value: null, expiresAt: this.now() + INFO_TTL, retryAt: 0 });
         return null;
       }
