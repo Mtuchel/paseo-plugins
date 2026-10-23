@@ -5560,7 +5560,7 @@ they are already separate processes of their own.
 The daemon gives each plugin hook 30 seconds; an `agent.session_open` hook that takes longer fails
 the open (`before agent.session_open failed: Plugin RPC timed out`). The load probe
 (`server/load-probe.ts`) records what keeps the plugin's event loop busy, so such a timeout can be
-traced to its cause. It starts with the plugin's first daemon connection, stops on unload, and
+traced to its cause. It starts when the plugin loads, so the first hooks are measured too, stops on unload, and
 never changes what the work it times returns or throws. It writes four kinds of log lines:
 
 - `[linear-tickets] event loop blocked <ms> ms (heap <n> MB, rss <n> MB, in flight: <name> <ms> ms, …)`:
@@ -5583,16 +5583,18 @@ never changes what the work it times returns or throws. It writes four kinds of 
 - `[linear-tickets] profiler …`: the CPU profiler's start, stop and failures (below).
 
 The CPU profiler only runs while the owner asks for it. The switch is the file
-`$PASEO_HOME/linear-tickets/diagnostics/profile-until` holding an ISO end time, for example
-`date -u -d '+5 hours' +%Y-%m-%dT%H:%M:%SZ > ~/.paseo/linear-tickets/diagnostics/profile-until`.
-The plugin reads it once a minute and ignores, with one log line, an end time that has passed or
-lies more than 24 hours after the file was written; leaving the file in place never extends a
-recording. While the switch holds, an in-process inspector session records one-minute chunks and
-keeps a chunk as `diagnostics/<start time>.cpuprofile` only when its minute held a stall of at
-least 5 seconds; open it in Chrome DevTools or `speedscope`. At most 30 profiles and 500 MB are
-kept, the oldest are deleted first. The recording ends at the end time, when the file is deleted,
-or when the plugin unloads; any profiler failure disconnects the session and leaves the profiler
-off until the next reload.
+`$PASEO_HOME/linear-tickets/diagnostics/profile-until` holding an ISO end time with its zone, for
+example `date -u -d '+5 hours' +%Y-%m-%dT%H:%M:%SZ > ~/.paseo/linear-tickets/diagnostics/profile-until`.
+The plugin reads it once a minute and ignores, with one log line, a value that is not such a time,
+an end time that has passed, or one more than 24 hours after the file was written; leaving the file
+in place never extends a recording. While the switch holds, an in-process inspector session records
+consecutive one-minute chunks (the next one starts before the last is written) and keeps a chunk
+as `diagnostics/<start time>.cpuprofile` only when its minute held a stall of at least 5 seconds;
+open it in Chrome DevTools or `speedscope`. At most 30 profiles and 500 MB are kept, the oldest are
+deleted first; a profile that cannot be deleted counts as a profiler failure. The recording ends at
+the end time, when the file is deleted, or when the plugin unloads, which also disconnects a session
+the inspector has not answered yet; any profiler failure disconnects the session and leaves the
+profiler off until the next reload.
 
 ## Validation
 

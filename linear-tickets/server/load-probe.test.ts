@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readdirSync } from "node:fs";
 import { mkdtemp, mkdir, readdir, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -69,10 +70,15 @@ class FakeHistogram implements DelayHistogram {
 class FakeSession implements InspectorSessionLike {
   calls: string[] = [];
   fail: string | null = null;
+  // A method whose callback never comes (an inspector that does not answer).
+  hang: string | null = null;
+  onPost: ((method: string) => void) | null = null;
   connect() { this.calls.push("connect"); }
   disconnect() { this.calls.push("disconnect"); }
   post(method: string, _params: object, callback: (error: Error | null, result?: object) => void) {
     this.calls.push(method);
+    this.onPost?.(method);
+    if (method === this.hang) return;
     if (method === this.fail) { setImmediate(() => callback(new Error(`${method} broke`))); return; }
     setImmediate(() => callback(null, method === "Profiler.stop" ? { profile: { nodes: [], startTime: 0, endTime: 1 } } : {}));
   }
@@ -177,6 +183,34 @@ test("time() hands back the work's own value and its own error", async () => {
     assert.throws(() => probe.time("pass", () => { throw syncError; }), (thrown) => thrown === syncError);
     await flush();
     assert.deepEqual(lines, [], "fast work is not logged, failed or not");
+  } finally { probe.stop(); }
+});
+
+test("step() hands back the work's own value and error, and marks only the operation it runs in", async () => {
+  const clock = new FakeClock();
+  const { probe, lines } = probeWith(clock);
+  try {
+    const value = { answer: 7 };
+    assert.equal(await probe.step("outside", async () => value), value);
+    const error = new Error("step boom");
+    await assert.rejects(probe.step("outside", async () => { throw error; }), (thrown) => thrown === error);
+
+    const gates: Array<() => void> = [];
+    const gate = () => new Promise<void>((resolve) => { gates.push(resolve); });
+    const first = probe.time("first", async () => { await probe.step("first-read", gate); }, "hook");
+    const second = probe.time("second", async () => {
+      await probe.step("second-read", gate);
+      return probe.step("second-write", async () => value);
+    }, "hook");
+    clock.advance(2500);
+    for (const open of gates.splice(0)) open();
+    await first;
+    assert.equal(await second, value);
+    await flush();
+    const slow = lines.filter((line) => line.includes(" slow "));
+    assert.equal(slow.length, 2, slow.join("\n"));
+    assert.match(slow[0] as string, /slow first 2500 ms \(ok\).*; steps: first-read 2500 ms$/);
+    assert.match(slow[1] as string, /slow second 2500 ms \(ok\).*; steps: second-read 2500 ms, second-write 0 ms$/);
   } finally { probe.stop(); }
 });
 
@@ -450,5 +484,74 @@ test("stopping the plugin disconnects a running recording", async () => {
     await world.clock.run(5 * MINUTE, world.settle);
     assert.equal(world.sessions.length, 1);
     assert.equal(session.calls.at(-1), "disconnect");
+  } finally { await world.cleanup(); }
+});
+
+test("stopping the plugin while the inspector has not answered disconnects the session it connected", async () => {
+  let enabled = () => {};
+  const enabling = new Promise<void>((resolve) => { enabled = resolve; });
+  const world = await profilerWorld({ session: () => {
+    const session = new FakeSession();
+    session.hang = "Profiler.enable";
+    session.onPost = (method) => { if (method === "Profiler.enable") enabled(); };
+    world.sessions.push(session);
+    return session;
+  } });
+  try {
+    await world.writeSwitch(world.clock.wallNow() + 60 * MINUTE);
+    world.clock.advance(MINUTE);
+    await enabling;
+    world.probe.stop();
+    assert.deepEqual((world.sessions[0] as FakeSession).calls, ["connect", "Profiler.enable", "disconnect"]);
+    assert.equal(world.lines.filter((line) => line.includes("profiler disabled")).length, 0, "a stop is not a profiler failure");
+  } finally { await world.cleanup(); }
+});
+
+test("the next chunk starts before the kept profile is written, so the chunks are consecutive", async () => {
+  const profilesAtStart: number[] = [];
+  let directory = "";
+  const world = await profilerWorld({ session: () => {
+    const session = new FakeSession();
+    session.onPost = (method) => { if (method === "Profiler.start") profilesAtStart.push(readdirSync(directory).filter((name) => name.endsWith(".cpuprofile")).length); };
+    world.sessions.push(session);
+    return session;
+  } });
+  directory = world.directory;
+  try {
+    await world.writeSwitch(world.clock.wallNow() + 60 * MINUTE);
+    await world.clock.run(70_000, world.settle);
+    world.clock.block(6000);
+    await world.clock.run(MINUTE, world.settle);
+    assert.equal((await world.profiles()).length, 1);
+    assert.deepEqual(profilesAtStart, [0, 0], "the second chunk was already recording when the first was written");
+  } finally { await world.cleanup(); }
+});
+
+test("a profile that cannot be pruned disables the profiler instead of silently passing the cap", async () => {
+  const world = await profilerWorld();
+  try {
+    await mkdir(join(world.directory, "2000-01-01T00-00-00.000Z.cpuprofile"));
+    for (let index = 1; index < 30; index++) await writeFile(join(world.directory, `2000-01-01T00-00-${String(index).padStart(2, "0")}.000Z.cpuprofile`), "{}");
+    await world.writeSwitch(world.clock.wallNow() + 60 * MINUTE);
+    await world.clock.run(70_000, world.settle);
+    world.clock.block(6000);
+    await world.clock.run(3 * MINUTE, world.settle);
+    const disabled = world.lines.filter((line) => line.includes("profiler disabled until reload"));
+    assert.equal(disabled.length, 1, world.lines.join("\n"));
+    assert.match(disabled[0] as string, /pruning profiles failed/);
+    assert.equal((world.sessions[0] as FakeSession).calls.at(-1), "disconnect");
+    assert.equal(world.sessions.length, 1, "nothing starts again until reload");
+  } finally { await world.cleanup(); }
+});
+
+test("a switch whose end time is not an ISO time is ignored and logged once", async () => {
+  const world = await profilerWorld();
+  try {
+    await writeFile(join(world.directory, "profile-until"), new Date(world.clock.wallNow() + 60 * MINUTE).toUTCString());
+    await world.clock.run(3 * MINUTE, world.settle);
+    assert.equal(world.sessions.length, 0);
+    const ignored = world.lines.filter((line) => line.includes("profiler switch ignored"));
+    assert.equal(ignored.length, 1, ignored.join("\n"));
+    assert.match(ignored[0] as string, /is not an ISO time/);
   } finally { await world.cleanup(); }
 });

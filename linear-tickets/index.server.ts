@@ -78,7 +78,7 @@ import { PeerAppUser } from "./server/peer-identity";
 import { ActivationIntake } from "./server/activation-intake";
 import { DrainRouter } from "./server/drain";
 import { ticketOwnership, ticketOwners } from "./server/activation-guard";
-import { loadProbe, startLoadProbe, type LoadProbe } from "./server/load-probe";
+import { loadProbe, startLoadProbe } from "./server/load-probe";
 import { sessionOpenGuard, sessionPrepare } from "./server/session-open";
 import { ReviewDeletions } from "./server/review-deletions";
 import { ReviewIssueInfos } from "./server/review-issue-info";
@@ -639,12 +639,12 @@ export default function contribute(server: PluginServerContext) {
     return holdSeed;
   };
   let recoveredReplyEffects = false;
-  // The load probe (README, "Diagnostics"): from the first daemon connection until the unload.
-  let probe: LoadProbe | null = null;
+  // The load probe (README, "Diagnostics"): from the plugin's load until its unload, so the first
+  // hooks are measured too, including those that arrive before any daemon connection.
+  const probe = startLoadProbe();
   const attach = (paseo: PaseoApi) => {
     const first = !attached;
     attached = true;
-    if (first && !stopped) probe = startLoadProbe();
     attachedPaseo = paseo;
     replies.attach(paseo);
     const ready = restoreOwnerHolds();
@@ -882,7 +882,7 @@ export default function contribute(server: PluginServerContext) {
     await replies.stop();
     clearTimeout(startSoon);
     clearInterval(usageTimer);
-    probe?.stop();
+    probe.stop();
     planningSmoke.stop();
     stopKeepingFresh();
     void own?.close();

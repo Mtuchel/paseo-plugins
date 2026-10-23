@@ -22,6 +22,8 @@ const IN_FLIGHT_SHOWN = 8;
 const MAX_FILES = 30;
 const MAX_BYTES = 500 * 1024 * 1024;
 const SWITCH_FILE = "profile-until";
+// An ISO 8601 time with its zone: anything else Date.parse would read is ignored.
+const ISO_TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d{1,3})?)?(Z|[+-]\d{2}:\d{2})$/;
 
 // A hook answers the daemon (session_open, turn events, capacity reads); a pass is periodic work.
 export type ProbeKind = "hook" | "pass";
@@ -217,7 +219,7 @@ export function startLoadProbe(options: LoadProbeOptions = {}): LoadProbe {
       return { invalid: `unreadable (${code ?? (error instanceof Error ? error.message : error)})`, key: `read:${code}` };
     }
     const value = text.trim();
-    const until = Date.parse(value);
+    const until = ISO_TIME.test(value) ? Date.parse(value) : Number.NaN;
     const key = `${value}@${mtimeMs}`;
     if (!Number.isFinite(until)) return { invalid: `"${value.slice(0, 40)}" is not an ISO time`, key };
     if (until <= wallNow()) return { invalid: `${value} is in the past`, key };
@@ -236,13 +238,17 @@ export function startLoadProbe(options: LoadProbeOptions = {}): LoadProbe {
     once("disabled", `profiler disabled until reload: ${phase} failed (${error instanceof Error ? error.message : error})`);
   };
 
+  // Oldest first until both caps hold. A profile that cannot be removed fails the pruning, so the
+  // caps are never silently passed; one already gone counts as removed.
   const prune = async () => {
     const names = (await readdir(directory)).filter((name) => name.endsWith(".cpuprofile")).sort();
     const sizes = await Promise.all(names.map((name) => stat(join(directory, name)).then((info) => info.size, () => 0)));
     let total = sizes.reduce((sum, size) => sum + size, 0);
     let count = names.length;
     for (let index = 0; index < names.length && (count > maxFiles || total > maxBytes); index++) {
-      await unlink(join(directory, names[index] as string)).catch(() => undefined);
+      await unlink(join(directory, names[index] as string)).catch((error: unknown) => {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      });
       count--;
       total -= sizes[index] ?? 0;
     }
@@ -252,16 +258,34 @@ export function startLoadProbe(options: LoadProbeOptions = {}): LoadProbe {
     current.timer = unref(after(() => enqueue(endChunk), Math.max(0, Math.min(CHUNK_MS, current.until - wallNow()))));
   };
 
-  // Ends the running chunk: keeps it under the stall rule, then starts the next one while the
-  // switch still allows it, or ends the recording. A stop() during any await has already
-  // disconnected the session; the chunk then ends here without touching it again.
-  const endChunk = async (): Promise<void> => {
+  // Starts the next chunk on the recording's session; false when it did not start.
+  const startChunk = async (current: Recording): Promise<boolean> => {
+    try {
+      await post(current.session, "Profiler.start");
+    } catch (error) {
+      if (recording === current) fail("Profiler.start", error);
+      return false;
+    }
+    if (recording !== current) return false;
+    current.chunkStall = 0;
+    current.chunkStartedAt = wallNow();
+    scheduleChunkEnd(current);
+    return true;
+  };
+
+  // Ends the running chunk and, before anything else is awaited, starts the next one while the
+  // switch's time has not passed, so the chunks are consecutive. Then keeps the ended chunk under
+  // the stall rule, and re-reads the switch: a removed or no longer valid one ends the recording.
+  // A stop() during any await has already disconnected the session; the chunk then ends here
+  // without touching it again.
+  const endChunk = async (next = true): Promise<void> => {
     const current = recording;
     if (!current) return;
     if (current.timer !== null) cancelAfter(current.timer);
     current.timer = null;
     // A stall that delayed this very callback has not reached the monitor yet.
     const stalled = Math.max(current.chunkStall, now() - lastTick);
+    const startedAt = current.chunkStartedAt;
     let profile: object | undefined;
     try {
       profile = ((await post(current.session, "Profiler.stop")) as { profile?: object } | undefined)?.profile;
@@ -269,63 +293,78 @@ export function startLoadProbe(options: LoadProbeOptions = {}): LoadProbe {
       if (recording === current) fail("Profiler.stop", error);
       return;
     }
+    let running = next && recording === current && current.until > wallNow() && await startChunk(current);
     if (stalled >= PROFILE_STALL_MS && profile) {
       try {
         await mkdir(directory, { recursive: true });
-        await writeFile(join(directory, `${iso(current.chunkStartedAt).replace(/:/g, "-")}.cpuprofile`), JSON.stringify(profile));
-        await prune();
+        await writeFile(join(directory, `${iso(startedAt).replace(/:/g, "-")}.cpuprofile`), JSON.stringify(profile));
       } catch (error) {
         if (recording === current) fail("writing the profile", error);
         return;
       }
-    }
-    const next = await readSwitch();
-    if (recording !== current) return;
-    if (!next || "invalid" in next) {
-      recording = null;
-      disconnect(current.session);
-      // The switch this recording ran on is not reported again as ignored once it has expired.
-      reported.add(current.key);
-      if (next) reported.add(next.key);
-      log(`profiler stopped (${!next ? "switch removed" : current.until <= wallNow() ? "switch expired" : `switch ignored: ${next.invalid}`})`);
-      return;
-    }
-    current.until = next.until;
-    current.key = next.key;
-    try {
-      await post(current.session, "Profiler.start");
-    } catch (error) {
-      if (recording === current) fail("Profiler.start", error);
-      return;
+      try {
+        await prune();
+      } catch (error) {
+        if (recording === current) fail("pruning profiles", error);
+        return;
+      }
     }
     if (recording !== current) return;
-    current.chunkStall = 0;
-    current.chunkStartedAt = wallNow();
-    scheduleChunkEnd(current);
+    const read = await readSwitch();
+    if (recording !== current) return;
+    if (read && !("invalid" in read)) {
+      current.key = read.key;
+      if (running && read.until < current.until && current.timer !== null) {
+        // A switch rewritten to an earlier time ends the chunk at that time.
+        cancelAfter(current.timer);
+        current.until = read.until;
+        scheduleChunkEnd(current);
+      }
+      current.until = read.until;
+      // Not running yet: the time had passed, and the rewritten switch names a new one. A start
+      // that fails or meets a stop has already ended the recording.
+      if (!running) await startChunk(current);
+      return;
+    }
+    recording = null;
+    if (current.timer !== null) cancelAfter(current.timer);
+    // A chunk started above is discarded with the session.
+    if (running) { try { current.session.post("Profiler.stop", {}, () => undefined); } catch { /* disconnecting below */ } }
+    disconnect(current.session);
+    // The switch this recording ran on is not reported again as ignored once it has expired.
+    reported.add(current.key);
+    if (read) reported.add(read.key);
+    log(`profiler stopped (${!read ? "switch removed" : current.until <= wallNow() ? "switch expired" : `switch ignored: ${read.invalid}`})`);
   };
 
+  // The session between its connect and its first chunk: a stop() then disconnects it at once,
+  // whether or not the inspector ever answers.
+  let connecting: InspectorSessionLike | null = null;
   const pollSwitch = async (): Promise<void> => {
     if (disabled || stopped) return;
     if (recording) {
       // Only a removed or no longer valid switch ends the chunk early; a valid one runs on.
       const read = await readSwitch();
-      if (!read || "invalid" in read) await endChunk();
+      if (!read || "invalid" in read) await endChunk(false);
       return;
     }
     const read = await readSwitch();
-    if (!read) return;
+    if (!read || stopped) return;
     if ("invalid" in read) { once(read.key, `profiler switch ignored: ${read.invalid}`); return; }
     let session: InspectorSessionLike | null = null;
     try {
       session = createSession();
+      connecting = session;
       session.connect();
       await post(session, "Profiler.enable");
       await post(session, "Profiler.start");
     } catch (error) {
+      connecting = null;
       if (session) disconnect(session);
-      fail("Profiler.start", error);
+      if (!stopped) fail("Profiler.start", error);
       return;
     }
+    connecting = null;
     if (stopped) { disconnect(session); return; }
     const current: Recording = { session, until: read.until, key: read.key, chunkStall: 0, chunkStartedAt: wallNow(), timer: null };
     recording = current;
@@ -352,6 +391,7 @@ export function startLoadProbe(options: LoadProbeOptions = {}): LoadProbe {
         try { current.session.post("Profiler.stop", {}, () => undefined); } catch { /* disconnecting below */ }
         disconnect(current.session);
       }
+      if (connecting) { disconnect(connecting); connecting = null; }
       if (active === probe) active = null;
     },
     idle: async () => { let seen: Promise<void>; do { seen = queue; await seen; } while (seen !== queue); },
