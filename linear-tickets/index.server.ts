@@ -426,6 +426,8 @@ export default function contribute(server: PluginServerContext) {
     peers: async () => (await settings.read()).reviewPeers,
     inbox: { decisions: () => browserDecisions.view() },
     origin: () => tailnetOrigin(),
+    // Reported on `/api/inbox` so peers trust this host's replan comments (plan-requests.ts).
+    appUserId: () => linear.appUserId(),
     decide: decideReview,
     decisions: { applying: () => decisionJournal.applying(), resolve: (entryId, action): Promise<void> => plannotator.resolve(entryId, action) },
     linearWorkspace: () => linear.workspaceUrl(),
