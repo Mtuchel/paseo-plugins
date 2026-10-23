@@ -6,20 +6,23 @@ import test from "node:test";
 import { documentPlanHash } from "./review-outcome";
 import { PlanRelations, RETRY_MS, summaryText } from "./plan-relations";
 import { Credentials } from "./credentials";
-import { LABEL_BY_NAME_QUERY, LinearService, type App } from "./linear";
+import { CREATE_DOCUMENT_QUERY, LABEL_BY_NAME_QUERY, LinearService, UPDATE_DOCUMENT_QUERY, type App } from "./linear";
 
 const OWN = { id: "own-id", identifier: "TUC-7", title: "this ticket" };
 const OTHER = { id: "other-id", identifier: "TUC-9", title: "the parser" };
 const THIRD = { id: "third-id", identifier: "TUC-10", title: "the duplicate" };
 const THEIR_PLAN = "# Their plan\n\nDo it.\n## Risk and impact\n\n- Impact: 1\n";
+// The ticket's own approved plan: what a catch-up section's guard names.
+const OWN_PLAN = "> **Approved** in Plannotator on 2026-10-05 09:00 UTC for TUC-7.\n\n# Plan\n\nChange things.\n";
+const NEW_PLAN = "# A new plan\n\nDifferent work.\n## Risk and impact\n\n- Impact: 2\n";
 const plan = (lines: string[]) => `## Related work\n\nText.\n\n\`\`\`related-work\n${lines.join("\n")}\n\`\`\`\n`;
 
 type Fake = ReturnType<typeof fake>;
 
-function fake(options: { open?: boolean; unstarted?: boolean; ownLabels?: string[]; targetPlan?: string | null; targetReady?: boolean; commentNull?: boolean; failCommentOnce?: boolean; loseCommentOnce?: boolean; removeNullOnce?: boolean; coreFails?: boolean } = {}) {
+function fake(options: { open?: boolean; unstarted?: boolean; ownLabels?: string[]; targetPlan?: string | null; targetReady?: boolean; commentNull?: boolean; failCommentOnce?: boolean; loseCommentOnce?: boolean; removeNullOnce?: boolean; coreFails?: boolean; ownPlan?: string | null; blockNull?: boolean } = {}) {
   const calls: string[] = [];
   const stated = new Set<string>();
-  const state = { targetPlan: options.targetPlan === undefined ? THEIR_PLAN : options.targetPlan, commentNull: options.commentNull === true, failed: false, failCommentOnce: options.failCommentOnce === true, loseCommentOnce: options.loseCommentOnce === true, lost: false, removeNull: options.removeNullOnce === true, removeFailed: false };
+  const state = { targetPlan: options.targetPlan === undefined ? THEIR_PLAN : options.targetPlan, ownPlan: options.ownPlan === undefined ? OWN_PLAN : options.ownPlan, blockNull: options.blockNull === true, commentNull: options.commentNull === true, failed: false, failCommentOnce: options.failCommentOnce === true, loseCommentOnce: options.loseCommentOnce === true, lost: false, removeNull: options.removeNullOnce === true, removeFailed: false };
   const comments: { issueId: string; body: string; id?: string }[] = [];
   const labels = new Map<string, Set<string>>([["own-id", new Set(options.ownLabels ?? [])], ["other-id", new Set(options.targetReady === false ? [] : ["plan-ready"])]]);
   const status = options.unstarted === false ? "started" : "unstarted";
@@ -40,13 +43,14 @@ function fake(options: { open?: boolean; unstarted?: boolean; ownLabels?: string
     },
     async viewerId() { return "owner"; },
     async trustedAppIds() { return ["paseo-app"]; },
-    async addBlockerAsApp(blockerId: string, blockedId: string) { calls.push(`block ${blockerId} ${blockedId}`); return true as const; },
+    async addBlockerAsApp(blockerId: string, blockedId: string) { calls.push(`block ${blockerId} ${blockedId}`); return state.blockNull ? null : true as const; },
     async relateAsApp(issueId: string, relatedId: string, type: string) { calls.push(`relate ${issueId} ${relatedId} ${type}`); return true as const; },
     async addLabelAsApp(issueId: string, name: string) { calls.push(`+${name} ${issueId}`); labels.get(issueId)?.add(name); return true as const; },
     async removeLabelAsApp(issueId: string, name: string) { calls.push(`-${name} ${issueId}`); if (state.removeNull && !state.removeFailed) { state.removeFailed = true; return null; } labels.get(issueId)?.delete(name); return true as const; },
     async commentAsApp(issueId: string, body: string, id?: string) { calls.push(`commentAsApp ${issueId}`); if (state.commentNull) return null; if (state.loseCommentOnce && !state.lost) { state.lost = true; comments.push({ issueId, body, id }); return null; } if (state.failCommentOnce && !state.failed) { state.failed = true; return null; } comments.push({ issueId, body, id }); return true as const; },
     async commentById(id: string) { return comments.some((comment) => comment.id === id) ? { id } : null; },
-    async issueDocument(_id: string, _title: string) {
+    async issueDocument(id: string, title: string) {
+      if (id === OWN.id && title.startsWith("Plan: ")) return state.ownPlan ? { url: "https://linear.app/doc/own", content: state.ownPlan } : null;
       return state.targetPlan ? { url: "https://linear.app/doc/their", content: state.targetPlan } : null;
     },
     async replanComments() { calls.push("replanComments"); return comments.map((comment) => ({ body: comment.body })); },
@@ -447,4 +451,117 @@ test("AC-14: an unavailable summary write keeps its reservation, announces nothi
     assert.equal(untrusted.comments.length, 1);
     assert.equal(untrusted.comments[0].id, first.summaryId);
   } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("AC-19: a plan approved again while a catch-up's lines are written stops the remaining blocker", async () => {
+  const recordId = "catch-up:own-id:block";
+  await harness({}, async ({ relations, fake, directory }) => {
+    const relate = fake.linear.relateAsApp;
+    // The owner approves a new plan while the first line's write is under way.
+    fake.linear.relateAsApp = async (issueId: string, relatedId: string, type: string) => {
+      const result = await relate(issueId, relatedId, type);
+      fake.state.ownPlan = NEW_PLAN;
+      return result;
+    };
+    await relations.file({
+      issueId: OWN.id, identifier: OWN.identifier, plan: plan(["TUC-7 relates to TUC-10: same files", "TUC-9 blocks TUC-7: the parser lands first"]),
+      documentUrl: null, cleanup: false, recordId, guard: { issueId: OWN.id, planHash: documentPlanHash(OWN_PLAN) },
+    });
+    assert.deepEqual(fake.calls.filter((call) => call.startsWith("block")), [], "the blocker write is skipped: the plan it belongs to was replaced");
+    assert.deepEqual(await relations.outcome(recordId), { status: "stopped", reason: "changed" });
+    const summary = fake.comments.at(-1)!.body;
+    assert.match(summary, /approved again/);
+    assert.match(summary, /TUC-9 blocks TUC-7/, "the line that was not written is named");
+    const saved = JSON.parse(await readFile(join(directory, "catch-up_own-id_block.json"), "utf8"));
+    assert.equal(saved.stopped, "changed", "the record stops on its own file");
+  });
+});
+
+test("AC-19: a plan approved again while a catch-up's lines are written stops the remaining replan", async () => {
+  const recordId = "catch-up:own-id:replan";
+  await harness({}, async ({ relations, fake }) => {
+    const relate = fake.linear.relateAsApp;
+    fake.linear.relateAsApp = async (issueId: string, relatedId: string, type: string) => {
+      const result = await relate(issueId, relatedId, type);
+      fake.state.ownPlan = NEW_PLAN;
+      return result;
+    };
+    await relations.file({
+      issueId: OWN.id, identifier: OWN.identifier, plan: plan(["TUC-7 relates to TUC-10: same files", "replan TUC-9: this plan changes what it builds"]),
+      documentUrl: null, cleanup: false, recordId, guard: { issueId: OWN.id, planHash: documentPlanHash(OWN_PLAN) },
+    });
+    assert.ok(!fake.calls.includes("replanComments"), "the replan request is not written");
+    assert.deepEqual(fake.comments.filter((comment) => comment.issueId === OTHER.id), [], "the other ticket hears nothing");
+    assert.deepEqual([...fake.labels.get(OTHER.id)!], ["plan-ready"], "and gets no `plan` label");
+    assert.deepEqual(await relations.outcome(recordId), { status: "stopped", reason: "changed" });
+    assert.match(fake.comments.at(-1)!.body, new RegExp("Not applied[^\\n]*approved again[^\\n]*\\n- replan TUC-9"));
+  });
+});
+
+test("AC-19: a catch-up record filed again with a changed section keeps its done lines and never writes the dropped one", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "paseo-plan-relations-"));
+  const f = fake({ blockNull: true });
+  const recordId = "catch-up:own-id:abc";
+  const guard = { issueId: OWN.id, planHash: documentPlanHash(OWN_PLAN) };
+  const now = Date.parse("2026-10-05T10:00:00Z");
+  try {
+    const relations = new PlanRelations(f.linear as never, async () => [], () => "server087", directory, () => now);
+    // Round 1: the relate is written, the blocker cannot be (the app answers null): it stays pending.
+    await relations.file({
+      issueId: OWN.id, identifier: OWN.identifier, plan: plan(["TUC-7 relates to TUC-10: same files", "TUC-9 blocks TUC-7: the parser lands first"]),
+      documentUrl: null, cleanup: false, recordId, guard,
+    });
+    assert.deepEqual(f.calls.filter((call) => call.startsWith("block")), ["block other-id own-id"]);
+    assert.deepEqual(await relations.outcome(recordId), { status: "pending" }, "the blocker waits for its retry");
+    // The owner returns with a changed section under the same record id.
+    await relations.file({
+      issueId: OWN.id, identifier: OWN.identifier, plan: plan(["TUC-7 relates to TUC-10: same files", "TUC-7 relates to TUC-9: the export calls it"]),
+      documentUrl: null, cleanup: false, recordId, guard,
+    });
+    assert.deepEqual(f.calls.filter((call) => call.startsWith("relate")), ["relate own-id third-id related", "relate own-id other-id related"], "the done line is not written again");
+    assert.deepEqual(f.calls.filter((call) => call.startsWith("block")), ["block other-id own-id"], "the dropped pending line is never written");
+    assert.match(f.comments.at(-1)!.body, /Dropped with this plan \(never applied\):\n- TUC-9 blocks TUC-7/);
+    assert.deepEqual(await relations.outcome(recordId), { status: "done" });
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("AC-14: a related-work document write goes only as the Paseo app, and writes nothing when the app cannot", async () => {
+  const requests: { key: string; query: string }[] = [];
+  const mutations: { query: string; variables: Record<string, unknown> }[] = [];
+  let nodes: { id: string; title: string }[] = [];
+  const post = async (key: string, query: string) => {
+    requests.push({ key, query });
+    return { issue: { id: OWN.id, documents: { nodes } } };
+  };
+  const app = {
+    query: async () => ({ issue: { id: OWN.id, documents: { nodes } } }),
+    mutate: async (query: string, variables: Record<string, unknown>) => { mutations.push({ query, variables }); return null as Record<string, unknown> | null; },
+    viewer: async () => ({ id: "paseo-app", name: "Paseo" }),
+  };
+  const linear = new LinearService(new Credentials("/nonexistent/credentials.json", "owner-key"), post, app);
+
+  nodes = [{ id: "doc-9", title: "Related work: TUC-7" }];
+  assert.equal(await linear.upsertDocumentAsApp(OWN.id, "Related work: TUC-7", "body"), null, "an app that cannot write returns null");
+  assert.deepEqual(mutations.map((mutation) => mutation.query), [UPDATE_DOCUMENT_QUERY], "the existing document is updated, as the app only");
+  assert.deepEqual(requests, [], "no request reaches the owner's key at all");
+  assert.deepEqual(mutations.length, 1, "the app did the one write it was asked for");
+
+  let answer: Record<string, unknown> | null = { documentCreate: { success: true, document: { id: "doc-10", url: "https://linear.app/doc/related-work" } } };
+  const working = { ...app, mutate: async (query: string, variables: Record<string, unknown>) => { mutations.push({ query, variables }); return answer; } };
+  const service = new LinearService(new Credentials("/nonexistent/credentials.json", "owner-key"), post, working);
+  nodes = [];
+  assert.equal(await service.upsertDocumentAsApp(OWN.id, "Related work: TUC-7", "body"), "https://linear.app/doc/related-work");
+  assert.deepEqual(mutations.at(-1), { query: CREATE_DOCUMENT_QUERY, variables: { input: { title: "Related work: TUC-7", content: "body", issueId: OWN.id } } }, "created on the ticket");
+  mutations.length = 0;
+  nodes = [{ id: "doc-9", title: "Related work: TUC-7" }];
+  answer = { documentUpdate: { success: true, document: { id: "doc-9", url: "https://linear.app/doc/related-work" } } };
+  assert.equal(await service.upsertDocumentAsApp(OWN.id, "Related work: TUC-7", "new body"), "https://linear.app/doc/related-work");
+  assert.deepEqual(mutations, [{ query: UPDATE_DOCUMENT_QUERY, variables: { id: "doc-9", input: { title: "Related work: TUC-7", content: "new body" } } }], "the document of that title is updated, not a second one");
+});
+
+test("AC-7: a catch-up section's replan comment credits the catch-up ticket, not the host", async () => {
+  await harness({}, async ({ relations, fake }) => {
+    await relations.file({ issueId: OWN.id, identifier: OWN.identifier, plan: plan(["replan TUC-9: the analysis changes it"]), documentUrl: null, cleanup: false, recordId: "catch-up:own-id:x", origin: "TUC-42" });
+    assert.match(fake.comments.find((comment) => comment.issueId === OTHER.id)!.body, /Replan requested\*\* by TUC-42's approved plan/);
+  });
 });

@@ -8,9 +8,12 @@ import { normalizeIssue } from "./context";
 import { PullRequestFiles, type PullRequestRead } from "./label-sync";
 import { Launcher } from "./launch";
 import type { CandidateIssue, DoneIssue, Pages, PlanDocument } from "./linear";
-import { CANDIDATE_PULL_REQUEST_READS, CANDIDATE_TTL_MS, PRECEDENCE_RULE, RelatedWork } from "./related-work";
+import { CANDIDATE_PULL_REQUEST_READS, CANDIDATE_TTL_MS, composePlan, PRECEDENCE_RULE, relatedWorkDocument, RelatedWork } from "./related-work";
 import { DEFAULT_WORKTREE_SHARDS, DEFAULT_ACTIVATION, DEFAULT_BACKSTOP, DEFAULT_DISPATCH, DEFAULT_WRITEBACK, DEFAULT_WATCHDOG, DEFAULT_STEWARD, DEFAULT_DEPUTY, type PluginSettings } from "./settings";
 import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
+import { planFootprint } from "../shared/plan-footprint";
+import { documentPlanHash, documentPlanText } from "./review-outcome";
+import { planSetup } from "./starter";
 
 const NOW = Date.parse("2026-10-15T12:00:00Z");
 const pr = (n: number) => `https://github.com/o/r/pull/${n}`;
@@ -97,7 +100,7 @@ test("AC-1: the candidate list gives the team's open tickets, approved plans wit
   assert.equal(plans, [
     "## Approved plans of open tickets, newest approval first (2)",
     "Complete.",
-    "### TUC-1 — Ticket 1 (Todo), approved 2026-10-12 09:30 UTC\nRelated-work list: yes.\nFiles: `server/x.ts`.\nReach:\n\nAlso the CSV export.",
+    "### TUC-1 — Ticket 1 (Todo), approved 2026-10-12 09:30 UTC\nRelated-work list: yes, naming TUC-9.\nFiles: `server/x.ts`.\nReach:\n\nAlso the CSV export.",
     "### TUC-3 — Ticket 3 (In Progress), approved 2026-10-01\nRelated-work list: no.\nFiles: none named.\nReach: the plan has no `## Reach` section.",
   ].join("\n\n"), "a plan sent back is not listed");
 
@@ -211,4 +214,93 @@ test("a candidate list that cannot be built warns and tells the planner to searc
   assert.equal(result.agentId, "agent-1");
   assert.ok(result.warnings.includes("Could not build the candidate list of related work: Linear unavailable"));
   assert.ok(saved[0].endsWith("# Candidate list\n\nThe candidate list could not be built (Linear unavailable). Search Linear's open tickets and those done in the last 60 days for related work instead."));
+});
+
+test("AC-19: an old approved plan is read with its catch-up document while that one covers it, and without it after a new approval", async (t) => {
+  const approved = `> **Approved** in Plannotator on 2026-10-12 09:30 UTC for TUC-1.
+
+# Plan
+
+Change \`server/x.ts\`.
+
+## Model
+
+- Tier: cheap — one file
+- Strong steps: none — routine
+- Acceptance tests: none — no test seam
+`;
+  const analysis = "### TUC-4 — it changes the same file\n\n- TUC-4 — related: it changes the same file.\n- TUC-9 blocks TUC-1: it lands first.";
+  const reach = "- `server/z.ts`: include — AC-2, its export path.\n- `server/y.ts`: include — AC-3, the label.";
+  const annotation = relatedWorkDocument({ planHash: documentPlanHash(approved), section: analysis, catchUp: "TUC-8", approvedAt: "2026-10-15T09:00:00.000Z", reach });
+  const open = [candidate(1, { planDocuments: [
+    { id: "d1", title: "Plan: TUC-1", updatedAt: "2026-10-12T09:31:00Z" },
+    { id: "d10", title: "Related work: TUC-1", updatedAt: "2026-10-15T09:01:00Z" },
+  ] })];
+  const documents: Record<string, { content: string; updatedAt: string }> = {
+    d1: { content: approved, updatedAt: "2026-10-12T09:31:00Z" },
+    d10: { content: annotation, updatedAt: "2026-10-15T09:01:00Z" },
+  };
+  const tuc2Plan = "> **Approved** in Plannotator on 2026-10-10 08:00 UTC for TUC-2.\n\n# Plan\n\nTouch `server/y.ts`.\n";
+  const plans: PlanDocument[] = [{
+    id: "d1", title: "Plan: TUC-1", url: "https://linear.app/doc/d1", content: approved, updatedAt: "2026-10-12T09:31:00Z",
+    issue: { id: "i1", identifier: "TUC-1", url: "https://linear.app/x/issue/TUC-1", project: "App" }, relatedWork: annotation,
+  }];
+  const { linear, calls } = fakeLinear(open, documents, [], plans);
+  const { files } = await pullRequests(t, {}, () => NOW);
+  const related = new RelatedWork({ linear, pullRequests: files, now: () => NOW });
+
+  // The catch-up's eligibility reads the plan's own hash, block and reach, and the composed plan.
+  const [info] = await related.approvedPlans("team-1");
+  assert.equal(info.identifier, "TUC-1");
+  assert.equal(info.planHash, documentPlanHash(approved));
+  assert.equal(info.hasBlock, false, "the old plan has no related-work block of its own");
+  assert.equal(info.hasReach, false, "and no Reach of its own: the catch-up's is composed in");
+  assert.match(info.plan, /TUC-4 — related: it changes the same file\./);
+  assert.deepEqual(calls.documentContents.at(-1), ["d1", "d10"], "the catch-up document is read with the plan it covers");
+
+  // The candidate list shows TUC-1's related-work list: its tickets, its files, its reach.
+  const plansSection = section(await related.candidates("team-1"), "Approved plans");
+  assert.match(plansSection, /Related-work list: yes, naming TUC-4, TUC-9\./);
+  assert.match(plansSection, /Files: `server\/x\.ts`, `server\/z\.ts`, `server\/y\.ts`\./);
+  assert.match(plansSection, /Reach:\n\n- `server\/z\.ts`: include — AC-2/);
+
+  const composed = planFootprint(composePlan(approved, annotation), "TUC-1");
+  assert.deepEqual(composed.tickets, ["TUC-4", "TUC-9"]);
+  assert.deepEqual(composed.places, ["`server/z.ts`", "`server/y.ts`"]);
+
+  // TUC-2's plan names a file only the catch-up's reach named for TUC-1.
+  const changed = await related.changedSince({ issueId: "i2", identifier: "TUC-2", teamId: "team-1", plan: documentPlanText(tuc2Plan), approved: tuc2Plan });
+  assert.deepEqual(changed, [{
+    kind: "approved", identifier: "TUC-1", status: "Todo", approvedAt: Date.parse("2026-10-12T09:30:00Z"), completedAt: null,
+    overlap: { files: ["server/y.ts"], places: [], tickets: [], namesOther: false },
+  }]);
+  plans[0] = { ...plans[0], relatedWork: undefined };
+  assert.deepEqual(await related.changedSince({ issueId: "i2", identifier: "TUC-2", teamId: "team-1", plan: documentPlanText(tuc2Plan), approved: tuc2Plan }), [], "without the catch-up the old plan names no server/y.ts");
+
+  // What the implementing agent reads: the approved plan plus the analysis.
+  const setup = await planSetup({
+    issueCore: async () => ({ id: "i1", identifier: "TUC-1", creatorId: "owner-1", status: "Todo", statusType: "unstarted", teamId: "team-1", labels: [{ id: "l1", name: "plan-ready" }] }) as never,
+    viewerId: async () => "owner-1",
+    trustedAppIds: async () => [],
+    issueDocument: async (_id: string, title: string) => ({ url: `https://linear.app/doc/${title.startsWith("Plan: ") ? "d1" : "d10"}`, content: title.startsWith("Plan: ") ? approved : annotation }),
+  } as never, "i1", "omp/opus", undefined, {});
+  assert.equal(setup.policy, null, "an approved plan is implemented");
+  const note = setup.notes.find((entry) => entry.startsWith("The owner already approved a plan")) ?? "";
+  assert.match(note, /TUC-4 — related: it changes the same file\./);
+  assert.match(note, /`server\/y\.ts`: include/);
+
+  // TUC-1 approved again: the document covers the older hash and is ignored by every reader.
+  const reapproved = "> **Approved** in Plannotator on 2026-10-16 08:00 UTC for TUC-1.\n\n# Plan\n\nChange `server/x2.ts`.\n";
+  documents.d1 = { content: reapproved, updatedAt: "2026-10-16T08:01:00Z" };
+  open[0].planDocuments = [
+    { id: "d1", title: "Plan: TUC-1", updatedAt: "2026-10-16T08:01:00Z" },
+    { id: "d10", title: "Related work: TUC-1", updatedAt: "2026-10-15T09:01:00Z" },
+  ];
+  plans[0] = { ...plans[0], content: reapproved, updatedAt: "2026-10-16T08:01:00Z" };
+  const again = new RelatedWork({ linear, pullRequests: files, now: () => NOW });
+  const stale = section(await again.candidates("team-1"), "Approved plans");
+  assert.match(stale, /Related-work list: no\./);
+  assert.doesNotMatch(stale, /TUC-4|server\/y\.ts|server\/z\.ts/, "the new plan carries no related-work list, and the stale document adds none");
+  assert.deepEqual(planFootprint(composePlan(reapproved, annotation), "TUC-1").tickets, []);
+  assert.deepEqual(await again.changedSince({ issueId: "i2", identifier: "TUC-2", teamId: "team-1", plan: documentPlanText(tuc2Plan), approved: tuc2Plan }), [], "the re-approved plan names no server/y.ts either");
 });

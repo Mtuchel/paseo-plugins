@@ -19,8 +19,8 @@ import { findProject, readBranches } from "./projects";
 import { advisorNote, hasLabel, PLAN_POLICY_ENV, PLAN_POLICY_LABEL, PLAN_READY_LABEL, PLAN_REQUIRED_NOTE, PLAN_SECTIONS_NOTE, PLAN_SLICING_NOTE, planPolicy, SAFE_MODES, type PlanPolicy } from "./plan-policy";
 import { needsOwner, type Presence } from "./presence";
 import { ghostAgents, LIVE_AGENT, type ProcessInspector } from "./process-liveness";
-import { PRECEDENCE_RULE, type ChangedSinceEntry, type RelatedWork } from "./related-work";
-import { approvalInterval, documentPlanHash, documentPlanText } from "./review-outcome";
+import { composePlan, PRECEDENCE_RULE, type ChangedSinceEntry, type RelatedWork } from "./related-work";
+import { approvalInterval, documentPlanHash } from "./review-outcome";
 import type { PlanRequest } from "./plan-requests";
 import { nightInput, Scheduler, type Admission } from "./scheduler";
 import type { PluginSettings } from "./settings";
@@ -198,6 +198,12 @@ export async function planSetup(
   const providerKey = provider.split("/")[0];
   // Implementing an approved plan: the strongest of the ticket's label, its recorded tier and the plan's.
   const approvedPlan = planPolicy(state.labels) === null;
+  // A catch-up's analysis of an older plan (README, "Catch-up of older plans") is part of the plan
+  // every reader sees, while it covers the plan's hash. What reads the plan as the agent gets it
+  // (its tier, what changed since, the approved plan in the note) uses the composed text; what reads
+  // the document itself (its approval, a sent-back header, a missing `## Model`) uses the document.
+  const relatedWork = approvedPlan && plan ? await linear.issueDocument(issueId, `Related work: ${state.identifier}`).catch(() => null) : null;
+  const planText = plan ? composePlan(plan.content, relatedWork?.content ?? null) : "";
   // A request asks for that plan to be revised (README, "Related work"): plan again, holding the
   // plan and the requests. A replan comment counts only when it was written for this exact plan.
   // The cutoff is the plan's earliest approval bound, never a minute rounded down: a request at
@@ -213,7 +219,7 @@ export async function planSetup(
   const route = !approved && routes && settings && hasLabel(state.labels, NO_PLAN_LABEL) ? await routes.get(issueId) : null;
   const small = route && settings && !eligibilityProblems(state, untrusted, route.facts.impact, settings).length ? route : null;
   if (small) return smallRouteSetup(state.identifier, small, launchTier(state.labels, await tiers?.get(issueId) ?? null, small.tier) ?? small.tier, usualModeId);
-  const planned = approved ? planTier(plan?.content ?? "") : null;
+  const planned = approved && plan ? planTier(planText) : null;
   const decided = approved ? launchTier(state.labels, await tiers?.get(issueId) ?? null, planned?.tier ?? null) : null;
   // None of them names a tier: the plan goes back to planning for it, never to a default tier.
   const tierMissing = approved && !decided;
@@ -226,7 +232,7 @@ export async function planSetup(
   // null: the note says the check could not run and the agent compares itself. Without a plan
   // document there is no approval to compare against.
   const sinceApproval = !policy && plan && context.related
-    ? await context.related.changedSince({ issueId, identifier: state.identifier, teamId: state.teamId ?? "", plan: documentPlanText(plan.content), approved: plan.content }).then((entries) => entries, () => null)
+    ? await context.related.changedSince({ issueId, identifier: state.identifier, teamId: state.teamId ?? "", plan: planText, approved: plan.content }).then((entries) => entries, () => null)
     : undefined;
   return {
     identifier: state.identifier,
@@ -243,7 +249,7 @@ export async function planSetup(
       policy ? PLAN_SLICING_NOTE : "",
       offer ? smallRouteNote() : "",
       policy ? MODEL_NOTE : "",
-      policy ? advisorNote(providerKey) : approvedPlanNote(state.identifier, plan),
+      policy ? advisorNote(providerKey) : approvedPlanNote(state.identifier, plan ? { url: plan.url, content: planText } : null),
       policy && !tierMissing ? sentBackPlanNote(state.identifier, plan) : "",
       sinceApproval !== undefined ? sinceApprovalNote(state.identifier, sinceApproval) : "",
       tier ? tierNote(tier, tier === planned?.tier ? planned : null) : "",
