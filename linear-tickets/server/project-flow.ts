@@ -10,17 +10,15 @@ import { refusedByLinear, type LinearService, type ProjectIssue } from "./linear
 import { nightInput, type Candidate, type Scheduler } from "./scheduler";
 import type { TierStore } from "./model-tiers";
 import { needsOwner } from "./presence";
-import { classifyRunAgents, classifyTicketAgents, type TicketAgents } from "./starter";
+import { classifyRunAgents, classifyTicketAgents } from "./starter";
 import type { Focus } from "./focus";
 import { type ProcessInspector } from "./process-liveness";
-import { SetupError, type PlannerStart } from "./launch";
-import { RepairBusyError } from "./repair-exclusion";
+import type { PlannerStart } from "./launch";
 import { withPriority } from "./rate-budget";
+import type { UsageReader } from "./limit-resume";
 import type { PluginSettings, Settings } from "./settings";
 import { paseoHome } from "./ticket-mcp";
-import { activeModel } from "./model";
-import { candidates, normalizeModel } from "../shared/model-fallbacks";
-import { availability, LIMIT_DAY, LIMIT_SPACING, limitError, limitSchedule, limitTime, type UsageReader } from "./limit-resume";
+import { RESTART_GRACE_MS, PlannerTickets, recoveryOf, type PlannerRecord, type PlannerStore, type PlannerTarget } from "./planner-tickets";
 import { PLAN_APPROVED_STATE, planStage } from "./plan-policy";
 import { orderLine, parseOrder } from "../shared/work-order";
 
@@ -62,60 +60,24 @@ const HAND_OUT_TYPES = new Set(["backlog", "unstarted"]);
 // Polls a work order is retried while Linear refuses some of its changes, before it is closed with
 // them skipped. Changes that did not reach Linear (rate limit, outage) are retried without limit.
 const APPLY_TRIES = 3;
-// A started run without a live agent this long after its (re)start is started again. A start takes
-// a couple of minutes (TUC-678: filed 08:26:04, its workspace stood at 08:26:46, the daemon gave up
-// waiting for the agent at 08:27:46), so ten minutes never starts a second agent beside one still
-// launching, and a project stalls by a failed start for at most that plus one read.
-const RESTART_GRACE_MS = 10 * 60_000;
-// Starts per run before it is left to the owner: a start that fails this often (another agent
-// cannot come up, the daemon keeps timing out) needs them, not another try.
-const RESTART_CAP = 3;
-
-const recoveryTime = z.string().refine((value) => Number.isFinite(Date.parse(value)));
-export const plannerRecoverySchema = z.object({
-  attempt: z.number().int().nonnegative(),
-  claims: z.array(recoveryTime),
-  handledAgentId: z.string().optional(),
-  pending: z.object({
-    identity: z.string(), error: z.string(), model: z.string().nullable(), failedAt: recoveryTime,
-    resumeAt: recoveryTime, fallbackAt: recoveryTime, jitterMs: z.number().min(60_000).max(300_000),
-    basis: z.enum(["room", "reset", "retry-after", "default"]), selector: z.string().nullable(),
-  }).optional(),
-  claim: z.object({ requestId: z.string(), at: recoveryTime }).optional(),
-});
-type PlannerRecovery = z.infer<typeof plannerRecoverySchema>;
-
-function recoveryOf(run: PlannerRecord): PlannerRecovery | undefined {
-  if (run.recovery === undefined) return undefined;
-  const parsed = plannerRecoverySchema.safeParse(run.recovery);
-  if (!parsed.success) throw new Error(`Planner ${run.id}: corrupt usage-limit recovery metadata; automatic recovery is stopped.`);
-  return parsed.data;
-}
+// The run's lifecycle (its start, revivals, the owner's notice and its closing) is shared with a
+// catch-up ticket (planner-tickets.ts); this file keeps what is a project's: its record, its
+// tickets and its status. The run record and its recovery metadata are re-exported for the callers
+// that read projects.json.
+export { plannerRecoverySchema } from "./planner-tickets";
+export type { PlannerRecord } from "./planner-tickets";
 
 // `planned`: the tickets in an approved (or closed) plan: those its run listed. Kept by id, not by
 // creation time, so a ticket created while a run works, or moved into the project from elsewhere,
 // is new until a run lists it. Tickets no longer open in the project drop out when a run closes.
 // `plannedThrough`: what older versions kept instead (tickets created up to then were planned);
 // `migrated` turns it into `planned` with the project's tickets of that time.
-// `planner`: the open run: its `id` (the run uuid; the agent carries it as `linear.plannerRun`),
-// the time its ticket list was taken (`listedAt`), the tickets it `listed` and how many new tickets
-// it plans; `started`: false until its agent is up; `startedAt`: when it was last (re)started;
-// `agentId`: the agent the last start created; `restarts`: how often it was started again without a
-// live agent (a stopped agent, or a start that failed); `ownerAsked`: past RESTART_CAP, or on a
-// start that cannot succeed, the owner was asked once to start it or skip it; `error`: why it is
-// stuck; `approved`: its approved work order, until it is written into Linear, with the changes of
-// it already `done` in Linear.
+// `planner`: the open run (planner-tickets.ts); `started`: false until its agent is up.
 // `closedPlanner`: the run closed last, so a late report of its review is ignored, not applied twice.
 // `waiting`: when the flow first saw each unplanned ticket, pruned to them on every read: the
 // batching rule starts a run from these times.
 // `withheld`: tickets whose `hold` or blocker Linear refused: planned, but never handed out by the
 // project; you hand them out yourself.
-export type PlannerRecord = {
-  id: string; listedAt: string; listed?: string[]; tickets: number; started?: boolean;
-  startedAt?: string; agentId?: string; restarts?: number; ownerAsked?: boolean; error?: string;
-  approved?: { agentId: string | null; plan: string; done?: string[] };
-  recovery?: PlannerRecovery;
-};
 // A ticket assigned to Paseo whose start failed: `since` it was first seen so or last started
 // again, `restarts` so far, `ownerAsked` past RESTART_CAP.
 
@@ -396,10 +358,10 @@ export class ProjectFlow {
             let status = read.status;
             const focused = await this.deps.focus?.active() ?? false;
             if (settings.dispatch.enabled && !focused && open && !open.startedAt && !open.approved && !open.ownerAsked) {
-              status = await this.launchRun(project, open, read, settings, paseo)
-                .catch((error: unknown) => { console.error(`[linear-tickets] project ${project.name}: starting the planner failed: ${message(error)}`); return read.status; });
+              await this.tickets(project.id).launch(this.target(project, read), open, settings, paseo)
+                .catch((error: unknown) => console.error(`[linear-tickets] project ${project.name}: starting the planner failed: ${message(error)}`));
             } else if (settings.dispatch.enabled && open && open.startedAt && !open.approved && !open.ownerAsked) {
-              await this.revive(project, open, read, settings, paseo)
+              await this.tickets(project.id).revive(this.target(project, read), open, settings, paseo)
                 .catch((error: unknown) => console.error(`[linear-tickets] project ${project.name}: restarting the planner failed, the first read after ${RESTART_GRACE_MS / 60_000} minutes retries: ${message(error)}`));
             } else if (settings.dispatch.enabled && !focused && !open && read.unplanned.length && this.settled(read.record.waiting ?? {}, read.unplanned)) {
               // The tickets have waited for their plan (none newer than the quiet time, or the oldest
@@ -528,245 +490,61 @@ export class ProjectFlow {
     for (const id of obsolete) await this.deps.retire(id, paseo);
   }
 
-  // Starts a run for the project's unplanned tickets: the record first (the next read retries
-  // whatever the store says is missing, and no second run starts while one is open), then its
-  // agent. A read and Plan at the same time start one run: the other returns the status unchanged.
+  // Starts a run for the project's unplanned tickets: the shared lifecycle (planner-tickets.ts)
+  // writes the record first, then starts its agent; a run opened since this read is the other
+  // path's and is returned unchanged.
   private async startRun(project: { id: string; name: string }, read: Read, settings: PluginSettings, paseo: PaseoApi, background = false): Promise<ProjectStatus> {
-    // Started since this read (by the other path).
-    const current = (await this.store.all())[project.id]?.planner;
-    if (current) return { ...read.status, toPlan: 0, plansAt: null, planner: plannerSummary(current) };
-    const run: PlannerRecord = { id: randomUUID(), listedAt: read.readAt, listed: read.work.map((issue) => issue.id), tickets: read.unplanned.length, started: false };
-    await this.store.update(project.id, (record) => ({ ...(record ?? read.record), planner: run }));
-    console.log(`[linear-tickets] project ${project.name}: planner run ${run.id.slice(0, 8)} for ${read.unplanned.length} new ticket${read.unplanned.length === 1 ? "" : "s"}`);
-    if (background) {
-      // The RPC acknowledges the persisted run, not provider readiness (which can take minutes).
-      // Queue behind this operation; a poll already queued may start it first, so recheck attempts.
-      void this.exclusive(project.id, async () => {
-        const currentSettings = await this.currentSettings(settings);
-        if (currentSettings.activation.mode === "remote") return;
-        const pending = (await this.store.all())[project.id]?.planner;
-        if (pending?.id !== run.id || pending.startedAt || pending.approved || pending.ownerAsked) return;
-        await this.launchRun(project, pending, read, currentSettings, paseo);
-      }).catch((error: unknown) => console.error(`[linear-tickets] project ${project.name}: starting the planner failed; the next read after the grace retries: ${message(error)}`));
-    } else await this.launchRun(project, run, read, settings, paseo);
-    const stored = (await this.store.all())[project.id]?.planner ?? run;
-    return { ...read.status, toPlan: 0, plansAt: null, planner: plannerSummary(stored) };
-  }
-
-  // Recovered runs keep a live recorded root authoritative even if an uncertain older creation
-  // appears later. With no live recorded root, adopt deterministically; retire all other roots.
-  private async adoptLive(projectId: string, run: PlannerRecord, agents: TicketAgents, paseo: PaseoApi): Promise<boolean> {
-    const live = (run.recovery && agents.live.find((agent) => agent.id === run.agentId))
-      || agents.live.slice().sort((a, b) => (b.createdAt ?? "").localeCompare(a.createdAt ?? "") || a.id.localeCompare(b.id))[0];
-    if (!live) return false;
-    await this.store.update(projectId, (current) => {
-      if (current?.planner?.id !== run.id || current.planner.approved || current.planner.ownerAsked) return null;
-      const recovery = recoveryOf(current.planner);
-      const requestId = live.labels?.["linear.plannerRequest"];
-      const prefix = `planner-${run.id}-limit-`;
-      const suffix = requestId?.startsWith(prefix) ? requestId.slice(prefix.length) : "";
-      const attempt = /^[1-9]\d*$/.test(suffix) ? Number(suffix) : 0;
-      const evidence = recovery?.pending && attempt > 0 && attempt <= recovery.attempt
-        && live.id !== current.planner.agentId && live.id !== recovery.handledAgentId
-        ? confirmedRestart(current, current.planner, requestId!, live.id, this.now()) : current;
-      return { ...evidence, planner: { ...current.planner, started: true, agentId: live.id, startedAt: current.planner.startedAt ?? new Date(this.now()).toISOString(), error: undefined,
-        ...(run.recovery ? { recovery: { ...recovery!, pending: undefined, claim: undefined, handledAgentId: undefined } } : {}) } };
+    const run = await this.tickets(project.id).start(this.target(project, read), {
+      run: { listedAt: read.readAt, listed: read.work.map((issue) => issue.id), tickets: read.unplanned.length, started: false },
+      record: read.record, settings, paseo, background,
     });
-    if (run.recovery) {
-      for (const agent of [...agents.live, ...agents.stopped, ...agents.ghosts]) {
-        if (agent.id !== live.id) await this.deps.retire(agent.id, paseo);
-      }
-    }
-    return true;
+    return { ...read.status, toPlan: 0, plansAt: null, planner: plannerSummary(run) };
   }
 
-  private async launchAvailability(settings: PluginSettings) {
-    const selector = settings.lastProvider ? settings.launchPreferences?.[settings.lastProvider]?.model ?? null : null;
-    const [chains, reports] = await Promise.all([this.deps.usage?.chains() ?? {}, this.deps.usage?.read() ?? null]);
-    return { selector, recovery: reports ? availability(reports, selector ? candidates(chains, selector) : [], this.now()).recovery : null };
-  }
-
-  private async scheduleLimit(projectId: string, run: PlannerRecord, identity: string, error: string, model: string | null, settings: PluginSettings, failedAgentId?: string): Promise<void> {
-    const hint = limitError(error)!;
-    const old = recoveryOf(run) ?? { attempt: 0, claims: [] };
-    if (old.pending?.identity === identity) return;
-    const reading = await this.launchAvailability(settings);
-    const now = this.now();
-    const jitterMs = this.deps.jitter?.() ?? 60_000 + Math.floor(Math.random() * 240_001);
-    const timing = limitSchedule(reading.recovery, hint.retryAfterMs, now, () => jitterMs);
-    const fallback = limitSchedule(null, hint.retryAfterMs, now, () => jitterMs);
-    const pending: NonNullable<PlannerRecovery["pending"]> = {
-      identity, error, model: model ? normalizeModel(model) : null, failedAt: new Date(now).toISOString(),
-      resumeAt: new Date(timing.resumeAt).toISOString(), fallbackAt: new Date(fallback.resumeAt).toISOString(),
-      jitterMs, basis: timing.basis, selector: reading.selector,
+  // The shared run lifecycle for one project (planner-tickets.ts): every write goes through
+  // `ProjectStore.update` on the project's record, so a poll, a Plan and an approval never
+  // overwrite each other's state.
+  private tickets(projectId: string): PlannerTickets<ProjectRecord> {
+    const store: PlannerStore<ProjectRecord> = {
+      current: async () => (await this.store.all())[projectId]?.planner ?? null,
+      open: async (run, record) => {
+        const existing = (await this.store.all())[projectId]?.planner;
+        if (existing) return { run: existing, opened: false };
+        await this.store.update(projectId, (current) => ({ ...(current ?? record), planner: run }));
+        return { run, opened: true };
+      },
+      update: (runId, change, restart) => this.store.update(projectId, (current) => {
+        if (!current?.planner || current.planner.id !== runId) return null;
+        const base = restart ? confirmedRestart(current, current.planner, restart.requestId, restart.agentId, restart.at) : current;
+        return change(base, current.planner);
+      }),
     };
-    await this.store.update(projectId, (current) => current?.planner?.id === run.id && !current.planner.approved && !current.planner.ownerAsked
-      ? { ...current, planner: { ...current.planner, agentId: failedAgentId ?? current.planner.agentId,
-        recovery: { ...old, handledAgentId: failedAgentId ?? old.handledAgentId, pending }, error } } : null);
+    return new PlannerTickets<ProjectRecord>({
+      retire: this.deps.retire, now: this.deps.now, inspect: this.deps.inspect, usage: this.deps.usage, jitter: this.deps.jitter,
+    }, store);
   }
 
-  // No new jitter or fallback deadline while waiting. Room can advance a wait, but only for the
-  // selector the same settings snapshot will launch; preference changes invalidate old room.
-  private async limitReady(projectId: string, run: PlannerRecord, settings: PluginSettings): Promise<boolean> {
-    const recovery = recoveryOf(run)!;
-    const pending = recovery.pending!;
-    const reading = await this.launchAvailability(settings);
-    const now = this.now();
-    let at = Date.parse(pending.resumeAt);
-    let basis = pending.basis;
-    if (reading.recovery?.roomNow) { at = now; basis = "room"; }
-    else if (pending.selector !== reading.selector || basis === "room") {
-      const reset = reading.recovery?.earliestReset;
-      at = reset !== null && reset !== undefined ? reset + pending.jitterMs : Date.parse(pending.fallbackAt);
-      basis = reset !== null && reset !== undefined ? "reset" : limitError(pending.error)?.retryAfterMs ? "retry-after" : "default";
-    } else if (reading.recovery?.earliestReset !== null && reading.recovery?.earliestReset !== undefined && reading.recovery.earliestReset > now) {
-      at = Math.max(at, reading.recovery.earliestReset + pending.jitterMs);
-      basis = "reset";
-    }
-    const claims = recovery.claims.filter((claim) => Date.parse(claim) > now - LIMIT_DAY);
-    if (claims.length) at = Math.max(at, Math.max(...claims.map(Date.parse)) + LIMIT_SPACING);
-    // A lost launch response keeps its original grace even if another account has room.
-    if (pending.identity !== run.agentId || recovery.claim) at = Math.max(at, Date.parse(run.startedAt ?? run.listedAt) + RESTART_GRACE_MS);
-    const provider = limitError(pending.error)?.provider ?? pending.model?.split("/")[0] ?? "provider";
-    const updated = { ...pending, resumeAt: new Date(at).toISOString(), basis, selector: reading.selector };
-    await this.store.update(projectId, (current) => current?.planner?.id === run.id && !current.planner.approved && !current.planner.ownerAsked
-      ? { ...current, planner: { ...current.planner, recovery: { ...recovery, claims, pending: updated },
-        error: `Usage limit on ${provider}: Paseo starts a new agent at ${limitTime(at, now)}.` } } : null);
-    return at <= now;
-  }
-
-  private async restartLimit(project: { id: string; name: string }, run: PlannerRecord, read: Read, settings: PluginSettings, paseo: PaseoApi): Promise<ProjectStatus> {
-    settings = await this.ownerSettings(settings);
-    if (!await this.limitReady(project.id, run, settings)) return this.runStatus(project.id, read.status);
-    const brief = await this.brief(project, read, settings);
-    // Broker/brief reads can outlive an uncertain creation: inspect again before spending a slot.
-    run = (await this.store.all())[project.id]?.planner!;
-    if (!run || run.approved || run.ownerAsked) return this.runStatus(project.id, read.status);
-    const agents = await classifyRunAgents(paseo, run.id, this.now(), this.deps.inspect);
-    if (await this.adoptLive(project.id, run, agents, paseo)) return this.runStatus(project.id, read.status);
-    if (!await this.limitReady(project.id, run, settings)) return this.runStatus(project.id, read.status);
-    run = (await this.store.all())[project.id].planner!;
-    settings = await this.ownerSettings(settings);
-    const recovery = recoveryOf(run)!;
-    if (recovery.claims.length >= 4) {
-      await this.askOwner(project, run, "The planner reached four usage-limit restart attempts in twenty-four hours.");
-      return this.runStatus(project.id, read.status);
-    }
-    const at = new Date(this.now()).toISOString();
-    const attempt = recovery.attempt + 1;
-    const requestId = `planner-${run.id}-limit-${attempt}`;
-    await this.store.update(project.id, (current) => current?.planner?.id === run.id && !current.planner.approved && !current.planner.ownerAsked
-      ? { ...current, planner: { ...current.planner, startedAt: at, recovery: { ...recovery, attempt, claims: [...recovery.claims, at], claim: { requestId, at } } } } : null);
-    let agentId: string;
-    try {
-      ({ agentId } = await this.deps.startPlanner({ runId: run.id, linearProjectId: project.id, projectName: project.name, teamId: this.busiestTeam(read.work), requestId, brief }, paseo, settings));
-    } catch (error) {
-      if (error instanceof RepairBusyError) {
-        // The repair holds the ticket briefly and nothing was created: undo the claim so the
-        // pending limit recovery stays and the next pass retries it.
-        await this.store.update(project.id, (current) => current?.planner?.id === run.id && current.planner.recovery?.claim?.requestId === requestId
-          ? { ...current, planner: { ...current.planner, startedAt: run.startedAt, recovery } } : null);
-        console.log(`[linear-tickets] project ${project.name}: the planner start waits for a repair; the next pass retries`);
-        return this.runStatus(project.id, read.status);
-      }
-      const current = (await this.store.all())[project.id].planner!;
-      if (error instanceof SetupError) await this.askOwner(project, current, message(error));
-      else if (limitError(message(error))) {
-        await this.scheduleLimit(project.id, current, requestId, message(error), /\bmodel=([^\s,)]+)/i.exec(message(error))?.[1] ?? null, settings);
-        await this.limitReady(project.id, (await this.store.all())[project.id].planner!, settings);
-      } else if (/Agent creation could not be confirmed/i.test(message(error))) {
-        // The response is uncertain, not proof no agent was created. Keep the spent claim and
-        // pending limit until adoption or the next separately bounded identity after the grace.
-        console.error(`[linear-tickets] project ${project.name}: uncertain limit restart: ${message(error)}`);
-      } else {
-        await this.store.update(project.id, (record) => record?.planner?.id === run.id ? { ...record, planner: { ...record.planner, error: message(error),
-          recovery: { ...recoveryOf(record.planner)!, pending: undefined, claim: undefined } } } : null);
-        throw error;
-      }
-      return this.runStatus(project.id, read.status);
-    }
-    // External creation has succeeded. Persistence/retirement failures are not failed creations.
-    await this.store.update(project.id, (current) => current?.planner?.id === run.id
-      ? { ...confirmedRestart(current, current.planner, requestId, agentId, this.now()), planner: { ...current.planner, started: true, agentId, error: undefined,
-        recovery: { ...recoveryOf(current.planner)!, pending: undefined, claim: undefined } } } : null);
-    for (const stopped of [...agents.stopped, ...agents.ghosts]) await this.deps.retire(stopped.id, paseo);
-    return this.runStatus(project.id, read.status);
-  }
-
-  // Inspect roots before either retry budget. Provider limits use durable reset-aware claims;
-  // other failures keep the original grace/cap, and SetupError immediately leaves the run held.
-  private async launchRun(project: { id: string; name: string }, run: PlannerRecord, read: Read, settings: PluginSettings, paseo: PaseoApi): Promise<ProjectStatus> {
-    settings = await this.ownerSettings(settings);
-    const again = run.startedAt !== undefined;
-    const agents = await classifyRunAgents(paseo, run.id, this.now(), this.deps.inspect);
-    for (const ghost of agents.ghosts) console.log(`[linear-tickets] project ${project.name}: planner agent ${ghost.id.slice(0, 8)} shows ${ghost.status} but its OMP process is gone; it counts as stopped`);
-    recoveryOf(run); // Corruption never clears a durable budget or silently takes the generic path.
-    if (await this.adoptLive(project.id, run, agents, paseo)) return this.runStatus(project.id, read.status);
-    const stopped = run.agentId ? agents.stopped.find((agent) => agent.id === run.agentId)
-      : agents.stopped.slice().sort((a, b) => (b.createdAt ?? "").localeCompare(a.createdAt ?? ""))[0];
-    if (!run.recovery?.pending && stopped?.status === "error" && stopped.id !== run.recovery?.handledAgentId && limitError(stopped.lastError ?? "")) {
-      await this.scheduleLimit(project.id, run, stopped.id, stopped.lastError!, activeModel(stopped), settings, stopped.id);
-      run = (await this.store.all())[project.id].planner!;
-    }
-    if (run.recovery?.pending) return this.restartLimit(project, run, read, settings, paseo);
-    const restarts = run.restarts ?? 0;
-    if (again && restarts >= RESTART_CAP) {
-      await this.askOwner(project, run, `Paseo started the planner ${restarts + 1} times, and none of its agents is working on it now (the start failed, or the agent stopped without submitting a plan).`);
-      return this.runStatus(project.id, read.status);
-    }
-    const brief = await this.brief(project, read, settings);
-    settings = await this.ownerSettings(settings);
-    const counted = again ? restarts + 1 : restarts;
-    const attemptAt = new Date(this.now()).toISOString();
-    await this.store.update(project.id, (current) => current?.planner?.id === run.id ? { ...current, planner: { ...current.planner, restarts: counted, startedAt: attemptAt } } : null);
-    if (again) console.log(`[linear-tickets] project ${project.name}: no live planner agent since its start at ${run.startedAt}; restart ${counted} of ${RESTART_CAP}`);
-    let agentId: string;
-    const requestId = run.recovery ? `planner-${run.id}-restart-${counted}-after-limit-${run.recovery.attempt}` : `planner-${run.id}-${counted}`;
-    try {
-      agentId = (await this.deps.startPlanner({ runId: run.id, linearProjectId: project.id, projectName: project.name, teamId: this.busiestTeam(read.work), requestId, brief }, paseo, settings)).agentId;
-    } catch (error) {
-      if (error instanceof RepairBusyError) {
-        // Nothing was created: undo this attempt's restart count and grace start so the next pass
-        // tries again instead of spending the restart budget the owner is asked about.
-        await this.store.update(project.id, (current) => current?.planner?.id === run.id && current.planner.startedAt === attemptAt
-          ? { ...current, planner: { ...current.planner, restarts: run.restarts, startedAt: run.startedAt } } : null);
-        console.log(`[linear-tickets] project ${project.name}: the planner start waits for a repair; the next pass retries`);
-        return this.runStatus(project.id, read.status);
-      }
-      if (error instanceof SetupError) {
-        await this.askOwner(project, { ...run, restarts: counted }, message(error));
-        return this.runStatus(project.id, read.status);
-      }
-      if (limitError(message(error))) {
-        await this.store.update(project.id, (current) => current?.planner?.id === run.id
-          ? { ...current, planner: { ...current.planner, restarts } } : null);
-        run = (await this.store.all())[project.id].planner!;
-        await this.scheduleLimit(project.id, run, requestId, message(error), /\bmodel=([^\s,)]+)/i.exec(message(error))?.[1] ?? null, settings);
-        await this.limitReady(project.id, (await this.store.all())[project.id].planner!, settings);
-        return this.runStatus(project.id, read.status);
-      }
-      throw error;
-    }
-    await this.store.update(project.id, (current) => current?.planner?.id === run.id ? { ...current, planner: { ...current.planner, started: true, agentId, startedAt: new Date(this.now()).toISOString(), error: undefined } } : null);
-    for (const stopped of agents.stopped) await paseo.agents.ref(stopped.id).archive().catch((error: unknown) => console.error(`[linear-tickets] project ${project.name}: archiving planner agent ${stopped.id.slice(0, 8)} failed: ${message(error)}`));
-    return this.runStatus(project.id, read.status);
-  }
-
-  // A started run whose agent stopped without submitting a plan (closed after idling, archived,
-  // lost with its process) would hold its project: no new run starts while it is open.
-  // RESTART_GRACE_MS after its last start without a live agent it is started again for the same
-  // run; a few tries, then the owner is asked once (README, "Projects").
-  private async revive(project: { id: string; name: string }, run: PlannerRecord, read: Read, settings: PluginSettings, paseo: PaseoApi): Promise<void> {
-    settings = await this.ownerSettings(settings);
-    // Inspect every poll for live/limit roots; only the generic path obeys its ten-minute grace.
-    recoveryOf(run);
-    if (!run.recovery?.pending && this.now() - Date.parse(run.startedAt ?? run.listedAt) < RESTART_GRACE_MS) {
-      const agents = await classifyRunAgents(paseo, run.id, this.now(), this.deps.inspect);
-      if (await this.adoptLive(project.id, run, agents, paseo)) return;
-      const stopped = run.agentId && agents.stopped.find((agent) => agent.id === run.agentId);
-      if (!stopped || stopped.status !== "error" || stopped.id === run.recovery?.handledAgentId || !limitError(stopped.lastError ?? "")) return;
-    }
-    await this.launchRun(project, run, read, settings, paseo);
+  // The project's side of the run lifecycle: what the run is called, its agents, the brief from
+  // this read, the start that maps its agent, and the one project update that asks the owner.
+  private target(project: { id: string; name: string }, read: Read): PlannerTarget {
+    return {
+      label: `project ${project.name}`,
+      own: (settings) => this.ownerSettings(settings),
+      fresh: async (settings) => {
+        const current = await this.currentSettings(settings);
+        return current.activation.mode === "remote" ? null : current;
+      },
+      agents: (run, paseo) => classifyRunAgents(paseo, run.id, this.now(), this.deps.inspect),
+      brief: (settings) => this.brief(project, read, settings),
+      start: (input, paseo, settings) => this.deps.startPlanner({ ...input, linearProjectId: project.id, projectName: project.name, teamId: this.busiestTeam(read.work) }, paseo, settings),
+      ask: async (_run, problem) => {
+        console.error(`[linear-tickets] project ${project.name}: no agent is planning the work order: ${problem}`);
+        const body = `**No agent is planning the work order of ${project.name}.** ${problem}\n\nPress Plan in the Paseo Agents menu bar app to start again, or Skip to hand the tickets out without an order.`;
+        await this.deps.linear.projectUpdate(project.id, body, true)
+          .catch((error: unknown) => console.error(`[linear-tickets] project ${project.name}: the project update failed: ${message(error)}`));
+      },
+      defer: (work) => this.exclusive(project.id, work),
+    };
   }
 
   // The project's status as the store now has the run: the read's `toPlan` and `plansAt` still
@@ -774,20 +552,6 @@ export class ProjectFlow {
   private async runStatus(projectId: string, base: ProjectStatus): Promise<ProjectStatus> {
     const planner = (await this.store.all())[projectId]?.planner;
     return planner ? { ...base, planner: plannerSummary(planner) } : base;
-  }
-
-  // Asks the owner once per run, as one Linear project update on the project (README, "Projects"),
-  // written as the Paseo app. The record is marked first, so later reads neither repeat the notice
-  // nor restart the run; a failed write is logged and never retried, and never blocks the project.
-  private async askOwner(project: { id: string; name: string }, run: PlannerRecord, problem: string): Promise<void> {
-    const stored = await this.store.update(project.id, (current) => current?.planner?.id === run.id && !current.planner.ownerAsked
-      ? { ...current, planner: { ...current.planner, ownerAsked: true, error: problem } }
-      : null);
-    if (!stored) return;
-    console.error(`[linear-tickets] project ${project.name}: no agent is planning the work order: ${problem}`);
-    const body = `**No agent is planning the work order of ${project.name}.** ${problem}\n\nPress Plan in the Paseo Agents menu bar app to start again, or Skip to hand the tickets out without an order.`;
-    await this.deps.linear.projectUpdate(project.id, body, true)
-      .catch((error: unknown) => console.error(`[linear-tickets] project ${project.name}: the project update failed: ${message(error)}`));
   }
 
   // The busiest team of the project's tickets: the mapping fallback, and the team whose other open
@@ -891,7 +655,7 @@ export class ProjectFlow {
         recoveryOf(run);
         if (!run.approved && !run.ownerAsked) {
           const agents = await classifyRunAgents(paseo, runId, this.now(), this.deps.inspect);
-          await this.adoptLive(projectId, run, agents, paseo);
+          await this.tickets(projectId).adopt(run, agents, paseo);
         }
         const canonical = (await this.store.all())[projectId]?.planner?.agentId;
         if (!agentId || canonical !== agentId) return false;
@@ -994,19 +758,18 @@ export class ProjectFlow {
       withhold.size ? `Not handed out, because Linear refused their hold or blocker: ${[...withhold.values()].join(", ")}. Assign them to Paseo yourself when they may start.` : "",
     ].filter(Boolean).join("\n\n")).catch((error: unknown) => console.error(`[linear-tickets] project ${projectId}: the work order's project update failed: ${message(error)}`));
     const openIds = new Set(issues.map((issue) => issue.id));
-    await this.store.update(projectId, (stored) => {
-      const current = stored && migrated(stored, issues);
-      return current?.planner?.id === planner.id ? {
+    // The run is closed in the record and its agent retired (planner-tickets.ts); the project keeps
+    // what the order marked planned and what it withheld.
+    await this.tickets(projectId).close(planner, (stored) => {
+      const current = migrated(stored, issues);
+      return current.planner?.id === planner.id ? {
         ...current,
         planned: plannedAfter(current, current.planner, issues),
-        planner: null,
-        closedPlanner: planner.id,
         withheld: [...new Set([...(current.withheld ?? []).filter((id) => openIds.has(id) && !released.has(id)), ...withhold.keys()])],
       } : null;
-    });
+    }, paseo);
     this.refusedTries.delete(planner.id);
     this.statuses = this.statuses.map((status) => status.id === projectId ? { ...status, planner: null } : status);
-    if (planner.approved.agentId) await this.deps.retire(planner.approved.agentId, paseo);
     return true;
   }
 }

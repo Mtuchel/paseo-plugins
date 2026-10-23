@@ -61,3 +61,11 @@ test("a plan that sets a new rule always goes to the owner, whatever its impact 
   const unstated = parsePlanRisk(section({}).replace("- New rule: no — nothing general\n", ""));
   assert.ok("problem" in unstated && /unreadable value for: New rule/.test(unstated.problem), "an old-format plan is not rated, so it is never auto-approved");
 });
+
+test("a catch-up of older approved plans always goes to the owner, whatever its rating and the threshold", () => {
+  const routine = risk({ Impact: "0 — tooling", "Advisor rating": "impact 0, reversibility revert" });
+  for (const policy of [DEFAULT_AUTO_APPROVE, { enabled: true, maxImpact: 4, maxImpactWithFlag: 4 }]) {
+    assert.deepEqual(autoApproval(routine, policy, { ...trusted, catchUp: true }), { approve: false, reasons: ["a related-work catch-up always goes to you"] });
+  }
+  assert.deepEqual(autoApproval(routine, DEFAULT_AUTO_APPROVE, { ...trusted, catchUp: false }), { approve: true, reasons: [] }, "the same plan without the catch-up fact is routine");
+});

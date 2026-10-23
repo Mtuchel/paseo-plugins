@@ -777,7 +777,9 @@ export const ORGANIZATION_QUERY = `query organizationUrlKey {
 export type LabeledProject = { id: string; name: string };
 export type TicketRef = { id: string; identifier: string; title: string };
 // An open ticket of the candidate list (related-work.ts). `labels`: grouped ones as "Area: Sales".
-// `planDocuments`: its "Plan: " documents, without content. `pullRequests`: its pull request links.
+// `planDocuments`: its `Plan: ` and `Related work: ` documents, without content (a catch-up's
+// document is composed into the plan it covers, related-work.ts `composePlan`).
+// `pullRequests`: its pull request links.
 export type CandidateIssue = {
   id: string; identifier: string; title: string; description: string; updatedAt: string; status: string; statusType: string;
   labels: string[]; pullRequests: string[]; planDocuments: { id: string; title: string; updatedAt: string }[];
@@ -1145,8 +1147,11 @@ export const WINDOW_COMMENTS_QUERY = `query windowComments($filter: CommentFilte
     pageInfo { hasNextPage endCursor }
   }
 }`;
+// Every `Plan: ` and `Related work: ` document updated since a time, with its ticket:
+// `planDocumentsSince` keeps the `Plan: ` ones and carries a ticket's `Related work:` document along
+// with its plan, so a plan is read as its readers see it (related-work.ts `composePlan`).
 export const PLAN_DOCUMENTS_QUERY = `query planDocuments($since: DateTimeOrDuration!, $after: String) {
-  documents(first: 50, after: $after, filter: { title: { startsWith: "Plan: " }, updatedAt: { gte: $since } }) {
+  documents(first: 50, after: $after, filter: { updatedAt: { gte: $since }, or: [{ title: { startsWith: "Plan: " } }, { title: { startsWith: "Related work: " } }] }) {
     nodes { id title url content updatedAt issue { id identifier url project { name } } }
     pageInfo { hasNextPage endCursor }
   }
@@ -1158,7 +1163,7 @@ export const TEAM_CANDIDATES_QUERY = `query teamCandidates($team: ID!, $after: S
     nodes { id identifier title description updatedAt state { name type }
       labels(first: 25) { nodes { name parent { name } } }
       attachments(first: 25) { nodes { url } }
-      documents(first: 10, filter: { title: { startsWith: "Plan: " } }) { nodes { id title updatedAt } } }
+      documents(first: 10, filter: { or: [{ title: { startsWith: "Plan: " } }, { title: { startsWith: "Related work: " } }] }) { nodes { id title updatedAt } } }
     pageInfo { hasNextPage endCursor }
   }
 }`;
@@ -1210,7 +1215,9 @@ export type IssueLink = { id: string; identifier: string; url: string; project: 
 // `issue.parentId`: the ticket's parent (a "Needs you" sub-issue's ticket); `parentBody`: the
 // comment this one replies to.
 export type WindowComment = { id: string; body: string; createdAt: string; url: string; userId: string; issue: (IssueLink & { title: string; parentId: string | null }) | null; parentBody: string | null };
-export type PlanDocument = { id: string; title: string; url: string; content: string; updatedAt: string; issue: IssueLink | null };
+// `relatedWork`: the ticket's `Related work:` document, when it has one: a catch-up's analysis
+// covers the plan only while its hash matches (related-work.ts `composePlan`).
+export type PlanDocument = { id: string; title: string; url: string; content: string; updatedAt: string; issue: IssueLink | null; relatedWork?: string };
 export type MentioningIssue = IssueLink & { title: string; status: string; statusType: string; description: string; comments: { body: string; createdAt: string; url: string; author: string }[] };
 
 function issueLink(value: unknown): IssueLink | null {
@@ -1880,7 +1887,7 @@ export class LinearService {
           planDocuments: connection(node.documents ?? { nodes: [] }).nodes.map((item) => {
             const entry = record(item);
             return { id: label(entry.id), title: label(entry.title), updatedAt: label(entry.updatedAt) };
-          }).filter((document) => document.id && document.title.startsWith("Plan: ")),
+          }).filter((document) => document.id && (document.title.startsWith("Plan: ") || document.title.startsWith("Related work: "))),
         };
       }).filter((issue) => issue.id),
     };
@@ -2715,11 +2722,17 @@ export class LinearService {
     return this.windowComments({ body: { contains: "Plan sent back" }, createdAt: { gte: since } });
   }
 
-  // "Plan: <ID>" documents updated since then, with their ticket.
+  // "Plan: <ID>" documents updated since then, with their ticket and the ticket's `Related work:`
+  // document when it has one (the query reads every document in the window).
   async planDocumentsSince(since: string): Promise<PlanDocument[]> {
-    return (await this.allPages(PLAN_DOCUMENTS_QUERY, { since }, "documents")).map((node) => ({
+    const documents = (await this.allPages(PLAN_DOCUMENTS_QUERY, { since }, "documents")).map((node) => ({
       id: label(node.id), title: label(node.title), url: label(node.url), content: typeof node.content === "string" ? node.content : "", updatedAt: label(node.updatedAt), issue: issueLink(node.issue),
     })).filter((document) => document.id);
+    const annotations = new Map(documents.flatMap((document) => document.issue && document.title === `Related work: ${document.issue.identifier}` ? [[document.issue.id, document.content] as [string, string]] : []));
+    return documents.filter((document) => document.title.startsWith("Plan: ")).map((document) => {
+      const relatedWork = document.issue ? annotations.get(document.issue.id) : undefined;
+      return relatedWork === undefined ? document : { ...document, relatedWork };
+    });
   }
 
   // The team's tickets whose description contains `text` (archived ones too), with their comments;
@@ -2816,6 +2829,27 @@ export class LinearService {
     const field = existing ? "documentUpdate" : "documentCreate";
     succeeded(result, field, existing ? "update the plan document" : "create the plan document");
     return label(record(record(result[field]).document ?? {}).url);
+  }
+
+  // The document a catch-up writes beside an old plan (server/related-catch-up.ts): one per title on
+  // the ticket, created or updated only as the Paseo app — null when the app cannot be used here (the
+  // caller retries), and then nothing is written. Paseo is the only writer of `Related work:` titles,
+  // and Linear's document write needs the id, so the title is what names the app's own document.
+  async upsertDocumentAsApp(issueId: string, title: string, content: string): Promise<string | null> {
+    if (!this.app) return null;
+    // Read with the app too: the owner's key writes nothing here, and an app that cannot read
+    // cannot write either (null: the caller retries).
+    const data = await this.app.query(ISSUE_DOCUMENTS_QUERY, { id: issueId });
+    if (!data) return null;
+    const issue = record(data.issue ?? {});
+    const existing = connection(issue.documents ?? { nodes: [] }).nodes.map((node) => record(node)).find((node) => label(node.title) === title);
+    const result = existing
+      ? await this.app.mutate(UPDATE_DOCUMENT_QUERY, { id: label(existing.id), input: { title, content } })
+      : await this.app.mutate(CREATE_DOCUMENT_QUERY, { input: { title, content, issueId: label(issue.id) || issueId } });
+    if (!result) return null;
+    const field = existing ? "documentUpdate" : "documentCreate";
+    succeeded(record(result), field, existing ? "update the related-work document" : "create the related-work document");
+    return label(record(record(record(result)[field]).document ?? {}).url);
   }
 
   // A plan's visual mocks (README, "Plan-first") are files on this host under

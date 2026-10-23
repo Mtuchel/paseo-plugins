@@ -34,7 +34,7 @@ import { labelTier, onlyTierAdded, tierModel, writeTierLabel, type TierStore } f
 import type { ReviewDeletions } from "./review-deletions";
 import { RateLimitedError, withPriority } from "./rate-budget";
 import { DecisionJournal, DecisionPendingError, FencedError, HaltedError, type DecisionAttempt, type ResolveAction, type ReviewGeneration, type RouteSnapshot } from "./decision-journal";
-import { applyLater, applySplit, splitProblem, type PanelWork, type Steps } from "./split";
+import { applyLater, applySplit, CATCH_UP_RETIRE, CATCH_UP_SPLIT, splitProblem, type PanelWork, type Steps } from "./split";
 
 // The plan text of a running review, from the same endpoint its page loads.
 export async function readReviewPlan(localUrl: string): Promise<string> {
@@ -95,6 +95,21 @@ type Sessions = Pick<SessionRouter, "sessionFor" | "plan" | "ask" | "say" | "sai
 // `reasons` why it needs the owner (empty when approved).
 type Judgement = { approved: boolean; line: string; reasons: string[] };
 type ProjectPlans = Pick<ProjectFlow, "isPlannerRun" | "applyPlan">;
+// The catch-up of older approved plans (related-catch-up.ts). Its plan is not a ticket plan: it
+// holds a verdict per listed ticket and its approval writes their information, so the bridge routes
+// it on its own. `isCatchUp` is true for the open catch-up and the last closed one, like a planner
+// run; `apply` is record-first.
+export type CatchUpHooks = {
+  isCatchUp(issueId: string): Promise<boolean>;
+  // Problems of a catch-up plan (sections, blocks, verdicts, `#### Reach`, record gates). Empty: fine.
+  problems(issueId: string, plan: string): Promise<string[]>;
+  // The plan was opened for review without problems: its record moves to `awaiting-review`.
+  opened(issueId: string): Promise<void>;
+  // The owner sent the plan back: its record returns to `planning`.
+  sentBack(issueId: string): Promise<void>;
+  // The owner approved it: Paseo applies the plan to the listed tickets.
+  apply(issueId: string, agentId: string | null, plan: string): Promise<void>;
+};
 // Parked plans (README, "Parked plans"): `available` while the central Plannotator host runs;
 // `retire` closes the agent's own review (when it has one) with the reason, stops and archives the agent.
 export type Parking = {
@@ -256,6 +271,8 @@ export class PlannotatorBridge {
   private lastPrune = 0;
   // A project's planner runs and their work orders (project-flow.ts).
   private projectPlans: ProjectPlans | null = null;
+  // The catch-up of older approved plans (related-catch-up.ts), if this host files one.
+  private catchUp: CatchUpHooks | null = null;
   // Files an approved plan's follow-ups (plan-follow-ups.ts); its retries run on this bridge's sweep.
   private followUps: Pick<PlanFollowUps, "file" | "retryPending"> | null = null;
   // Writes an approved plan's related work into Linear (plan-relations.ts); its retries run on
@@ -335,7 +352,7 @@ export class PlannotatorBridge {
   // The ticket's Linear agent panel for an opened review: review link, plan checklist and
   // Approve / Send back. Returns whether the agent has a session: then the progress comment
   // carries the plan state instead of separate plan comments.
-  private async toSession(event: OpenedEvent, review: ReviewGeneration, agentId: string, model: string | null, reviewLink: string | null, planText: string, judgement: Judgement | null): Promise<boolean> {
+  private async toSession(event: OpenedEvent, review: ReviewGeneration, agentId: string, model: string | null, reviewLink: string | null, planText: string, judgement: Judgement | null, catchUp = false): Promise<boolean> {
     const sessions = this.sessions;
     if (!sessions) return false;
     try {
@@ -346,7 +363,8 @@ export class PlannotatorBridge {
       // An auto-approved plan is decided already; the journal carries its approval out.
       if (judgement?.approved) { await sessions.say(link.sessionId, "thought", judgement.line); return true; }
       await sessions.expectReview(link.sessionId, event.localUrl, planText, reviewLink, review.id);
-      const split = steps.length > 1 ? [{ label: `Approve & split into ${Math.min(steps.length, MAX_SPLIT)} sub-issues`, value: SPLIT_PLAN }] : [];
+      // A catch-up's sections are per-ticket verdicts, not steps: it is approved or sent back.
+      const split = !catchUp && steps.length > 1 ? [{ label: `Approve & split into ${Math.min(steps.length, MAX_SPLIT)} sub-issues`, value: SPLIT_PLAN }] : [];
       await sessions.ask(link.sessionId, `The plan is ready for review${reviewLink ? ` (full view: ${reviewLink})` : ""}. Approve it, or reply with what to change.${judgement ? `\n\n${judgement.line}` : ""}${model ? `\n\nPlanned with ${model}.` : ""}`, [{ label: "Approve plan", value: APPROVE_PLAN }, { label: "Approve, implement later", value: APPROVE_LATER }, ...split, { label: "Send back", value: SEND_BACK }]);
       return true;
     } catch (error) {
@@ -389,6 +407,17 @@ export class PlannotatorBridge {
 
   onProjectPlan(plans: ProjectPlans): void {
     this.projectPlans = plans;
+  }
+
+  // The catch-up's routes beside the planner run's: its plan is decided on its own.
+  onCatchUp(catchUp: CatchUpHooks): void {
+    this.catchUp = catchUp;
+  }
+
+  // The catch-up hooks when this ticket is the team's catch-up of older approved plans (the open one
+  // or the last closed one); null otherwise, and always for a bridge without a catch-up (tests).
+  private async catchUpOf(issueId: string | null | undefined): Promise<CatchUpHooks | null> {
+    return issueId && this.catchUp && await this.catchUp.isCatchUp(issueId) ? this.catchUp : null;
   }
 
   useFollowUps(followUps: Pick<PlanFollowUps, "file" | "retryPending">): void {
@@ -472,6 +501,7 @@ export class PlannotatorBridge {
     const stored = link.review;
     const agentId = link.agentId;
     if (!stored || !agentId) throw new Error("The plan review is no longer open.");
+    if (mode === "split" && await this.catchUpOf(link.issueId)) throw new Error(CATCH_UP_SPLIT);
     const planContent = await this.fetchPlan(stored.localUrl);
     if (!planContent.trim()) throw new Error("The plan could not be read from Plannotator.");
     const problem = mode === "split" ? splitProblem(planContent) : null;
@@ -652,10 +682,12 @@ export class PlannotatorBridge {
   }
 
   // What the risk policy needs to know about the ticket besides the plan. `round`: how the
-  // planning round is found; a parked plan passes the round it was parked in.
-  private async reviewFacts(state: IssueState, verdict: string | null, settings: PluginSettings, plan: string, round: { agentId: string; startedAt?: string | null }): Promise<ReviewFacts> {
+  // planning round is found; a parked plan passes the round it was parked in. `catchUp`: the plan
+  // is a catch-up's, which the owner always decides.
+  private async reviewFacts(state: IssueState, verdict: string | null, settings: PluginSettings, plan: string, round: { agentId: string; startedAt?: string | null }, catchUp = false): Promise<ReviewFacts> {
     return {
       verdict,
+      catchUp,
       untrusted: isUntrusted(state, await this.linear.viewerId(), await this.linear.trustedAppIds()),
       attended: hasLabel(state.labels, dispatchLabels(settings.dispatch.label).attended.toLowerCase()),
       // D1 (README, "Plan risk and auto-approval"): a block line that makes this ticket wait for an
@@ -706,8 +738,8 @@ export class PlannotatorBridge {
   // approval it had when nothing else changed. A planner run's work order never comes here
   // (deliverWorkOrder). The approval is journaled before Plannotator is told.
   // null: the plan has no readable rating.
-  private judge(review: ReviewGeneration, localUrl: string, agentId: string, issueId: string, planText: string, settings: PluginSettings): Promise<Judgement | null> {
-    return this.whileJudging(review.id, () => this.judgeNow(review, localUrl, agentId, issueId, planText, settings));
+  private judge(review: ReviewGeneration, localUrl: string, agentId: string, issueId: string, planText: string, settings: PluginSettings, catchUp = false): Promise<Judgement | null> {
+    return this.whileJudging(review.id, () => this.judgeNow(review, localUrl, agentId, issueId, planText, settings, catchUp));
   }
 
   private async whileJudging<T>(reviewId: string, work: () => Promise<T>): Promise<T> {
@@ -721,7 +753,7 @@ export class PlannotatorBridge {
     }
   }
 
-  private async judgeNow(review: ReviewGeneration, localUrl: string, agentId: string, issueId: string, planText: string, settings: PluginSettings): Promise<Judgement | null> {
+  private async judgeNow(review: ReviewGeneration, localUrl: string, agentId: string, issueId: string, planText: string, settings: PluginSettings, catchUp: boolean): Promise<Judgement | null> {
     // A replayed `opened` event: the review's decision is in the journal already.
     const decided = this.journal.attempts(review.id).find((attempt) => attempt.state !== "void");
     if (decided) return { approved: decided.approved, line: decided.approved ? "Approved; the decision is being applied." : "Sent back; the decision is being applied.", reasons: [] };
@@ -731,10 +763,12 @@ export class PlannotatorBridge {
     try {
       const state = await this.linear.issueState(issueId);
       const approvedBefore = await this.linear.issueDocument(issueId, `Plan: ${state.identifier}`).catch(() => null);
-      const tierOnly = approvedBefore ? onlyTierAdded(approvedBefore.content, planText) : false;
+      // A catch-up is never approved on its own: not for a rating, and not because only its model
+      // tier changed since an earlier round.
+      const tierOnly = !catchUp && approvedBefore ? onlyTierAdded(approvedBefore.content, planText) : false;
       if (!tierOnly && "problem" in rated) return null;
       const advice = await this.advice(agentId);
-      const outcome = tierOnly || "problem" in rated ? { approve: tierOnly, reasons: [] } : autoApproval(rated.risk, settings.autoApprove, await this.reviewFacts(state, advice && advice.hash === planHash(planText) ? advice.verdict : null, settings, planText, { agentId }));
+      const outcome = tierOnly || "problem" in rated ? { approve: tierOnly, reasons: [] } : autoApproval(rated.risk, settings.autoApprove, await this.reviewFacts(state, advice && advice.hash === planHash(planText) ? advice.verdict : null, settings, planText, { agentId }, catchUp));
       if (!outcome.approve) return { approved: false, line: `${rating} Needs your approval: ${outcome.reasons.join("; ")}.`, reasons: outcome.reasons };
       // Every other check passed, so only a plan that would be approved automatically claims. The
       // coordinator answers `granted` only when no overlapping plan holds or holds a newer approval;
@@ -809,7 +843,7 @@ export class PlannotatorBridge {
     const rated = parsePlanRisk(parked.plan);
     if ("problem" in rated) return;
     const settings = await this.settings.read();
-    const outcome = autoApproval(rated.risk, settings.autoApprove, await this.reviewFacts(await this.linear.issueState(parked.issueId), verdict, settings, parked.plan, { agentId: parked.agentId, startedAt: parked.roundStartedAt }));
+    const outcome = autoApproval(rated.risk, settings.autoApprove, await this.reviewFacts(await this.linear.issueState(parked.issueId), verdict, settings, parked.plan, { agentId: parked.agentId, startedAt: parked.roundStartedAt }, Boolean(await this.catchUpOf(parked.issueId))));
     const rating = `Risk: ${ratingText(rated.risk)}.`;
     let reasons = outcome.reasons;
     let approved = outcome.approve;
@@ -1040,13 +1074,33 @@ export class PlannotatorBridge {
     const planText = await this.fetchPlan(event.localUrl).catch(() => "");
     // The plan text tells a report on this review from one on another (decision-journal.ts, `unbound`).
     if (planText.trim()) review = await this.journal.ensureReview({ agentId, localUrl: event.localUrl, openedAt: event.at, planHash: planHash(planText) });
-    // A ticket plan without a complete `## Model` section (README, "Model tiers") or with an
-    // unusable `## Related work` block (README, "Related work") goes back to its planner before
-    // anyone reviews it; it never reaches the owner or a default tier, and one send-back names
-    // every problem. The closing is journaled first, so its report is never taken as the owner's
-    // send-back. A plan from before the rollout (only `## Overlapping tickets`) is not sent back:
-    // the catch-up covers it.
-    if (issueId) {
+    // A catch-up of older approved plans (related-catch-up.ts) is not a ticket plan: its verdict
+    // lines belong to the listed tickets, and its approval never writes this one. It is routed
+    // here, before every ticket-plan gate below.
+    const catchUp = await this.catchUpOf(issueId);
+    if (issueId && catchUp) {
+      if (!planText.trim()) throw new Error(`the plan of the catch-up ${identifier} could not be read from Plannotator`);
+      const problems = await catchUp.problems(issueId, planText);
+      if (problems.length) {
+        const reason = [
+          "Paseo sent this catch-up plan back before review.",
+          problems.map((problem) => `- ${problem}`).join("\n"),
+          "Fix these and submit the plan again.",
+        ].join("\n\n");
+        await this.journal.addClosing(review, false, reason);
+        await this.decide(event.localUrl, false, reason);
+        console.log(`[linear-tickets] ${identifier}: catch-up plan sent back to its agent: ${problems.join("; ")}`);
+        return;
+      }
+      // Its review waits for the owner from here on; its own record says so.
+      await catchUp.opened(issueId);
+    } else if (issueId) {
+      // A ticket plan without a complete `## Model` section (README, "Model tiers") or with an
+      // unusable `## Related work` block (README, "Related work") goes back to its planner before
+      // anyone reviews it; it never reaches the owner or a default tier, and one send-back names
+      // every problem. The closing is journaled first, so its report is never taken as the owner's
+      // send-back. A plan from before the rollout (only `## Overlapping tickets`) is not sent back:
+      // the catch-up covers it.
       const own = labels["linear.identifier"] ?? "";
       const model = planText.trim() ? modelProblem(planText) : null;
       const related = planText.trim() && own ? relatedWorkProblems(planText, own) : [];
@@ -1071,7 +1125,7 @@ export class PlannotatorBridge {
     const stableLink = await this.reviews?.opened(agentId, event, { identifier: labels["linear.identifier"] || undefined, ...(issueId ? { issueId } : {}), model, reviewId: review.id }) ?? null;
     const url = stableLink ?? event.remoteUrl ?? event.localUrl;
     const settings = await this.settings.read();
-    const judgement = issueId ? await this.judge(review, event.localUrl, agentId, issueId, planText, settings) : null;
+    const judgement = issueId ? await this.judge(review, event.localUrl, agentId, issueId, planText, settings, catchUp !== null) : null;
     if (issueId && !judgement?.approved && planText.trim() && this.parking?.available()) {
       const agent = refreshed?.agent ? { id: refreshed.agent.id, title: refreshed.agent.title ?? null, cwd: refreshed.agent.cwd } : null;
       await this.park(event, review, { issueId, identifier, agentId, plan: planText, line: judgement?.line ?? "The plan has no readable risk rating, so it needs your approval.", reasons: judgement?.reasons ?? ["no readable risk rating"], model, parkedAt: new Date().toISOString(), announced: false }, paseo, agent);
@@ -1087,7 +1141,7 @@ export class PlannotatorBridge {
     await handle.timeline.append({ type: "plugin", id: `plannotator-opened-${event.at.replace(/[^0-9A-Za-z]/g, "")}`, kind: PLANNOTATOR_KIND, version: 1, data: row })
       .catch((error: unknown) => console.error(`[linear-tickets] Plannotator chat row for ${agentId} skipped: ${message(error)}`));
     // Tailnet links only: a local-only review has no link worth showing off this machine.
-    const inSession = await this.toSession(event, review, agentId, model, event.remoteUrl ? url : null, planText, judgement);
+    const inSession = await this.toSession(event, review, agentId, model, event.remoteUrl ? url : null, planText, judgement, catchUp !== null);
     if (!issueId) return;
     // Plan review while the plan waits for its review; the decision writes the next stage. An
     // auto-approval writes nothing here: its decision writes the status and labels.
@@ -1205,13 +1259,16 @@ export class PlannotatorBridge {
       const record = { ...parked, staged: true };
       if (await this.stageReview(parked.issueId, parked.identifier, review, () => this.parking!.plans.put(record))) parked = record;
     }
+    // A parked catch-up's review is open too; its record stays in `awaiting-review`.
+    const catchUp = await this.catchUpOf(parked.issueId);
+    if (catchUp) await catchUp.opened(parked.issueId);
     if (parked.announced) return;
     if (!stableLink) this.show(event.localUrl);
     const model = parked.model ? `\n\nPlanned with ${parked.model}.` : "";
     if (link) {
       const steps = planSteps(parked.plan);
       if (steps.length) await this.sessions!.plan(link.sessionId, steps.map((content) => ({ content, status: "pending" as const })));
-      const split = steps.length > 1 ? [{ label: `Approve & split into ${Math.min(steps.length, MAX_SPLIT)} sub-issues`, value: SPLIT_PLAN }] : [];
+      const split = !catchUp && steps.length > 1 ? [{ label: `Approve & split into ${Math.min(steps.length, MAX_SPLIT)} sub-issues`, value: SPLIT_PLAN }] : [];
       await this.sessions!.ask(link.sessionId, `The plan waits for your review${reviewLink ? ` (full view: ${reviewLink})` : ""}. Its agent was closed to free the slot; a new one starts once you decide. Approve it, or reply with what to change.\n\n${parked.line}${model}`, [{ label: "Approve plan", value: APPROVE_PLAN }, { label: "Approve, implement later", value: APPROVE_LATER }, ...split, { label: "Send back", value: SEND_BACK }]);
     } else {
       await this.linear.comment(parked.issueId, `📋 **Plan waiting for your review in Plannotator**: ${url}${event.remoteUrl ? "" : "\n\n(Local link only: Tailscale was unavailable on the host.)"}\n\n${parked.line}\n\nIts agent was closed to free the slot. Assign Paseo again once you have decided.${model}`);
@@ -1346,6 +1403,24 @@ export class PlannotatorBridge {
     await steps.optional("chat", () => paseo.agents.ref(attempt.agentId).timeline.append({ type: "plugin", id: `plannotator-decided-${attempt.at.replace(/[^0-9A-Za-z]/g, "")}`, kind: PLANNOTATOR_KIND, version: 1, data: row }));
   }
 
+  // The owner's approval of a catch-up (related-catch-up.ts): Paseo applies the plan to the listed
+  // tickets, then the agent is retired as a planner run's is. The caller returns before every
+  // ticket-plan step: no `Plan:` document, no follow-ups, no relations, no plan-ready, no Todo move
+  // and no fresh implementing agent. Both steps are recorded, so a retry repeats only a missing one.
+  private async applyCatchUp(catchUp: CatchUpHooks, issueId: string, attempt: DecisionAttempt, steps: WorkerSteps): Promise<void> {
+    await steps.once("catch-up", () => catchUp.apply(issueId, attempt.agentId, attempt.planContent));
+    await steps.once("retire", async () => {
+      const paseo = this.paseo;
+      if (!paseo) throw new FencedError();
+      const review = this.journal.review(attempt.reviewId);
+      if (this.parking) {
+        await this.parking.retire(review && !review.legacy ? review.localUrl : null, attempt.agentId, paseo, CATCH_UP_RETIRE);
+        return;
+      }
+      if (review && !review.legacy) await this.decide(review.localUrl, false, CATCH_UP_RETIRE).catch((error: unknown) => { if (!(error instanceof ReviewClosedError)) throw error; });
+    });
+  }
+
   // A parked plan's decision: the plan document, its follow-ups and the plan stage (README,
   // "Statuses and labels"), then the session thread queues a fresh agent (or a comment asks to
   // assign Paseo). Approved: plan-ready, then a read-only preflight of the thread (`handoff`), then
@@ -1357,6 +1432,18 @@ export class PlannotatorBridge {
   private async applyParked(attempt: DecisionAttempt, steps: WorkerSteps): Promise<void> {
     const parked = attempt.parked!;
     const issue = { id: parked.issueId, identifier: parked.identifier };
+    // A catch-up's approval applies the plan to the listed tickets and ends here; a send-back
+    // returns it to planning through the normal path below.
+    const catchUp = await this.catchUpOf(issue.id);
+    if (catchUp) {
+      if (attempt.approved) {
+        await this.applyCatchUp(catchUp, issue.id, attempt, steps);
+        const parking = this.parking;
+        if (parking) await steps.once("unpark", () => parking.plans.remove(issue.id));
+        return;
+      }
+      await steps.once("catch-up-sent-back", () => catchUp.sentBack(issue.id));
+    }
     const event = this.eventOf(attempt, parked.plan);
     const sessionId = attempt.sessionId;
     const sessions = this.sessions;
@@ -1434,6 +1521,16 @@ export class PlannotatorBridge {
   private async applyLive(attempt: DecisionAttempt, steps: WorkerSteps): Promise<void> {
     const issueId = attempt.issueId!;
     const identifier = attempt.identifier ?? "this ticket";
+    // A catch-up's approval applies the plan to the listed tickets and ends here; a send-back
+    // returns it to planning through the normal path below.
+    const catchUp = await this.catchUpOf(issueId);
+    if (catchUp) {
+      if (attempt.approved) {
+        await this.applyCatchUp(catchUp, issueId, attempt, steps);
+        return;
+      }
+      await steps.once("catch-up-sent-back", () => catchUp.sentBack(issueId));
+    }
     const issue = { id: issueId, identifier };
     const event = this.eventOf(attempt);
     const settings = await this.settings.read();
@@ -1551,6 +1648,7 @@ export class PlannotatorBridge {
       ...(this.followUps ? { followUps: this.followUps } : {}),
       ...(this.relations ? { relations: this.relations } : {}),
       ...(this.claims ? { claims: this.claims } : {}),
+      ...(this.catchUp ? { catchUp: this.catchUp } : {}),
       roundStartedAt: attempt.parked?.roundStartedAt ?? await this.roundStart(attempt.agentId),
       session: sessions && sessionId ? {
         hold: (offer) => sessions.holdSession(sessionId, offer),

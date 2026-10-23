@@ -74,6 +74,7 @@ import { RelatedWork } from "./server/related-work";
 import { ApprovalClaims, ClaimRequests } from "./server/approval-claims";
 import { ProjectFlow, ProjectStore } from "./server/project-flow";
 import { ProjectIssueCache } from "./server/project-issues";
+import { RelatedCatchUp } from "./server/related-catch-up";
 import { Presence } from "./server/presence";
 import { Focus } from "./server/focus";
 import { rateBudget, withPriority } from "./server/rate-budget";
@@ -285,12 +286,23 @@ export default function contribute(server: PluginServerContext) {
   const projectStore = new ProjectStore();
   // Project tickets are read in full every 30 minutes and only as changed in between (project-issues.ts).
   const projectIssues = new ProjectIssueCache(linear);
+  // A planner run's agent is stopped and archived once its work is applied (planner-tickets.ts).
+  const retireRun = async (agentId: string, api: PaseoApi) => {
+    await stopAgentTurn(agentId).catch(() => {});
+    await api.agents.ref(agentId).archive().catch(() => {});
+  };
   const projects = new ProjectFlow({ linear, settings, projectIssues: (projectId, full) => projectIssues.read(projectId, full), scheduler: starter.scheduler, capacity: starter.capacity, store: projectStore, usage, tiers, focus,
     startPlanner: (input, paseo, current) => launcher.startPlanner(input, paseo, current),
-    retire: async (agentId, api) => {
-      await stopAgentTurn(agentId).catch(() => {});
-      await api.agents.ref(agentId).archive().catch(() => {});
-    } });
+    retire: retireRun });
+  // The catch-up of plans approved before related work was part of every plan (README, "Catch-up
+  // of older plans"). Its relations record and the bridge are built below; reached once it runs.
+  const relatedCatchUp = new RelatedCatchUp({
+    linear, related: relatedWork, settings, parked: waitingPlans, retire: retireRun,
+    relations: { file: (request) => planRelations.file(request), outcome: (recordId) => planRelations.outcome(recordId) },
+    startTicket: (issueId, paseo, current, options) => starter.start(issueId, paseo, current, options),
+    openSession,
+    paseo: () => attachedPaseo,
+  });
   const writeback = new Writeback(linear, settings, { sessions, handover }, undefined, undefined, needsYou);
   // The before-merge manual tasks of a ticket (manual-tasks.ts), read by the steward's facts.
   const manualTasks = new ManualTasks({ linear, settings });
@@ -316,7 +328,7 @@ export default function contribute(server: PluginServerContext) {
     responsibility: { due: (now) => responsibility.due(now), holds: (issue) => responsibility.holds(issue), run: (input) => responsibility.run(input) },
   });
   const relay = new CommentRelay(linear, undefined, needsYou, route, replies, { covered: () => coverage.covers("Comment"), agentDirectory });
-  const dispatcher = new Dispatcher({ linear, starter, launcher, settings, route, relay, afterLaunch: openSession, handOff: (issueId, openChildren) => sessions.handOffGroup(issueId, openChildren), projects, steward, focus, parked: waitingPlans });
+  const dispatcher = new Dispatcher({ linear, starter, launcher, settings, route, relay, afterLaunch: openSession, handOff: (issueId, openChildren) => sessions.handOffGroup(issueId, openChildren), projects, catchUp: relatedCatchUp, steward, focus, parked: waitingPlans });
   // The owner's plan feedback and answers, for the weekly decision candidates (README, "Decision candidates").
   const decisions = new DecisionLog();
   writeback.recordDecisions(decisions);
@@ -563,6 +575,8 @@ export default function contribute(server: PluginServerContext) {
   plannotator.usePlanRequests(planRequests);
   // The risk policy's overlap check (README, "Plan risk and auto-approval").
   plannotator.useRelated(relatedWork);
+  // The catch-up's review is decided on its own (README, "Catch-up of older plans").
+  plannotator.onCatchUp(relatedCatchUp);
   // The requester side: a plan that would be auto-approved claims the coordinator's grant first,
   // settles it once its `Plan:` document is written, and reports owner approvals from an outbox.
   claimRequests = new ClaimRequests({

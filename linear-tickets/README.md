@@ -860,7 +860,8 @@ or `Incomplete:` with what to look up by hand:
   excerpt of its description;
 - the approved `Plan: <ticket>` documents of open tickets, newest approval first, each with its
   `## Reach`, the files the plan names and whether it has a `## Related work` list (a plan sent
-  back is left out);
+  back is left out), each read together with its `Related work: <ticket>` document while that
+  document covers the plan's current text (see **Catch-up of older plans**);
 - the tickets in Planning;
 - the files of the open tickets' pull requests, open ones and merged ones (newest merge first,
   with the ticket's status); those closed without merging are left out, and those not read yet
@@ -948,6 +949,62 @@ coding and ask you in a question request whether to re-plan, naming the ticket t
 request reads go through the same cache and limit as the candidate list. When the plan document or
 the check cannot be read, the note says the check could not run and asks the agent to compare with
 recent approvals and merged pull requests itself.
+
+**Catch-up of older plans.** Plans approved before related work was part of every plan carry no
+```` ```related-work ```` block, so nothing links them to the work around them. The dispatch host
+(`dispatch.enabled`, not forwarding to a peer) looks at each dispatch team every five minutes and
+files one catch-up per team for them ([`server/related-catch-up.ts`](server/related-catch-up.ts)). A
+ticket is listed when it is open, its `Plan:` document is approved and has no related-work block, it
+is neither a catch-up nor a project planner's work order, and no earlier catch-up settled it for the
+same plan text. The catch-up is a ticket the Paseo app files in that team, without a project and
+without the trigger label: `Catch up the related work of N approved plans`. Its description is the
+brief: the precedence rule above, the listed plans oldest approval first (title, status, approval
+instant, whether the plan has `## Reach`, and what changed since that approval, newest first, as in
+the since-approval note) and the steps: read each listed plan in full before giving it a verdict,
+check a merged change that seems to contradict it on `origin/main`, and do not count a later plan
+that deliberately replaces the behaviour as a contradiction. Its agent starts on the dispatch host as
+a planning launch, so it gets the candidate list; opening its Linear thread delegates the ticket to
+Paseo. The record is written before the agent starts: a start that fails is retried by the next
+look, never with a second ticket, and an agent that stops without a plan is restarted up to three
+times, then you get one comment on the catch-up ticket. A catch-up waiting for your review, parked
+or not, is never restarted.
+
+Its plan follows your planning instructions' parts. After the last part come the usual `## Reach`,
+`## Principles and rules`, `## Verification`, `## Model` and `## Risk and impact` (a fixed text the
+brief gives: impact 2, `data-fix`, recommendation owner), then `## Listed tickets` with one
+`### TUC-N` section per listed ticket, then `## Advisor review`. A section gives `Verdict: holds — …`
+or `Verdict: replan — …`, the typed related-work lines, a `#### Reach` list when the listed plan has
+no `## Reach`, and one related-work block whose lines name that ticket, with `replan TUC-N` exactly
+when the verdict is replan. Only `blocks`, `related` and `replan` lines are allowed: a catch-up never
+adds a hold label or closes a duplicate. A plan with a listed ticket missing, a ticket listed twice or
+not listed, a verdict that disagrees with its block, or an unreadable rating is sent back to its
+agent with the problems before it reaches you. Its review always goes to you, with the reason *a
+related-work catch-up always goes to you*; it is approved or sent back, not split, and "Approve
+later" applies it at once (it starts no implementation).
+
+Approving it applies each section in order, as the Paseo app, and never rewrites a `Plan:`
+document: the listed ticket and its plan are read again first, and a ticket closed since, or whose
+plan was approved again (the new plan carries its own list), is skipped and named. A ticket not
+written by you or Paseo gets one comment with its section's lines for your review and nothing else;
+it is not listed again for that plan. Otherwise the ticket gets a `Related work: <ticket>` document
+(first line `<!-- covers-plan: <hash of the plan> -->`, then the hash of the section, then
+`## Related work (catch-up TUC-N, approved <instant>)` with the section, and `## Reach` from its
+`#### Reach` list), rewritten only when the section changed, and its lines go through the same
+records as a plan approval (above), keyed by the ticket and the plan's hash, so nothing is written
+twice. Every reader of an approved plan (the candidate list, the overlap check, the since-approval
+and plan-ready notes) reads it with that document while `covers-plan` names the plan's current hash;
+once the ticket is approved again, the document is ignored. A section the app cannot write yet stays
+pending and the next look continues it; one whose record gives up is skipped, the ticket stays
+eligible, and the next catch-up resumes the same record. When every section is applied or skipped,
+the catch-up ticket gets one summary comment (each listed ticket, applied or skipped with the
+reason), is completed, and its agent is retired; the next catch-up follows no sooner than a day
+later. Closing or canceling the catch-up ticket without approving it declines it: its agents are
+retired, and the next catch-up waits a week. Every write re-reads the ticket and its plan first; a
+plan approved in the instant between that read and the write can still get a link meant for the old
+plan, and the summary names every write so you can remove one by hand. Deleting a `Related work:`
+document by hand removes the analysis from the plan's readers; the links it wrote stay, and the
+ticket is not listed again for that plan. The state lives in
+`$PASEO_HOME/linear-tickets/related-catch-up.json`.
 
 **Reach and principles.** A decision made in one ticket should apply everywhere it belongs and not
 come back in the next one, so every plan carries two more sections before `## Risk and impact`, in
@@ -1281,6 +1338,9 @@ shares files, `## Reach` places or related tickets with this plan, or that names
 named by it, into a reason: `TUC-12's plan names the same files: server/x.ts`, also for shared
 places (`reaches the same places: …`) and tickets (`names the same tickets: …`). A read that fails
 gives `the related-work check failed` instead: the plan waits for you either way.
+A related-work catch-up (see **Catch-up of older plans**) is never approved on your behalf either:
+its review always carries *a related-work catch-up always goes to you*. The approved plans this
+check reads include their `Related work:` document while it covers the plan's current text.
 
 **The approval coordinator.** Two hosts approving at the same time could both read Linear's
 approved plans before either wrote its document, so only one host approves automatically: the one

@@ -3,12 +3,13 @@
 // a planner starts, at most once per team every CANDIDATE_TTL_MS, at background priority.
 
 import { footprintOverlap, planFootprint, sameFile, type FootprintOverlap, type PlanFootprint } from "../shared/plan-footprint";
-import { reachBody } from "../shared/plan-sections";
+import { hasSection, REACH_SECTION, reachBody } from "../shared/plan-sections";
+import { parseBlock, RELATED_WORK_TAG } from "../shared/work-order";
 import type { PullRequestFiles } from "./label-sync";
 import type { CandidateIssue, DoneIssue, LinearService, Pages } from "./linear";
 import { PLANNING_STATE, planStage } from "./plan-policy";
 import { withPriority } from "./rate-budget";
-import { approvalInterval, approvedDocument, documentPlanText } from "./review-outcome";
+import { approvalInterval, approvedDocument, documentPlanHash, documentPlanText, planHash } from "./review-outcome";
 
 export const CANDIDATE_TTL_MS = 2 * 60 * 1000;
 const DONE_DAYS = 60;
@@ -22,13 +23,63 @@ export const CANDIDATE_PULL_REQUEST_READS = 20;
 // implementer's note state it.
 export const PRECEDENCE_RULE = "When sources disagree: the code as merged is the current baseline. A plan written before a later merged change that contradicts it is re-planned, not implemented against it. A later approved plan that deliberately replaces existing behaviour stays valid: it is the newer decision. Open pull requests are proposed work, to be checked as conflicts, not authority. Ticket descriptions count least. When unsure whether a merged change still holds (it may have been reverted), read the file on `origin/main`.";
 
+// The document a catch-up leaves beside an old approved plan (README, "Catch-up of older plans"):
+// its first two lines name the plan it covers and the approved section it was written from, so
+// every reader drops it as soon as the ticket is approved again.
+export type RelatedWorkDocument = { planHash: string; section: string; catchUp: string; approvedAt: string; reach?: string | null };
+
+export function relatedWorkDocument({ planHash: covers, section, catchUp, approvedAt, reach }: RelatedWorkDocument): string {
+  return [
+    `<!-- covers-plan: ${covers} -->\n<!-- analysis: ${planHash(section)} -->`,
+    `## Related work (catch-up ${catchUp}, approved ${approvedAt})`,
+    section.trim(),
+    ...(reach ? [`## Reach`, reach.trim()] : []),
+  ].join("\n\n") + "\n";
+}
+
+// A `Related work:` document's two header lines; either is null when the document was written by
+// something else.
+export function relatedWorkHeader(content: string): { coversPlan: string | null; analysis: string | null } {
+  return {
+    coversPlan: /^<!-- covers-plan: (\S+) -->\s*$/m.exec(content)?.[1] ?? null,
+    analysis: /^<!-- analysis: (\S+) -->\s*$/m.exec(content)?.[1] ?? null,
+  };
+}
+
+// A ticket's plan as every reader sees it: the `Plan:` document's own text, plus its `Related
+// work:` document while that one covers the plan's current hash. A plan approved again makes the
+// document stale, and its new plan carries its own list.
+export function composePlan(planDocument: string, relatedWork: string | null): string {
+  const plan = documentPlanText(planDocument);
+  if (!relatedWork || relatedWorkHeader(relatedWork).coversPlan !== documentPlanHash(planDocument)) return plan;
+  // Everything below the document's leading `<!-- … -->` header lines is its body.
+  const body = relatedWork.replace(/^(?:\s*<!--[^\n]*-->\s*\n)+/, "").trim();
+  return `${plan.trimEnd()}\n\n${body}\n`;
+}
+
 type Deps = {
   linear: Pick<LinearService, "teamCandidates" | "doneSince" | "documentContents" | "planDocumentsSince">;
   pullRequests: Pick<PullRequestFiles, "refresh" | "filesOf" | "stateOf">;
   now?: () => number;
 };
 
-type ApprovedPlan = { issue: CandidateIssue; approvedAt: string; label: string; content: string };
+type ApprovedPlan = {
+  issue: CandidateIssue;
+  approvedAt: string;
+  label: string;
+  // The `Plan:` document's content, and the plan every reader uses (composed, see `composePlan`).
+  content: string;
+  plan: string;
+  // The `Plan:` document's own hash, block and `## Reach`, which the catch-up checks as they are.
+  planHash: string;
+  hasBlock: boolean;
+  hasReach: boolean;
+};
+// One approved plan as the catch-up lists and applies it (server/related-catch-up.ts).
+export type ApprovedPlanInfo = {
+  issueId: string; identifier: string; title: string; status: string; statusType: string;
+  approvedAt: string; planHash: string; hasBlock: boolean; hasReach: boolean; plan: string;
+};
 // An approved plan of another ticket whose footprint overlaps one's own (`approvedSince`).
 export type ApprovalOverlap = { identifier: string; approvedAt: number; overlap: FootprintOverlap };
 // Work that changed since a plan was approved (`changedSince`): a pull request merged, or another
@@ -69,7 +120,7 @@ export class RelatedWork {
     const since = new Date(this.now() - DONE_DAYS * DAY_MS).toISOString();
     const [done, plans] = await Promise.all([
       this.deps.linear.doneSince(teamId, since).catch((error: unknown) => error instanceof Error ? error : new Error(String(error))),
-      this.approvedPlans(open.items),
+      this.readPlans(open.items),
       // A failed refresh leaves the pull requests it did not read listed as not read yet.
       this.deps.pullRequests.refresh(open.items.flatMap((issue) => issue.pullRequests), CANDIDATE_PULL_REQUEST_READS).catch(() => undefined),
     ]);
@@ -85,11 +136,24 @@ export class RelatedWork {
     ].join("\n\n") + "\n";
   }
 
-  // The Approved `Plan: <identifier>` documents of these tickets, newest approval first; `unread`:
-  // the documents whose content could not be read.
-  private async approvedPlans(issues: CandidateIssue[]): Promise<{ plans: ApprovedPlan[]; unread: string[] }> {
+  // The team's approved plans, newest approval first, with what the catch-up needs (README,
+  // "Catch-up of older plans"): its own block, reach and hash, and the plan as its readers see it.
+  async approvedPlans(teamId: string): Promise<ApprovedPlanInfo[]> {
+    const open = await withPriority("background", "related work", () => this.deps.linear.teamCandidates(teamId));
+    const { plans } = await this.readPlans(open.items);
+    return plans.map((plan) => ({
+      issueId: plan.issue.id, identifier: plan.issue.identifier, title: plan.issue.title, status: plan.issue.status, statusType: plan.issue.statusType,
+      approvedAt: plan.approvedAt, planHash: plan.planHash, hasBlock: plan.hasBlock, hasReach: plan.hasReach, plan: plan.plan,
+    }));
+  }
+
+  // The Approved `Plan: <identifier>` documents of these tickets, newest approval first, each with
+  // the ticket's `Related work:` document composed into it while that one covers the plan's hash;
+  // `unread`: the plan documents whose content could not be read.
+  private async readPlans(issues: CandidateIssue[]): Promise<{ plans: ApprovedPlan[]; unread: string[] }> {
     const documents = issues.flatMap((issue) => issue.planDocuments.filter((document) => document.title === `Plan: ${issue.identifier}`).map((document) => ({ issue, document })));
-    const texts = await this.documentTexts(documents.map(({ document }) => document));
+    const annotations = issues.flatMap((issue) => issue.planDocuments.filter((document) => document.title === `Related work: ${issue.identifier}`).map((document) => ({ issue, document })));
+    const texts = await this.documentTexts([...documents, ...annotations].map(({ document }) => document));
     const plans: ApprovedPlan[] = [];
     const unread: string[] = [];
     for (const { issue, document } of documents) {
@@ -100,7 +164,15 @@ export class RelatedWork {
       // approval interval (review-outcome.ts) carries the precision.
       const label = /^> \*\*Approved\*\*[^\n]* on (\d{4}-\d{2}-\d{2}(?: \d{2}:\d{2}(?::\d{2}(?:\.\d+)?)? UTC)?)/.exec(content)?.[1] ?? `${document.updatedAt} (document saved)`;
       const [approvedAt] = approvalInterval(content, document.updatedAt) ?? [Date.parse(document.updatedAt), 0];
-      plans.push({ issue, approvedAt: new Date(approvedAt).toISOString(), label, content });
+      const annotation = annotations.find((entry) => entry.issue.id === issue.id);
+      const text = documentPlanText(content);
+      plans.push({
+        issue, approvedAt: new Date(approvedAt).toISOString(), label, content,
+        plan: composePlan(content, annotation ? texts.get(annotation.document.id) ?? null : null),
+        planHash: documentPlanHash(content),
+        hasBlock: parseBlock(text, RELATED_WORK_TAG) !== null,
+        hasReach: hasSection(text, REACH_SECTION),
+      });
     }
     plans.sort((a, b) => b.approvedAt.localeCompare(a.approvedAt));
     return { plans, unread };
@@ -137,7 +209,7 @@ export class RelatedWork {
       if (!approvedDocument(document.content)) continue;
       const approved = approvalInterval(document.content, document.updatedAt);
       if (!approved || approved[1] < since) continue;
-      const overlap = footprintOverlap(own, planFootprint(documentPlanText(document.content), document.issue.identifier));
+      const overlap = footprintOverlap(own, planFootprint(composePlan(document.content, document.relatedWork ?? null), document.issue.identifier));
       if (!overlap.files.length && !overlap.places.length && !overlap.tickets.length && !overlap.namesOther) continue;
       overlaps.push({ identifier: document.issue.identifier, approvedAt: approved[0], overlap });
     }
@@ -190,7 +262,8 @@ export class RelatedWork {
       if (!approvedDocument(content)) continue;
       const approved = approvalInterval(content, document.updatedAt);
       if (!approved) continue;
-      const overlap = footprintOverlap(own, planFootprint(documentPlanText(content), issue.identifier));
+      const annotation = issue.planDocuments.find((entry) => entry.title === `Related work: ${issue.identifier}`);
+      const overlap = footprintOverlap(own, planFootprint(composePlan(content, annotation?.content || null), issue.identifier));
       if (!overlap.files.length && !overlap.places.length && !overlap.tickets.length && !overlap.namesOther) continue;
       const existing = byTicket.get(issue.identifier);
       if (existing) { existing.status = "Done"; existing.completedAt = issue.completedAt; continue; }
@@ -251,12 +324,13 @@ function plansSection({ plans, unread }: { plans: ApprovedPlan[]; unread: string
     `## Approved plans of open tickets, newest approval first (${plans.length})`,
     completeness(!unread.length, `these plan documents could not be read; read them in Linear: ${unread.join(", ")}.`),
     ...plans.map((plan) => {
-      const reach = reachBody(plan.content);
-      const files = planFootprint(plan.content).files;
+      const footprint = planFootprint(plan.plan, plan.issue.identifier);
+      const reach = reachBody(plan.plan);
+      const list = /^#{1,6}\s+Related work\b/im.test(plan.plan) ? "yes" : "no";
       return [
         `### ${plan.issue.identifier} — ${plan.issue.title} (${plan.issue.status}), approved ${plan.label}`,
-        `Related-work list: ${/^#{1,6}\s+Related work\b/im.test(plan.content) ? "yes" : "no"}.`,
-        `Files: ${files.length ? files.map((file) => `\`${file}\``).join(", ") : "none named"}.`,
+        `Related-work list: ${list}${footprint.tickets.length ? `, naming ${footprint.tickets.join(", ")}` : ""}.`,
+        `Files: ${footprint.files.length ? footprint.files.map((file) => `\`${file}\``).join(", ") : "none named"}.`,
         reach ? `Reach:\n\n${reach}` : "Reach: the plan has no `## Reach` section.",
       ].join("\n");
     }),

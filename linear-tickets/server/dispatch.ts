@@ -44,6 +44,8 @@ type Deps = {
   relay?: Pick<CommentRelay, "poll">;
   // Labelled projects (README, "Projects"), moved forward after the labelled tickets.
   projects?: { tick: (paseo: PaseoApi, settings: PluginSettings) => Promise<void> };
+  // The catch-up of older approved plans (README, "Catch-up of older plans"), after the projects.
+  catchUp?: { tick: (paseo: PaseoApi, settings: PluginSettings) => Promise<void> };
   // Stale running and failed labels (README, "Repairing stale running and failed labels"), repaired
   // after the projects; `ownerRetried` ends a ticket's incident before the owner's label starts it.
   // `tickQueueBlockers` is the paused poll's queue-blocker-only pass (README, "Auto-dispatch").
@@ -213,10 +215,11 @@ export class Dispatcher {
       this.launchRoom();
       await this.dispatch(issue, settings, paseo);
     }
-    for (const next of [this.deps.projects, this.deps.steward]) {
+    const passes = [["project-flow", this.deps.projects], ["related-catch-up", this.deps.catchUp], ["steward", this.deps.steward]] as const;
+    for (const [caller, next] of passes) {
       if (this.stopped || !next) continue;
       this.launchRoom();
-      await asCaller(next === this.deps.projects ? "project-flow" : "steward", () => next.tick(paseo, settings));
+      await asCaller(caller, () => next.tick(paseo, settings));
     }
   }
 

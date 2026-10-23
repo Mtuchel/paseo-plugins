@@ -51,6 +51,9 @@ export type RelationStep = {
 
 export type RelationsRecord = {
   issueId: string;
+  // The record file's own identity: a catch-up section files one record per ticket beside the
+  // ticket's agent record, and the outcome is read back by it. Absent for a ticket's own record.
+  recordId?: string;
   identifier: string;
   documentUrl: string | null;
   // sha256 of the plan text the keys belong to: a revised plan re-asks its `replan` lines and
@@ -73,7 +76,13 @@ export type RelationsRecord = {
   removalRestored?: boolean;
   attempts: number;
   retryAt: number | null;
-  stopped?: "gave-up" | "untrusted";
+  // A catch-up section's guard (README, "Catch-up of older plans"): the ticket's plan document
+  // hash it was written for, re-read before every write step. A new approval stops it.
+  guard?: { issueId: string; planHash: string };
+  // What a replan comment credits ("<origin>'s approved plan"): this host, or the catch-up's
+  // identifier for a catch-up section's request. Kept on the record for the retries.
+  origin?: string;
+  stopped?: "gave-up" | "untrusted" | "changed";
   // sha256 of the last comment posted, with the id reserved before it (as PlanFollowUps).
   summary: string | null;
   summaryId?: string;
@@ -88,7 +97,20 @@ export type RelationsRequest = {
   // A catch-up section (README, "Related work") applies links only: it never touches the label.
   cleanup?: boolean;
   roundStartedAt?: string | null;
+  // The record's own file identity (a catch-up section's `catch-up:<issueId>:<planHash>`); the
+  // serial key stays the ticket's, so its records still run one at a time. Default: the ticket's.
+  recordId?: string;
+  // A catch-up section's replan comments credit the catch-up ticket, not this host.
+  origin?: string;
+  // A catch-up section's guard: the ticket's `Plan:` document hash its lines were written for.
+  // Every write step re-reads that hash and the ticket's trust first, and stops the remaining
+  // lines (`changed`) when either moved: the owner replaced the plan this analysis covers.
+  guard?: { issueId: string; planHash: string };
 };
+
+// What a record reached, read by its id (the catch-up marks its sections pending, applied or
+// skipped with it). A missing record is pending: `file()` has not run yet.
+export type RelationsOutcome = { status: "pending" } | { status: "done" } | { status: "stopped"; reason: "gave-up" | "untrusted" | "changed" };
 
 // A plan's `## Related work` block (README, "Related work"): approving the plan writes each line
 // into Linear as the Paseo app (never the owner's key) — a blocker, a relation, closing an
@@ -122,11 +144,20 @@ export class PlanRelations {
     const removal = request.cleanup !== false;
     // No block (a plan from before the rollout) is a plan with no related work: nothing to apply.
     if (block === null && !removal) return Promise.resolve();
+    // A catch-up section files its own record beside the ticket's own; the ticket still runs one
+    // call at a time, so two records of one ticket never write at once.
+    const key = request.recordId ?? request.issueId;
     return this.serial(request.issueId, async () => {
-      const record = await this.load(request.issueId) ?? {
+      const record = await this.load(key) ?? {
         issueId: request.issueId, identifier: request.identifier, documentUrl: null, planHash: "", lines: [], steps: {}, unreadable: [],
         dropped: [], doneElsewhere: [], roundStartedAt: null, removal: "pending", attempts: 0, retryAt: null, summary: null,
       };
+      // A later catch-up resumes the record an earlier one stopped (README, "Catch-up of older
+      // plans"): its done lines and operation ids stay, its rounds start over.
+      const resumed = Boolean(request.origin && record.origin && record.origin !== request.origin);
+      if (request.recordId) record.recordId = request.recordId;
+      if (request.guard) record.guard = request.guard;
+      if (request.origin) record.origin = request.origin;
       record.identifier = request.identifier;
       record.documentUrl = request.documentUrl ?? record.documentUrl;
       if (request.roundStartedAt !== undefined) record.roundStartedAt = request.roundStartedAt;
@@ -137,7 +168,10 @@ export class PlanRelations {
       const parsed = blockLines(block ?? "").map((line) => ({ line, step: stepOf(line) }));
       // A revised plan: the same line keeps its done state, a line it no longer lists is dropped
       // (never written halfway), and `replan` lines are keyed by the plan's hash, so they ask again.
-      const keys = parsed.flatMap(({ line, step }) => step ? [step.kind === "replan" ? `${line} @ ${hash}` : line] : []);
+      // A catch-up section's replan belongs to the listed ticket's plan (`guard`), not to the
+      // section's wording: a changed analysis of the same plan never asks a second time.
+      const replanHash = request.guard?.planHash ?? hash;
+      const keys = parsed.flatMap(({ line, step }) => step ? [step.kind === "replan" ? `${line} @ ${replanHash}` : line] : []);
       if (record.planHash && revised) {
         const current = new Set(keys);
         for (const [key, step] of Object.entries(record.steps)) {
@@ -153,6 +187,11 @@ export class PlanRelations {
         delete record.stopped;
         delete record.removalKept;
         delete record.removalRestored;
+      }
+      if (resumed && !revised) {
+        record.attempts = 0;
+        record.retryAt = null;
+        delete record.stopped;
       }
       record.planHash = hash;
       record.lines = keys;
@@ -184,8 +223,9 @@ export class PlanRelations {
         if (!name.endsWith(".json")) continue;
         const found = await this.read(join(this.directory, name));
         if (!due(found)) continue;
+        const key = found.recordId ?? found.issueId;
         await this.serial(found.issueId, async () => {
-          const record = await this.load(found.issueId);
+          const record = await this.load(key);
           if (due(record)) await this.process(record);
         }).catch((error: unknown) => {
           console.error(`[linear-tickets] retrying the plan relations of ${found.identifier} failed: ${message(error)}`);
@@ -257,6 +297,8 @@ export class PlanRelations {
     }
     for (const step of steps) {
       if (record.stopped || step.done || step.skipped) continue;
+      // A catch-up section's guard (below): the plan it analyses may be replaced between two lines.
+      if (await this.guardMoved(record)) { await this.save(record); break; }
       try {
         if (await this.apply(record, step)) {
           step.done = true;
@@ -287,6 +329,35 @@ export class PlanRelations {
     if (failed && !record.stopped) this.failedRound(record);
     await this.save(record);
     await this.announce(record, steps);
+  }
+
+  // A catch-up section's guard (server/related-catch-up.ts): its lines belong to the plan hash it
+  // names, and the ticket must still be trusted. Both are re-read before every write step, so a
+  // plan approved again mid-round stops the remaining lines instead of linking them under a plan
+  // the owner replaced. True when the record stopped.
+  private async guardMoved(record: RelationsRecord): Promise<boolean> {
+    const guard = record.guard;
+    if (!guard) return false;
+    const state = await this.linear.issueCore(guard.issueId);
+    if (isUntrusted(state, await this.linear.viewerId(), await this.linear.trustedAppIds())) {
+      record.stopped = "untrusted";
+      return true;
+    }
+    const plan = await this.linear.issueDocument(guard.issueId, `Plan: ${state.identifier}`);
+    if (!plan || documentPlanHash(plan.content) !== guard.planHash) {
+      record.stopped = "changed";
+      return true;
+    }
+    return false;
+  }
+
+  // What a record reached, by its id (server/related-catch-up.ts marks its sections with it): a
+  // missing record has not run yet.
+  async outcome(recordId: string): Promise<RelationsOutcome> {
+    const record = await this.load(recordId);
+    if (!record) return { status: "pending" };
+    if (record.stopped) return { status: "stopped", reason: record.stopped };
+    return { status: this.settled(record) ? "done" : "pending" };
   }
 
   // One line, as the Paseo app. True when done; false when the app could not be used (retried).
@@ -371,7 +442,7 @@ export class PlanRelations {
       const posted = await this.linear.replanComments(target.id, step.opAt!).then((comments) => comments.some((comment) => comment.body.includes(`<!-- replan-op: ${step.opId} -->`)));
       if (!posted) {
         const body = [
-          `🔁 **Replan requested** by ${this.origin()}'s approved plan`,
+          `🔁 **Replan requested** by ${record.origin ?? this.origin()}'s approved plan`,
           "",
           step.reason || `${record.identifier}'s approved plan depends on this ticket's plan.`,
           ...(record.documentUrl ? [`[${record.identifier}'s approved plan](${record.documentUrl})`] : []),
@@ -478,12 +549,13 @@ export class PlanRelations {
     await this.save(record);
   }
 
-  private path(issueId: string): string {
-    return join(this.directory, `${issueId.replace(/[^A-Za-z0-9-]/g, "_")}.json`);
+  // `key`: the record's id (the ticket's own id, or a catch-up section's `recordId`).
+  private path(key: string): string {
+    return join(this.directory, `${key.replace(/[^A-Za-z0-9-]/g, "_")}.json`);
   }
 
-  private load(issueId: string): Promise<RelationsRecord | null> {
-    return this.read(this.path(issueId));
+  private load(key: string): Promise<RelationsRecord | null> {
+    return this.read(this.path(key));
   }
 
   private async read(path: string): Promise<RelationsRecord | null> {
@@ -495,7 +567,7 @@ export class PlanRelations {
 
   private async save(record: RelationsRecord): Promise<void> {
     await mkdir(this.directory, { recursive: true, mode: 0o700 });
-    const path = this.path(record.issueId);
+    const path = this.path(record.recordId ?? record.issueId);
     const temporary = `${path}.${randomUUID()}.tmp`;
     try {
       await writeFile(temporary, JSON.stringify(record, null, 2), { mode: 0o600 });
@@ -518,7 +590,9 @@ export function summaryText(record: Pick<RelationsRecord, "identifier" | "docume
   } else {
     if (applied.length) sections.push(`Related work applied from the approved plan${plan}:\n${applied.map((step) => `- ${step.line}${step.kind === "replan" ? ` (asked ${step.ticket} to plan again)` : ""}`).join("\n")}`);
     if (refused.length) sections.push(`Not applied:\n${refused.map((step) => `- ${step.line} (${step.skipped})`).join("\n")}`);
-    if (waiting.length) sections.push(`Not applied yet — Paseo could not write to Linear as itself; it retries every ten minutes. Approve a revised plan to try again:\n${waiting.map((step) => `- ${step.line}`).join("\n")}`);
+    if (waiting.length) sections.push(record.stopped === "changed"
+      ? `Not applied — this analysis covers an earlier approved plan of ${record.identifier}, which was approved again (or whose plan document changed) while its lines were being written. The current plan carries its own related-work list, so these lines stop here:\n${waiting.map((step) => `- ${step.line}`).join("\n")}`
+      : `Not applied yet — Paseo could not write to Linear as itself; it retries every ten minutes. Approve a revised plan to try again:\n${waiting.map((step) => `- ${step.line}`).join("\n")}`);
     if (record.doneElsewhere.length) sections.push(`Applied from an earlier approved plan, no longer listed:\n${record.doneElsewhere.map((line) => `- ${line}`).join("\n")}`);
     if (record.dropped.length) sections.push(`Dropped with this plan (never applied):\n${record.dropped.map((line) => `- ${line}`).join("\n")}`);
     if (record.unreadable.length) sections.push(`Not one related-work line, left alone:\n${record.unreadable.map((line) => `- ${line}`).join("\n")}`);
