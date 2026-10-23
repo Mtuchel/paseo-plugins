@@ -37,7 +37,7 @@ import { ensureBackendSecret } from "./server/inbox-transport";
 import { tailnetOrigin } from "./server/tailscale";
 import { BrowserDecisionInbox } from "./server/decision-inbox";
 import { BoardInbox } from "./server/board-inbox";
-import { collectBoardFacts } from "./server/board-facts";
+import { BoardInsides, collectBoardFacts } from "./server/board-facts";
 import { boardIssues, boardPulls } from "./server/board-sources";
 import { MergeStatus } from "./server/merge-status";
 import { mergeStatusRpc } from "./shared/merge-status";
@@ -436,12 +436,14 @@ export default function contribute(server: PluginServerContext) {
   });
   // The factory board (/board): this host's live facts, its peers' answers, and the two shared
   // sources, derived into one view (shared/board.ts, server/board.ts).
+  const boardInsides = new BoardInsides();
   const board = new BoardInbox({
     facts: () => asCaller("board", () => collectBoardFacts({
       host: hostname().split(".")[0].toLowerCase(),
       home: join(paseoHome(), "linear-tickets"),
       paseo: () => attachedPaseo,
       agentDirectory,
+      insides: boardInsides,
       maxRunning: async () => (await settings.read()).dispatch.maxRunning ?? null,
     })),
     peers: async () => (await settings.read()).reviewPeers,

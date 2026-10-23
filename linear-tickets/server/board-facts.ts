@@ -16,6 +16,8 @@ export type BoardFactsDeps = {
   paseo: () => PaseoApi | null;
   // The shared read-only agent listing (TUC-3006).
   agentDirectory: Pick<AgentDirectory, "live">;
+  // The last tail read per agent, kept across collections.
+  insides: BoardInsides;
   maxRunning: () => Promise<number | null>;
   now?: () => Date;
 };
@@ -122,6 +124,34 @@ async function readInside(paseo: PaseoApi, agent: PaseoAgent): Promise<BoardInsi
   const page = await paseo.agents.ref(agent).timeline.refetch({ direction: "tail", projection: "canonical", limit: TIMELINE_TAIL });
   if (page.error) throw new Error("Public timeline unavailable");
   return insideOf(Array.isArray(page.entries) ? page.entries : []);
+}
+
+// A board poll read every ticket agent's tail (53 every minute on server087, 0.3 s to 2 s of the
+// daemon's main thread each). The daemon moves an agent's `updatedAt` on every live stream event
+// and every appended row, so a tail read at an `updatedAt` the listing still shows is still the
+// tail: it is reused, and only agents that moved since are read again. A failed read is not kept.
+export class BoardInsides {
+  private readonly readings = new Map<string, { updatedAt: string; inside: BoardInside }>();
+
+  async read(paseo: PaseoApi, agent: PaseoAgent): Promise<BoardInside | null> {
+    const updatedAt = typeof agent.updatedAt === "string" && agent.updatedAt ? agent.updatedAt : null;
+    const kept = this.readings.get(agent.id);
+    if (kept && updatedAt && kept.updatedAt === updatedAt) return kept.inside;
+    try {
+      const inside = await readInside(paseo, agent);
+      if (updatedAt) this.readings.set(agent.id, { updatedAt, inside });
+      else this.readings.delete(agent.id);
+      return inside;
+    } catch {
+      this.readings.delete(agent.id);
+      return null;
+    }
+  }
+
+  // Agents that left the board take their reading with them.
+  keepOnly(ids: ReadonlySet<string>): void {
+    for (const id of this.readings.keys()) if (!ids.has(id)) this.readings.delete(id);
+  }
 }
 
 // `responsibility.observedStage` is the steward's own JSON snapshot of the ticket's stage; the
@@ -314,13 +344,14 @@ export async function collectBoardFacts(deps: BoardFactsDeps): Promise<BoardHost
   }
   const ticketAgents = live.filter(({ agent }) => agent.labels?.["linear.identifier"] && !agent.labels?.["paseo.parent-agent-id"]).slice(0, 500);
   const [inside, stewardRaw, responsibilityRaw, watchdogRaw, plansRaw, pullsRaw] = await Promise.all([
-    pool(ticketAgents, TIMELINE_CONCURRENCY, ({ agent }) => readInside(paseo, agent).catch(() => null)),
+    pool(ticketAgents, TIMELINE_CONCURRENCY, ({ agent }) => deps.insides.read(paseo, agent)),
     ledger(join(deps.home, "steward.json")),
     ledger(join(deps.home, "responsibility.json")),
     ledger(join(deps.home, "watchdog.json")),
     ledger(join(deps.home, "plan-pipeline.json")),
     ledger(join(deps.home, "pr-watch.json")),
   ]);
+  deps.insides.keepOnly(new Set(ticketAgents.map(({ agent }) => agent.id)));
   const agents: BoardAgentFact[] = ticketAgents.map(({ agent, status }, index) => ({
     id: text(agent.id, 100),
     identifier: text(agent.labels["linear.identifier"], 50),
