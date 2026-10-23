@@ -120,7 +120,7 @@ export class Launcher {
   }
 
   // Planning launches (ticket planners and planner runs) get the team's candidate list appended to
-  // their context file (README, "Overlap check").
+  // their context file (README, "Related work").
   useCandidates(candidates: (teamId: string) => Promise<string>): void {
     this.candidates = candidates;
   }

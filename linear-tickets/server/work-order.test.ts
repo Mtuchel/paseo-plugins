@@ -7,7 +7,7 @@ const block = (tag: string, lines: string[]) => `## Section\n\nText.\n\n\`\`\`${
 const related = (...lines: string[]) => block("related-work", lines);
 const order = (...lines: string[]) => block("project-order", lines);
 
-test("AC-5: the related-work block reads each line as one change, synonyms included", () => {
+test("AC-11: the related-work block reads each line as one change, synonyms included", () => {
   const plan = related(
     "TUC-9 blocks TUC-7: the parser lands first",
     "TUC-7 blocks TUC-10",
@@ -59,7 +59,7 @@ test("AC-2: an empty related-work block is a valid plan with nothing related", (
   assert.deepEqual(parseRelatedWork(related()), []);
 });
 
-test("AC-7: a work order still reads its own block, and refuses replan", () => {
+test("AC-11: a work order still reads its own block, and refuses replan", () => {
   assert.equal(orderProblems(order("TUC-1 blocks TUC-2", "TUC-3 duplicates TUC-4: same ask")).length, 0);
   const problems = orderProblems(order("replan TUC-9: a work order cannot ask for a replan"));
   assert.deepEqual(problems, ['A work order cannot ask for a replan: "replan TUC-9: a work order cannot ask for a replan"']);
@@ -81,7 +81,7 @@ test("AC-12: a block that makes this ticket wait for an open ticket is a reason 
   assert.equal(outgoing.approve, true);
 });
 
-test("blockProblems keeps the work order's rules unchanged", () => {
+test("AC-11: blockProblems keeps the work order's rules unchanged", () => {
   assert.deepEqual(blockProblems(order(), "project-order", WORK_ORDER_KINDS), []);
   assert.deepEqual(blockProblems(related("TUC-7 duplicates TUC-8"), "related-work", RELATED_WORK_KINDS, "TUC-7"), []);
 });

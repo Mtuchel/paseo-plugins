@@ -915,7 +915,7 @@ export const COMMENT_BY_ID_QUERY = `query commentById($id: String!) {
 }`;
 // A replan request on a ticket (server/plan-relations.ts writes it, server/plan-requests.ts reads
 // it): an app comment carrying the `<!-- replan-op: -->` marker.
-export const REPLAN_COMMENTS_QUERY = `query replanComments($id: String!, $since: String!, $after: String) {
+export const REPLAN_COMMENTS_QUERY = `query replanComments($id: String!, $since: DateTimeOrDuration!, $after: String) {
   issue(id: $id) {
     comments(first: 100, after: $after, filter: { body: { contains: "<!-- replan-op:" }, createdAt: { gte: $since } }) {
       nodes { id body createdAt user { id } }

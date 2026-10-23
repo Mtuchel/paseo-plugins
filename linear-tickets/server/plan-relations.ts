@@ -237,6 +237,9 @@ export class PlanRelations {
         if (await this.apply(record, step)) {
           step.done = true;
           await this.save(record);
+        } else if (!step.skipped) {
+          // The app could not write (mutate answered null): the step waits for the next round.
+          failed = true;
         }
       } catch (error) {
         if (error instanceof RateLimitedError) throw error;
