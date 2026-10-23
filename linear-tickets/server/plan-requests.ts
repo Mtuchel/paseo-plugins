@@ -233,6 +233,21 @@ export class PlanRequests {
     const since = new Date(Date.parse(checked) - SKEW_MS).toISOString();
     const stamps = agents.length ? await this.deps.linear.planRequestStamps(agents.map((agent) => agent.issueId), since) : new Map<string, PlanRequestStamp>();
     const next: Record<string, Entry> = {};
+    try {
+      await this.check(agents, previous, stamps, trusted, apps, startedAt, next);
+    } catch (error) {
+      // The agents this poll finished keep what it saw, the rest what they had: after a refusal
+      // part way (the budget pause), the next poll goes on where this one stopped instead of reading
+      // every ticket again.
+      if (Object.keys(next).length) await this.save({ ...Object.fromEntries(agents.flatMap((agent) => previous[agent.id] ? [[agent.id, previous[agent.id]]] : [])), ...next });
+      throw error;
+    }
+    await this.save(next);
+    await this.removeStale(new Set(agents.map((agent) => agent.id)));
+    this.lastError = null;
+  }
+
+  private async check(agents: TicketAgent[], previous: Record<string, Entry>, stamps: Map<string, PlanRequestStamp>, trusted: Set<string>, apps: string, startedAt: string, next: Record<string, Entry>): Promise<void> {
     for (const agent of agents) {
       const before = previous[agent.id];
       const stamp = stamps.get(agent.issueId);
@@ -281,9 +296,6 @@ export class PlanRequests {
       entry.pending = found.some((request) => !entry.handled.includes(request.id));
       next[agent.id] = entry;
     }
-    await this.save(next);
-    await this.removeStale(new Set(agents.map((agent) => agent.id)));
-    this.lastError = null;
   }
 
   // The plugin itself sends a working agent back to planning (README, "Model tiers"): the same

@@ -1193,8 +1193,9 @@ difference). A ticket's own reads follow only where they can find something new:
 comments (and its plan document, when there is a comment to judge) when a newer one appeared, its
 label history when the ticket changed. An agent seen the first time, a change of the trusted apps
 and a request still waiting for its delivery read everything for that agent. What each poll saw
-is kept per agent in `$PASEO_HOME/linear-tickets/plan-requests/state.json`; a poll that fails
-saves nothing, so the next one looks back to the last poll that went through.
+is kept per agent in `$PASEO_HOME/linear-tickets/plan-requests/state.json`. A poll refused part
+way (the budget pause) keeps what it saw for the agents it finished, and the next one reads only
+the rest; the others keep what they had, so nothing between two polls is missed.
 
 **Plan advisor.** Every plan a ticket agent writes gets a second opinion before it reaches you.
 The planner (the model you launch tickets with; the model guard keeps it there) creates a GPT-6
