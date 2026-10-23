@@ -1285,8 +1285,8 @@ approved plans before either wrote its document, so only one host approves autom
 with `dispatch.enabled` ([`server/approval-claims.ts`](server/approval-claims.ts)). A plan that
 passed every other check claims there before it is approved, by `POST /api/approval-claims` on the
 inbox server (behind the header the decision routes require) or in process on that host. The answer
-is `granted` only when no live grant, no reported owner approval and no approval Linear shows
-since the planning round began overlaps the plan — the same files, `## Reach` places or tickets, or
+is `granted` only when no live grant and no approval since the planning round began, whether reported
+to the coordinator or shown by Linear, overlaps the plan — the same files, `## Reach` places or tickets, or
 both naming each other — and `denied` with the other ticket's own reason
 (`TUC-12's plan names the same files: server/x.ts`) otherwise. A ticket never overlaps itself: its
 earlier claim must settle before a re-plan claims, so two live approvals for one ticket cannot

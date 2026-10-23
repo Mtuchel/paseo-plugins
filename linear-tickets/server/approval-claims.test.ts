@@ -267,6 +267,21 @@ test("AC-18: an owner approval reported in denies overlapping plans before Linea
   });
 });
 
+test("AC-18: a ledger approval from before the planning round began does not deny, one from its start on does", async () => {
+  await withWorld(async (world) => {
+    const three = world.ticket("TUC-3"), four = world.ticket("TUC-4"), five = world.ticket("TUC-5"), six = world.ticket("TUC-6");
+    const claims = world.claims();
+    // TUC-3's plan was approved before TUC-5's round began and its ticket is still open, so the ledger
+    // keeps it; the planner saw it in its candidate list.
+    await claims.record({ issueId: three.issueId, identifier: three.identifier, planHash: planHash(X), footprint: planFootprint(X, three.identifier), approvedAt: "2026-10-15T10:41:10.499Z" });
+    assert.equal((await claims.claim(world.request(five, X))).state, "granted");
+    await claims.record({ issueId: four.issueId, identifier: four.identifier, planHash: planHash(Y), footprint: planFootprint(Y, four.identifier), approvedAt: START });
+    const denied = await claims.claim(world.request(six, Y));
+    assert.equal(denied.state, "denied");
+    assert.equal(denied.other, "TUC-4");
+  });
+});
+
 test("AC-18: a retried claim id gets its stored answer, and an id older than 30 days is expired, never granted", async () => {
   await withWorld(async (world) => {
     const one = world.ticket("TUC-1");

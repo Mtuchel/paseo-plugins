@@ -292,12 +292,14 @@ export class ApprovalClaims {
         const [first] = committed;
         return await deny(`${first.identifier}'s plan ${overlapText(first.overlap)}`, first.identifier);
       }
-      // Every live grant and every reported approval, including ones Linear's read may not show yet.
+      // Every live grant, and every reported approval since the round began, including ones Linear's
+      // read may not show yet. An approval from before the round was in the planner's candidate list.
       for (const grant of Object.values(grants)) {
         if (grant.issueId !== request.issueId && overlaps(request.footprint, grant.footprint)) return await deny(`${grant.identifier}'s plan ${overlapText(footprintOverlap(request.footprint, grant.footprint))}`, grant.identifier);
       }
       for (const entry of Object.values(await this.ledger.load())) {
-        if (entry.issueId !== request.issueId && overlaps(request.footprint, entry.footprint)) return await deny(`${entry.identifier}'s plan ${overlapText(footprintOverlap(request.footprint, entry.footprint))}`, entry.identifier);
+        if (entry.issueId === request.issueId || Date.parse(entry.approvedAt) < since) continue;
+        if (overlaps(request.footprint, entry.footprint)) return await deny(`${entry.identifier}'s plan ${overlapText(footprintOverlap(request.footprint, entry.footprint))}`, entry.identifier);
       }
       // Persisted before it is answered, so an answer that cannot be sent is still a grant.
       await this.granted.update((current) => {
