@@ -432,7 +432,7 @@ async function reviewWithRelated(plan: string, plans: PlanDocument[], options: {
 }
 
 test("AC-3: an approval counts from the planning round's start at its header's precision, and never from this ticket", async () => {
-  const plan = `${RISKY(1)}\n\nChange \`server/x.ts\`.\n`;
+  const plan = `Change \`server/x.ts\`.\n\n${RISKY(1)}`;
   const rows = [
     approvedPlanRow("TUC-2", "2026-10-15 10:41:10.900"), // after the start
     approvedPlanRow("TUC-3", "2026-10-15 10:41:10"), // the start's own second: its latest bound reaches it
@@ -457,7 +457,7 @@ test("AC-3: an approval counts from the planning round's start at its header's p
 
 test("AC-3: a shared place, a shared ticket and naming this ticket each need the owner, and a failed check approves nothing", async () => {
   const block = "```related-work\nTUC-9 relates to TUC-25\nTUC-25 relates to TUC-22\n```\n";
-  const plan = `${RISKY(1)}\n\nChange \`server/x.ts\`.\n\n## Reach\n\n- Settings page: include — AC-7\n\n## Related work\n\n${block}\nTUC-9 covers the export.\n`;
+  const plan = `Change \`server/x.ts\`.\n\n${RISKY(1)}\n## Reach\n\n- Settings page: include — AC-7\n\n## Related work\n\n${block}\nTUC-9 covers the export.\n`;
   const place = approvedPlanRow("TUC-20", "2026-10-15 10:41:20", "# Plan\n\nChange `server/y.ts`.\n\n## Reach\n\n- settings page: include — AC-2\n\n## Related work\n\nTUC-25 touches the same page.\n");
   const ticket = approvedPlanRow("TUC-21", "2026-10-15 10:41:20", "# Plan\n\n## Related work\n\n- TUC-9 covers the sender side.\n");
   // TUC-22's plan shares nothing; this plan names TUC-22, which is a relation worth the owner too.

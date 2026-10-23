@@ -5,6 +5,7 @@
 // `## Reach`. Tickets: those named in the plan's ```related-work block, in `## Related work`, or,
 // for an old plan with neither, in `## Overlapping tickets`.
 
+import { ADVISOR_SECTION } from "./plan-advisor";
 import { decisions, hasSection, RELATED_WORK_SECTION, reachBody, ticketRefs } from "./plan-sections";
 import { sectionBody } from "./plan-risk";
 import { parseRelatedWork, RELATED_WORK_TAG, type WorkOrderStep } from "./work-order";
@@ -16,6 +17,10 @@ const CODE_EXTENSIONS: Record<string, true> = {
   yaml: true, toml: true, sql: true, sh: true, prisma: true, graphql: true, proto: true,
 };
 const PATH = /^[\w@.+-]+(?:\/[\w@.+-]+)*\/?$/;
+// `## Advisor review` names the advisor's model ("omp/openai-codex/gpt-6-astra"), not files the
+// plan changes; read as files it would make every plan one advisor reviewed overlap. The section
+// ends where `sectionBody` ends it.
+const ADVISOR_REVIEW = new RegExp(`^#{1,6}\\s+${ADVISOR_SECTION}\\b[^\\n]*\\n[\\s\\S]*?(?=^#{1,2}\\s|(?![\\s\\S]))`, "gim");
 
 // `ticket`: the plan's own identifier, so `footprintOverlap` can tell that another plan names it.
 export type PlanFootprint = { files: string[]; places: string[]; tickets: string[]; ticket: string | null };
@@ -31,8 +36,9 @@ export function planFootprint(plan: string, ticket: string | null = null): PlanF
     const file = filePath(raw);
     if (file && !seen.has(file)) { seen.add(file); files.push(file); }
   };
-  for (const match of plan.matchAll(/`([^`\n]+)`/g)) add(match[1]);
-  for (const match of plan.matchAll(/\]\(([^)\s]+)\)/g)) add(match[1]);
+  const text = plan.replace(ADVISOR_REVIEW, "");
+  for (const match of text.matchAll(/`([^`\n]+)`/g)) add(match[1]);
+  for (const match of text.matchAll(/\]\(([^)\s]+)\)/g)) add(match[1]);
   return { files, places: planPlaces(plan), tickets: planTickets(plan, ticket), ticket };
 }
 

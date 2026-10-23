@@ -54,6 +54,15 @@ test("an overlap names the files, places and tickets two plans share, and whethe
   assert.deepEqual(footprintOverlap(shared, apart), { files: [], places: [], tickets: ["TUC-30"], namesOther: false });
 });
 
+test("the advisor's model named in `## Advisor review` is no file, so two plans reviewed by one advisor do not overlap", () => {
+  const review = "## Advisor review\n\nAstra (`omp/openai-codex/gpt-6-astra`, medium), round 1: **agreed**.\n* Model: `openai-codex/gpt-6-astra`.\n";
+  const mine = planFootprint(`# Plan\n\nChange \`server/x.ts\`.\n\n${review}`, "TUC-1");
+  const other = planFootprint(`# Plan\n\nChange \`server/z.ts\`.\n\n${review}\n## Later\n\nAlso \`server/w.ts\`.\n`, "TUC-2");
+  assert.deepEqual(mine.files, ["server/x.ts"]);
+  assert.deepEqual(other.files, ["server/z.ts", "server/w.ts"], "a section after the review is read again");
+  assert.deepEqual(footprintOverlap(mine, other), { files: [], places: [], tickets: [], namesOther: false });
+});
+
 test("a file matches its equal path or the same path with owner/repo in front, never another repository's path", () => {
   assert.equal(sameFile("server/x.ts", "server/x.ts"), true);
   assert.equal(sameFile("server/x.ts", "o/r/server/x.ts"), true);
