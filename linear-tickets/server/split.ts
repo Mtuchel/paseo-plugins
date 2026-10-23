@@ -79,8 +79,9 @@ export async function applyLater(steps: Steps, work: PanelWork, decision: Approv
   if (work.session) await steps.once("hold", () => work.session!.hold("later"));
   // A catch-up has no ticket work to start later: its approval applies the plan to the listed
   // tickets and ends its agent here, so no ticket-plan step follows.
-  if (work.catchUp && await work.catchUp.isCatchUp(decision.issueId)) {
-    await steps.once("catch-up", () => work.catchUp!.apply(decision.issueId, decision.agentId, decision.plan));
+  const catchUp = work.catchUp;
+  if (catchUp && await catchUp.isCatchUp(decision.issueId)) {
+    await steps.once("catch-up", () => catchUp.apply(decision.issueId, decision.agentId, decision.plan));
     await steps.once("retire", () => work.retire(CATCH_UP_RETIRE));
     await finish(steps, work, "Catch-up approved. Paseo applies it to the listed tickets.");
     return;
