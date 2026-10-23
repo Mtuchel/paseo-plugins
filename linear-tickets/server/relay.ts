@@ -4,7 +4,6 @@ import { dirname, join } from "node:path";
 import type { PaseoApi } from "@getpaseo/client";
 import type { AgentPermissionRequest, AgentPermissionResponse } from "@getpaseo/protocol/agent-types";
 import { filedIssues, pluginComments, postedComments } from "./agent-records";
-import { loadProbe } from "./load-probe";
 import type { LinearService, RelayComment } from "./linear";
 import type { ActivationSink, ActivationTake } from "./activation";
 import { overrideCommand, type Deputy } from "./deputy";
@@ -193,14 +192,14 @@ export class CommentRelay {
   // it resolves; a failed pass leaves its issues dirty for the next call, without a retry loop.
   poll(paseo: PaseoApi): Promise<void> {
     if (this.polling) return this.polling;
-    this.polling = loadProbe.time("comment-relay", async () => {
+    this.polling = (async () => {
       try {
         do {
           this.pollAgain = false;
           await this.pollOnce(paseo);
         } while (this.pollAgain);
       } finally { this.polling = null; }
-    });
+    })();
     return this.polling;
   }
 
