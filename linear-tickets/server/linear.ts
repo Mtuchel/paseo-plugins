@@ -514,6 +514,12 @@ export const ISSUE_STATE_QUERY = `query issueState($id: String!) {
 export const ISSUE_METADATA_QUERY = `query issueMetadata($id: String!) {
   issue(id: $id) { id identifier labels(first: 50) { nodes { id name } } }
 }`;
+// The same metadata for up to 50 tickets of one team per request, found by number: the review
+// inbox enriches every row it shows at once.
+export const ISSUES_METADATA_BATCH = 50;
+export const ISSUES_METADATA_QUERY = `query issuesMetadata($team: String!, $numbers: [Float!]!, $first: Int!) {
+  issues(first: $first, includeArchived: true, filter: { team: { key: { eqIgnoreCase: $team } }, number: { in: $numbers } }) { nodes { id identifier labels(first: 50) { nodes { id name } } } }
+}`;
 // PR discovery needs URLs, not dependency relations or ticket metadata.
 export const ISSUE_ATTACHMENT_URLS_QUERY = `query issueAttachmentUrls($id: String!) {
   issue(id: $id) { attachments(first: 50) { nodes { url } } }
@@ -1751,6 +1757,28 @@ export class LinearService {
     if (!data.issue || typeof data.issue !== "object") throw new Error("Linear did not return this issue. Check that you have access to it.");
     const issue = record(data.issue);
     return { id: label(issue.id), identifier: label(issue.identifier), labels: labelNodes(issue.labels) };
+  }
+
+  // Metadata by identifier ("TUC-1"), parsed exactly as `issueMetadata`. Malformed identifiers and
+  // tickets neither pool returns (deleted, moved to another team, invisible) are absent.
+  async issuesMetadata(identifiers: string[]): Promise<Map<string, IssueMetadata>> {
+    const byTeam = new Map<string, number[]>();
+    for (const identifier of new Set(identifiers)) {
+      const match = /^([A-Z][A-Z0-9_]*)-(\d+)$/.exec(identifier);
+      if (match) byTeam.set(match[1]!, [...byTeam.get(match[1]!) ?? [], Number(match[2])]);
+    }
+    const result = new Map<string, IssueMetadata>();
+    for (const [team, numbers] of byTeam) {
+      for (let start = 0; start < numbers.length; start += ISSUES_METADATA_BATCH) {
+        const chunk = numbers.slice(start, start + ISSUES_METADATA_BATCH);
+        const data = record(await this.read(ISSUES_METADATA_QUERY, { team, numbers: chunk, first: chunk.length }, (found) => connection(record(found.issues ?? {})).nodes.length === chunk.length));
+        for (const node of connection(record(data.issues ?? {})).nodes.map((item) => record(item))) {
+          const identifier = label(node.identifier);
+          if (identifier) result.set(identifier, { id: label(node.id), identifier, labels: labelNodes(node.labels) });
+        }
+      }
+    }
+    return result;
   }
 
   async issueStatus(id: string): Promise<Pick<IssueState, "status" | "statusType">> {

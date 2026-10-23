@@ -20,7 +20,7 @@ const catalog: CatalogLabel[] = [
 
 function harness() {
   const h = {
-    time: 0, reads: 0, catalogReads: 0, failIssue: false, failCatalog: false,
+    time: 0, reads: 0, catalogReads: 0, failIssue: false, failCatalog: false, batches: [] as string[][],
     identifier: null as string | null, issueId: ISSUE_ID,
     labels: [{ id: PURCHASING_ID, name: "Purchasing" }],
     catalog, block: null as Promise<void> | null,
@@ -31,6 +31,16 @@ function harness() {
       if (h.block) await h.block;
       if (h.failIssue) throw new Error("Linear temporarily unavailable");
       return { id: h.issueId, identifier: h.identifier ?? identifier, labels: h.labels };
+    },
+    issuesMetadata: async (identifiers): Promise<Map<string, IssueMetadata>> => {
+      h.reads++;
+      h.batches.push(identifiers);
+      if (h.block) await h.block;
+      if (h.failIssue) throw new Error("Linear temporarily unavailable");
+      return new Map(identifiers.map((identifier) => {
+        const found = h.identifier ?? identifier;
+        return [found, { id: h.issueId, identifier: found, labels: h.labels }];
+      }));
     },
     labelCatalog: async () => {
       h.catalogReads++;
@@ -99,6 +109,7 @@ test("concurrent failed refreshes retain verified metadata and throttle reads be
   h.block = gate.promise;
   const first = infos.forIdentifier("TUC-630");
   const second = infos.forIdentifier("TUC-630");
+  await Promise.resolve();
   assert.equal(h.reads, 2);
   gate.release();
   assert.deepEqual(await Promise.all([first, second]), [verified, verified]);
@@ -159,6 +170,7 @@ test("fresh revalidation waits for older enrichment and concurrent fresh calls s
   const enrichment = infos.forIdentifier("TUC-630");
   const fresh = infos.forIdentifier("TUC-630", { fresh: true });
   const another = infos.forIdentifier("TUC-630", { fresh: true });
+  await Promise.resolve();
   assert.equal(h.reads, 1);
   gate.release();
   await enrichment;
@@ -176,4 +188,22 @@ test("bounded cache evicts older identifiers without losing the newest verified 
   assert.equal(h.reads, reads);
   await infos.forIdentifier("TUC-1");
   assert.equal(h.reads, reads + 1, "old linkage must be read again after capacity eviction");
+});
+
+test("display lookups of one inbox refresh share a batched read and a missing ticket is not retried before the TTL", async () => {
+  const { h, infos } = harness();
+  const rows = ["TUC-1", "TUC-2", "tuc-3", "TUC-2"];
+  const infosOf = await Promise.all(rows.map((identifier) => infos.forIdentifier(identifier)));
+  assert.ok(infosOf.every((info) => info?.issueId === ISSUE_ID));
+  assert.deepEqual(h.batches, [["TUC-1", "TUC-2", "TUC-3"]], "one request for every row, each identifier once");
+  await Promise.all(rows.map((identifier) => infos.forIdentifier(identifier)));
+  assert.equal(h.reads, 1, "cached rows read nothing");
+
+  h.identifier = "TUC-9";
+  h.time = TTL;
+  assert.equal(await infos.forIdentifier("TUC-1"), null, "a ticket the batch does not return is unknown");
+  h.time += 60_000;
+  assert.equal(await infos.forIdentifier("TUC-1"), null);
+  assert.equal(h.batches.filter((batch) => batch.includes("TUC-1")).length, 2, "an unknown ticket waits for the TTL, not the 30-second failure retry");
+  assert.deepEqual(await infos.forIdentifier("TUC-1", { fresh: true }), null, "deletion still reads exactly this identifier");
 });

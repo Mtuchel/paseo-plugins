@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { AgentApi } from "./agent-app";
 import { Credentials } from "./credentials";
-import { AuthenticationError, CREATE_ISSUE_QUERY, ISSUE_ATTACHMENT_URLS_QUERY, ISSUE_COMMENT_HISTORY_QUERY, ISSUE_CORE_QUERY, ISSUE_GROUP_QUERY, ISSUE_GROUP_LABELS_QUERY, ISSUE_WATCH_STATE_QUERY, ISSUE_METADATA_QUERY, ISSUE_STATUS_QUERY, ISSUE_STATE_QUERY, ISSUE_STATUSES_QUERY, ISSUES_ATTACHMENT_URLS_QUERY, ISSUES_ATTACHMENTS_BATCH, ISSUES_WATCH_STATES_BATCH, ISSUES_WATCH_STATES_QUERY, LABELED_ISSUES_QUERY, LinearApiError, LinearService, MARKED_COMMENT_QUERY, MENTIONING_ISSUES_QUERY, OWNER_ASKS_QUERY, TEAM_STATES_QUERY, type App, type IssueCore, type Post } from "./linear";
+import { AuthenticationError, CREATE_ISSUE_QUERY, ISSUE_ATTACHMENT_URLS_QUERY, ISSUE_COMMENT_HISTORY_QUERY, ISSUE_CORE_QUERY, ISSUE_GROUP_QUERY, ISSUE_GROUP_LABELS_QUERY, ISSUE_WATCH_STATE_QUERY, ISSUE_METADATA_QUERY, ISSUE_STATUS_QUERY, ISSUE_STATE_QUERY, ISSUE_STATUSES_QUERY, ISSUES_ATTACHMENT_URLS_QUERY, ISSUES_ATTACHMENTS_BATCH, ISSUES_METADATA_QUERY, ISSUES_WATCH_STATES_BATCH, ISSUES_WATCH_STATES_QUERY, LABELED_ISSUES_QUERY, LinearApiError, LinearService, MARKED_COMMENT_QUERY, MENTIONING_ISSUES_QUERY, OWNER_ASKS_QUERY, TEAM_STATES_QUERY, type App, type IssueCore, type Post } from "./linear";
 import { RateLimitedError } from "./rate-budget";
 
 const issue = { id: "i1", identifier: "TUC-1", state: { id: "s1", name: "Todo", type: "unstarted" }, team: { id: "t1" }, labels: { nodes: [] }, attachments: { nodes: [] }, inverseRelations: { nodes: [] } };
@@ -308,6 +308,31 @@ test("issueWatchStates reads 50 tickets' state and labels per request, parsed ex
   assert.equal(states.size, 51);
   assert.deepEqual(states.get(ids[50]), await linear.issueWatchState(ids[50]), "the same fields as the single read");
   assert.deepEqual(keyCalls, []);
+});
+
+test("issuesMetadata reads up to 50 tickets of one team per request by number, parsed exactly as issueMetadata", async () => {
+  const node = (team: string, number: number) => ({ id: `${team}-id-${number}`, identifier: `${team}-${number}`, labels: { nodes: [{ id: "l1", name: "Sales" }, { id: "", name: "broken" }] } });
+  const asked: Record<string, unknown>[] = [];
+  const { linear, keyCalls } = service({
+    query: (query, variables) => {
+      if (query === ISSUE_METADATA_QUERY) { const [team, number] = String(variables.id).split("-"); return Promise.resolve({ issue: node(team!, Number(number)) }); }
+      assert.equal(query, ISSUES_METADATA_QUERY);
+      asked.push(variables);
+      return Promise.resolve({ issues: { nodes: (variables.numbers as number[]).filter((number) => number !== 7).map((number) => node(String(variables.team), number)) } });
+    },
+  }, (query, variables) => {
+    assert.equal(query, ISSUES_METADATA_QUERY);
+    return { issues: { nodes: (variables.numbers as number[]).filter((number) => number !== 7).map((number) => node(String(variables.team), number)) } };
+  });
+  const tuc = Array.from({ length: 60 }, (_, index) => `TUC-${index + 1}`);
+  const found = await linear.issuesMetadata([...tuc, "ENG-3", "TUC-1", "not an identifier"]);
+  assert.deepEqual(asked.map((variables) => ({ team: variables.team, first: variables.first, count: (variables.numbers as number[]).length })),
+    [{ team: "TUC", first: 50, count: 50 }, { team: "TUC", first: 10, count: 10 }, { team: "ENG", first: 1, count: 1 }], "grouped by team, duplicates read once");
+  assert.deepEqual(keyCalls, [ISSUES_METADATA_QUERY], "only the chunk the app answered incompletely goes to the key");
+  assert.equal(found.has("TUC-7"), false, "a ticket neither pool returns is absent");
+  assert.equal(found.size, 60);
+  assert.deepEqual(found.get("TUC-12"), await linear.issueMetadata("TUC-12"), "the same fields as the single read");
+  assert.deepEqual(await linear.issuesMetadata([]), new Map(), "no identifiers, no request");
 });
 
 // TUC-1684: the queue's batch decides admission on the same parsed fields as a single read.
