@@ -644,6 +644,14 @@ runs on that app's host. The sweep takes only its own app's threads, since Linea
 app's sessions to each of them. Keep `dispatch.enabled` on one host only. Without activation
 routing, the label poll and project flow cannot see another host's agents.
 
+Automatic approvals are coordinated between the hosts: list each other in `reviewPeers`, because a
+host that asks its peers which one coordinates reads their `/api/inbox` `dispatch` field (always
+present). The host with `dispatch.enabled` grants them; the others ask it over the tailnet inbox
+channel and, when it cannot be found, times out, or more than one peer claims the role, keep the
+plan with the owner (`the approval coordinator could not be reached`) instead of approving alone.
+Every host answers `/api/approval-claims/<id>/holder` for its own claim records; the coordinator's
+other `/api/approval-claims` routes answer `503` where dispatch is off.
+
 Tickets either host's app wrote count as yours: a host with an `activation.peer` asks the peer's
 authenticated `/activation/health` for its app user (`appUserId`) and trusts it like its own app,
 so tickets the other host's agents and planners file are not marked untrusted. The answer is kept
@@ -1271,6 +1279,30 @@ shares files, `## Reach` places or related tickets with this plan, or that names
 named by it, into a reason: `TUC-12's plan names the same files: server/x.ts`, also for shared
 places (`reaches the same places: …`) and tickets (`names the same tickets: …`). A read that fails
 gives `the related-work check failed` instead: the plan waits for you either way.
+
+**The approval coordinator.** Two hosts approving at the same time could both read Linear's
+approved plans before either wrote its document, so only one host approves automatically: the one
+with `dispatch.enabled` ([`server/approval-claims.ts`](server/approval-claims.ts)). A plan that
+passed every other check claims there before it is approved, by `POST /api/approval-claims` on the
+inbox server (behind the header the decision routes require) or in process on that host. The answer
+is `granted` only when no live grant, no reported owner approval and no approval Linear shows
+since the planning round began overlaps the plan — the same files, `## Reach` places or tickets, or
+both naming each other — and `denied` with the other ticket's own reason
+(`TUC-12's plan names the same files: server/x.ts`) otherwise. A ticket never overlaps itself: its
+earlier claim must settle before a re-plan claims, so two live approvals for one ticket cannot
+exist. A grant is written to `granted.json` before it is answered, and a repeated claim id gets that
+stored answer; a committed approval enters `ledger.json` before it leaves the grant table. A claim
+id is a uuid v7: one older than 30 days is `expired`, and a late retry never becomes a grant. A host
+that finds no coordinator, more than one peer answering `dispatch.enabled: true`, or no answer
+within the peer timeout keeps the plan with you: `the approval coordinator could not be reached`.
+Owner approvals take the same path from any host: the outbox entry is saved before the `Plan:`
+document is written, reported after it, and retried every sweep until the coordinator acknowledges
+it, so an approval is known before Linear's read shows it.
+A grant held an hour without a settlement or its own matching `Plan:` document raises one item on
+the ticket, **the automatic approval of TUC-N could not be confirmed**. Your answer makes the
+coordinator ask the requester's `/api/approval-claims/<id>/holder`; only a holder that no longer
+holds it (`none`, `unclear`, a withdrawal) releases the claim, while one still holding it, one that
+does not answer, and a closed ticket keep it blocking.
 
 It also refuses a ticket plan that does not follow the owner's plan layout
 ([`shared/plan-layout.ts`](shared/plan-layout.ts)). The layout is read at every record from

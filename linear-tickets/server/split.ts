@@ -22,6 +22,9 @@ export type PanelWork = {
   appUserId: () => Promise<string | null>;
   followUps?: Pick<PlanFollowUps, "file">;
   relations?: Pick<PlanRelations, "file">;
+  // The approval coordinator's outbox: the owner's approval is saved before its `Plan:` document
+  // exists, and reported until the coordinator acknowledged it (README, "Plan risk and auto-approval").
+  claims?: { ownerApproval(input: { issueId: string; identifier: string; plan: string; approvedAt: string }): Promise<void> };
   // When the planning round behind the approved plan began (README, "Related work").
   roundStartedAt: string | null;
   // The session is held first (offer "later" / "split"), so retiring the planner offers no Resume
@@ -42,6 +45,7 @@ export type PanelWork = {
 export type ApprovedPlan = { agentId: string | null; issueId: string; identifier: string; plan: string; model: string | null; at: string };
 
 async function approvedDocument(steps: Steps, work: PanelWork, decision: ApprovedPlan): Promise<string> {
+  await steps.once("approval-outbox", () => work.claims?.ownerApproval({ issueId: decision.issueId, identifier: decision.identifier, plan: decision.plan, approvedAt: decision.at }) ?? Promise.resolve());
   const round = await roundStep(steps, work.linear, decision.issueId, decision.identifier);
   const documentUrl = await steps.once("document", () => work.linear.upsertIssueDocument(decision.issueId, `Plan: ${decision.identifier}`, planDocument({ type: "decided", agentId: decision.agentId, approved: true, planContent: decision.plan, at: decision.at }, decision.identifier, decision.model, round)));
   await steps.once("follow-ups", async () => { await work.followUps?.file({ issueId: decision.issueId, identifier: decision.identifier, plan: decision.plan, documentUrl: documentUrl || null }); });

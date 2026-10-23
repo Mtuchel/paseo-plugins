@@ -17,6 +17,7 @@ import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
 import { planHash } from "./review-outcome";
 import type { PlanDocument } from "./linear";
 import { RelatedWork } from "./related-work";
+import { ApprovalClaims, ClaimRequests } from "./approval-claims";
 import { PlanRelations } from "./plan-relations";
 import { DecisionLog, type LogEntry } from "./owner-decisions";
 import { ReviewDeletions } from "./review-deletions";
@@ -471,6 +472,58 @@ test("AC-3: a shared place, a shared ticket and naming this ticket each need the
   const failed = await reviewWithRelated(plan, [], { fail: true });
   assert.deepEqual(failed.decisions, [], "a check that cannot run approves nothing");
   assert.match(failed.comment, /Needs your approval: the related-work check failed\./);
+});
+
+// Two requesters on this host, each with its own state directory, and the one coordinator they
+// both claim against: the plan both name `server/x.ts` may be approved automatically only once.
+test("AC-3: two overlapping plans opened before either decision get exactly one automatic approval, and the other names it", async () => {
+  const plan = `Change \`server/x.ts\`.\n\n${RISKY(1)}`;
+  const root = await mkdtemp(join(tmpdir(), "paseo-claims-"));
+  const coordinator = new ApprovalClaims({
+    linear: { issueDocument: async () => null, issueState: async () => ({ status: "Todo", statusType: "unstarted" }), comment: async () => {}, issueCommentHistory: async () => [], viewerId: async () => "owner" } as never,
+    related: relatedPlans([]),
+    directory: join(root, "coordinator"),
+  });
+  const decisions: Record<string, string[]> = { "TUC-1": [], "TUC-5": [] };
+  const run = async (identifier: string, issueId: string) => {
+    const { calls, linear, paseo } = setup({ "linear.issueId": issueId, "linear.identifier": identifier }, undefined, "2026-10-15T10:41:10.500Z");
+    await withEvents([
+      { type: "advised", agentId: `agent-${identifier}`, verdict: "agreed", hash: planHash(plan), at: "2026-10-15T10:45:00Z" },
+      { type: "opened", agentId: `agent-${identifier}`, localUrl: `http://localhost:4000/${identifier}/`, remoteUrl: `https://host.ts.net:4000/${identifier}/`, at: "2026-10-15T10:50:00Z" },
+    ], async (directory) => {
+      const bridge = new PlannotatorBridge(linear, { read: async () => settings }, directory, undefined, async () => plan, undefined, undefined, undefined,
+        async (url, approve, feedback) => { decisions[identifier].push(`${url} ${approve} ${feedback}`); }, () => {});
+      bridge.attach(paseo);
+      bridge.useRelated(relatedPlans([]));
+      bridge.useClaims(new ClaimRequests({
+        linear: { comment: async () => {} } as never,
+        local: async () => coordinator, peers: async () => [], origin: async () => null,
+        state: async () => "pending", rejudge: async () => {},
+        directory: join(root, `requester-${identifier}`),
+      }));
+      await bridge.drain();
+      bridge.stop();
+    });
+    return calls;
+  };
+  try {
+    const [one, five] = await Promise.all([run("TUC-1", "issue-1"), run("TUC-5", "issue-5")]);
+    assert.equal(decisions["TUC-1"].length + decisions["TUC-5"].length, 1, "exactly one plan is approved automatically");
+    const granted = decisions["TUC-1"].length ? "TUC-1" : "TUC-5";
+    const other = granted === "TUC-1" ? "TUC-5" : "TUC-1";
+    const comment = (granted === "TUC-1" ? five : one).find((call) => call.startsWith("comment ")) ?? "";
+    assert.match(comment, /^comment [^:]+: 📋 \*\*Plan ready for review in Plannotator\*\*/);
+    assert.match(comment, new RegExp(`Needs your approval: ${granted}'s plan names the same files: server/x\\.ts`));
+    assert.match((granted === "TUC-1" ? one : five).find((call) => call.startsWith("comment ")) ?? "", /Plan auto-approved/);
+    // The granted plan's decision was applied and settled as committed, so neither requester keeps a
+    // record; the coordinator keeps both answers.
+    const idOf = (identifier: string) => identifier === "TUC-1" ? "issue-1" : "issue-5";
+    for (const identifier of ["TUC-1", "TUC-5"]) {
+      assert.equal(await readFile(join(root, `requester-${identifier}`, `${idOf(identifier)}.json`)).catch(() => null), null, `${identifier} keeps no record`);
+    }
+    const answers = JSON.parse(await readFile(join(root, "coordinator", "answers.json"), "utf8")) as Record<string, { state: string }>;
+    assert.deepEqual(Object.values(answers).map((answer) => answer.state).sort(), ["committed", "denied"]);
+  } finally { await rm(root, { recursive: true, force: true }); }
 });
 
 // A plugin reload (a rollout, a daemon restart) between the planner's record and its hand-off used

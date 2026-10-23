@@ -2,7 +2,7 @@
 // planner of the team reads from its context file instead of searching Linear on its own. Built when
 // a planner starts, at most once per team every CANDIDATE_TTL_MS, at background priority.
 
-import { footprintOverlap, planFootprint, sameFile, type FootprintOverlap } from "../shared/plan-footprint";
+import { footprintOverlap, planFootprint, sameFile, type FootprintOverlap, type PlanFootprint } from "../shared/plan-footprint";
 import { reachBody } from "../shared/plan-sections";
 import type { PullRequestFiles } from "./label-sync";
 import type { CandidateIssue, DoneIssue, LinearService, Pages } from "./linear";
@@ -127,9 +127,10 @@ export class RelatedWork {
   // footprint overlaps `plan`, newest approval first (README, "Plan risk and auto-approval"). An
   // approval counts when its latest bound reaches `since`, so a legacy minute header approved in
   // that minute counts too. `planDocumentsSince` starts a day early, the widest header's window.
-  async approvedSince(issueId: string, since: number, plan: string, identifier: string | null = null): Promise<ApprovalOverlap[]> {
+  async approvedSince(issueId: string, since: number, plan: string | PlanFootprint, identifier: string | null = null): Promise<ApprovalOverlap[]> {
     const documents = await withPriority("background", "related work", () => this.deps.linear.planDocumentsSince(new Date(since - DAY_MS).toISOString()));
-    const own = planFootprint(plan, identifier);
+    // The approval coordinator holds a claim's footprint rather than its plan text.
+    const own = typeof plan === "string" ? planFootprint(plan, identifier) : plan;
     const overlaps: ApprovalOverlap[] = [];
     for (const document of documents) {
       if (!document.issue || document.issue.id === issueId || document.issue.identifier === identifier) continue;

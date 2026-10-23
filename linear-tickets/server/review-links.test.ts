@@ -1106,3 +1106,15 @@ test("a resolve for a decision only a peer lists is forwarded to that peer", asy
     }, undefined, { peers: async () => [peer], decisions: { applying: () => [], resolve: async () => { throw new Error("resolved locally"); } } });
   });
 });
+
+test("the inbox always states whether this host coordinates automatic approvals", async () => {
+  const readInbox = async (options: ReviewLinksOptions) => {
+    let answer: { appUserId?: string | null; dispatch?: { enabled: boolean } } = {};
+    await withLinks(async (_links, get) => { answer = await (await get("/api/inbox")).json(); }, undefined, options);
+    return answer;
+  };
+  assert.deepEqual((await readInbox({})).dispatch, { enabled: false }, "present on a host with dispatch off too");
+  const on = await readInbox({ dispatch: async () => true, appUserId: async () => "paseo-app" });
+  assert.deepEqual(on.dispatch, { enabled: true });
+  assert.equal(on.appUserId, "paseo-app");
+});

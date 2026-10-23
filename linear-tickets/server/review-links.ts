@@ -23,6 +23,7 @@ import { ReviewDeletions } from "./review-deletions";
 import { type RepairExclusion, withEffect } from "./repair-exclusion";
 import type { ReviewIssueInfo } from "./review-issue-info";
 import type { PipelineReview } from "./plan-pipeline";
+import { ClaimBody, RecordBody, SettleBody, type ApprovalClaims, type HolderAnswer } from "./approval-claims";
 import { ReviewClosedError } from "./sessions";
 
 // The checked inbox backend. The browser-facing port 127.0.0.1:47832 and the tailnet origin
@@ -103,6 +104,12 @@ export type ReviewLinksOptions = {
   // This host's Paseo app user, reported to peer hosts (`/api/inbox` `appUserId`) so their replan
   // requests from this host's app are trusted (server/plan-requests.ts).
   appUserId?: () => Promise<string | null>;
+  // The approval coordinator (README, "Plan risk and auto-approval"): its routes answer only while
+  // this host dispatches, and `/api/inbox` always reports whether it does.
+  claims?: () => Promise<Pick<ApprovalClaims, "claim" | "settle" | "record" | "status"> | null>;
+  dispatch?: () => Promise<boolean>;
+  // This host's own claim record for a claim id, answered on every host (`/holder`).
+  holder?: (claimId: string) => Promise<HolderAnswer | null>;
   // The plan text of a running review (Plannotator's /api/plan); "" when it cannot be read.
   fetchPlan?: (localUrl: string) => Promise<string>;
   // The time zone the inbox shows clock times and days in; the host's when absent.
@@ -204,14 +211,17 @@ const PeerRow = z.object({
 });
 const BackendInstanceId = z.string().uuid().optional();
 const ReviewId = z.string().min(1).max(200);
-const PeerInbox = z.object({ host: text(100), backendInstanceId: BackendInstanceId, appUserId: text(200).nullable().optional(), open: z.array(z.unknown()), decided: z.array(z.unknown()), applying: z.array(z.unknown()).optional(), pipeline: z.unknown().optional() });
+const PeerInbox = z.object({ host: text(100), backendInstanceId: BackendInstanceId, appUserId: text(200).nullable().optional(), dispatch: z.object({ enabled: z.boolean() }).optional(), open: z.array(z.unknown()), decided: z.array(z.unknown()), applying: z.array(z.unknown()).optional(), pipeline: z.unknown().optional() });
 const DecisionRequest = z.object({ approve: z.boolean(), feedback: z.string().optional(), reviewId: ReviewId, backendInstanceId: BackendInstanceId }).strict();
 const ResolveRequest = z.object({ entryId: z.string().min(1).max(200), action: z.enum(["carry-out", "drop", "keep", "other", "dismiss"]), backendInstanceId: BackendInstanceId }).strict();
 const RecheckRequest = z.object({ reviewId: ReviewId, backendInstanceId: BackendInstanceId }).strict();
 const DeleteRequest = z.object({ identifier: z.string(), reviewId: ReviewId, backendInstanceId: BackendInstanceId }).strict();
 const ErrorAnswer = z.object({ error: z.string(), outcomeUnknown: z.boolean().optional() });
+// The approval coordinator's routes (README, "Plan risk and auto-approval"): the collection, its
+// `settle` and `record` writes, one claim's status and one claim's holder record.
+const CLAIM_ROUTE = /^\/api\/approval-claims(?:\/(settle|record|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}))?(?:\/(holder))?\/?$/;
 type PeerInboxSnapshot = { peer: string; host: string; pipeline: HostPipeline } & (
-  | { backendInstanceId?: string; appUserId?: string | null; open: InboxRow[]; decided: InboxRow[]; applying: InboxRow[] }
+  | { backendInstanceId?: string; appUserId?: string | null; dispatch: boolean; open: InboxRow[]; decided: InboxRow[]; applying: InboxRow[] }
   | { unreachable: true; applying: InboxRow[] }
 );
 
@@ -287,6 +297,9 @@ export class ReviewLinks {
   private readonly host: string;
   private readonly peers: () => Promise<string[]>;
   private readonly appUserId: (() => Promise<string | null>) | null;
+  private readonly claims: ReviewLinksOptions["claims"];
+  private readonly dispatch: ReviewLinksOptions["dispatch"];
+  private readonly holder: ReviewLinksOptions["holder"];
   private readonly decide: DecideReview | null;
   private readonly decisions: ReviewDecisions | null;
   private readonly issueInfo: ReviewLinksOptions["issueInfo"];
@@ -320,6 +333,9 @@ export class ReviewLinks {
     this.host = options.host ?? hostname().replace(/\.local$/, "");
     this.peers = options.peers ?? (async () => []);
     this.appUserId = options.appUserId ?? null;
+    this.claims = options.claims;
+    this.dispatch = options.dispatch;
+    this.holder = options.holder;
     this.decide = options.decide ?? null;
     this.decisions = options.decisions ?? null;
     this.linearWorkspace = options.linearWorkspace ?? null;
@@ -520,6 +536,14 @@ export class ReviewLinks {
     return Object.values(await this.load()).some((entry) => entry.issueId === issueId && entry.recheckRequested);
   }
 
+  // Whether the review at this local URL still waits for a decision (null: this host does not list
+  // it). A decided review whose decision is not handled yet is not open: withdrawing its grant could
+  // release an approval that is being written.
+  async reviewOpen(localUrl: string): Promise<boolean | null> {
+    const entry = (await this.load())[localUrl];
+    return entry ? !entry.closedAt && !entry.outcome && !entry.decidedAt : null;
+  }
+
   // The plan's details for the inbox, with what the risk policy made of it (null: not judged).
   async described(localUrl: string, plan: string, judgement: { approved: boolean; reasons: string[] } | null): Promise<void> {
     if (!plan.trim()) return;
@@ -622,7 +646,8 @@ export class ReviewLinks {
       const custom = await this.routes({ method, path, headers, body, search: requestUrl.search });
       if (custom) return custom;
     }
-    if (action || path === "/api/push/subscribe") {
+    const claim = CLAIM_ROUTE.exec(path);
+    if (action || path === "/api/push/subscribe" || (claim && method === "POST")) {
       if (method !== "POST") return { status: 405, headers: { allow: "POST" } };
       // A page on another site cannot send these: the custom header needs a CORS preflight, which
       // this server never grants, and a browser's own Origin must be this inbox.
@@ -632,6 +657,7 @@ export class ReviewLinks {
       if (headers["x-review-action"] !== "1" || !String(headers["content-type"] ?? "").startsWith("application/json") || !sameOrigin) return json(403, { error: "Not allowed." });
       let parsed: unknown;
       try { parsed = JSON.parse(body); } catch { return json(400, { error: "The request is not JSON." }); }
+      if (claim) return await this.claimWrite(claim, parsed);
       if (path === "/api/push/subscribe") {
         const subscription = pushSubscription(parsed);
         if (!subscription) return json(400, { error: "That is not a push subscription." });
@@ -686,6 +712,7 @@ export class ReviewLinks {
         throw error;
       }
     }
+    if (claim) return await this.claimRead(claim);
     if (method !== "GET") return { status: 405, headers: { allow: "GET" } };
     const bundle = /^\/plannotator\/([0-9a-f]{64}\.(?:js|css))$/.exec(path);
     if (bundle) {
@@ -698,7 +725,10 @@ export class ReviewLinks {
     if (path === "/") return { status: 200, headers: { "content-type": "text/html; charset=utf-8" }, body: inboxPage(await this.view(), this.now(), this.timeZone) };
     if (path === "/api/inbox") {
       const appUserId = await Promise.resolve(this.appUserId ? this.appUserId() : null).catch(() => null);
-      return json(200, { host: this.host, backendInstanceId: this.seam?.instanceId, ...(appUserId ? { appUserId } : {}), ...await this.rows() });
+      // Always present: a manual-task check reads `has("dispatch")` on a host with dispatch off, and
+      // the approval coordinator lookup trusts only `enabled: true`.
+      const enabled = await Promise.resolve(this.dispatch ? this.dispatch() : false).catch(() => false);
+      return json(200, { host: this.host, backendInstanceId: this.seam?.instanceId, ...(appUserId ? { appUserId } : {}), dispatch: { enabled }, ...await this.rows() });
     }
     if (path === "/api/push/key") return json(200, { publicKey: await this.push.publicKey() });
     if (path === "/manifest.webmanifest") return { status: 200, headers: { "content-type": "application/manifest+json" }, body: MANIFEST };
@@ -717,6 +747,55 @@ export class ReviewLinks {
     const pending = applying.find((item) => item.kind === "attempt" && item.entry.state === "pending" && listedGeneration(registry, item) === entry);
     const outcome = pending && pending.kind === "attempt" ? `${pending.entry.approved ? "approved" : "sent back"} — being applied` : entry.outcome ?? "ended";
     return { status: 200, headers: { "content-type": "text/html; charset=utf-8" }, body: closedPage(entry.identifier, outcome) };
+  }
+
+  // The coordinator's writes: a claim, a settlement, an owner approval. Only the dispatch host
+  // answers; one that does not dispatch says so instead of guessing, and the requester then keeps
+  // the plan with the owner.
+  private async claimWrite(match: RegExpExecArray, body: unknown): Promise<{ status: number; headers: Record<string, string>; body: string }> {
+    const target = match[1];
+    if (target && target !== "settle" && target !== "record") return { status: 405, headers: { allow: "GET" }, body: "" };
+    let claims: Pick<ApprovalClaims, "claim" | "settle" | "record" | "status"> | null = null;
+    try { claims = this.claims ? await this.claims() : null; } catch { claims = null; }
+    if (!claims) return json(503, { error: "This host is not the approval coordinator." });
+    try {
+      if (!target) {
+        const request = ClaimBody.safeParse(body);
+        if (!request.success) return json(400, { error: "That is not an approval claim." });
+        return json(200, await claims.claim({ ...request.data, origin: request.data.origin ?? null }));
+      }
+      if (target === "settle") {
+        const request = SettleBody.safeParse(body);
+        if (!request.success) return json(400, { error: "That is not an approval settlement." });
+        return json(200, await claims.settle(request.data.claimId, request.data.state));
+      }
+      const approval = RecordBody.safeParse(body);
+      if (!approval.success) return json(400, { error: "That is not an owner approval." });
+      await claims.record(approval.data);
+      return json(200, { ok: true });
+    } catch (error) {
+      console.error(`[linear-tickets] the approval coordinator failed: ${error instanceof Error ? error.message : error}`);
+      return json(502, { error: "The approval coordinator failed." });
+    }
+  }
+
+  // A claim's status on the coordinator, and every host's own answer for one of its claim records
+  // (`/holder`, which the coordinator asks before it releases a claim).
+  private async claimRead(match: RegExpExecArray): Promise<{ status: number; headers: Record<string, string>; body: string }> {
+    const claimId = match[1];
+    if (!claimId || claimId === "settle" || claimId === "record") return { status: 405, headers: { allow: "POST" }, body: "" };
+    try {
+      if (match[2]) {
+        if (!this.holder) return json(503, { error: "This host does not keep approval claims." });
+        return json(200, await this.holder(claimId) ?? { claim: "none" });
+      }
+      const claims = this.claims ? await this.claims() : null;
+      if (!claims) return json(503, { error: "This host is not the approval coordinator." });
+      return json(200, { state: await claims.status(claimId) });
+    } catch (error) {
+      console.error(`[linear-tickets] reading an approval claim failed: ${error instanceof Error ? error.message : error}`);
+      return json(502, { error: "The approval coordinator failed." });
+    }
   }
 
   // Approve, or send back with the owner's note, the agent's waiting review: here when it is this
@@ -886,7 +965,7 @@ export class ReviewLinks {
       const pipeline: HostPipeline = status.success
         ? { ...status.data, host: answer.host, rows: status.data.rows.map((row) => ({ ...row, host: answer.host })) }
         : { host: answer.host, checkedAt: null, lastArrivalAt: null, rows: [], error: "Plan monitoring is unavailable on this host." };
-      return { peer, host: answer.host, backendInstanceId: answer.backendInstanceId, appUserId: answer.appUserId ?? null, open: peerRows(answer.open, answer.host, answer.backendInstanceId), decided: peerRows(answer.decided, answer.host, answer.backendInstanceId), applying: peerRows(answer.applying ?? [], answer.host, answer.backendInstanceId), pipeline };
+      return { peer, host: answer.host, backendInstanceId: answer.backendInstanceId, appUserId: answer.appUserId ?? null, dispatch: answer.dispatch?.enabled === true, open: peerRows(answer.open, answer.host, answer.backendInstanceId), decided: peerRows(answer.decided, answer.host, answer.backendInstanceId), applying: peerRows(answer.applying ?? [], answer.host, answer.backendInstanceId), pipeline };
     } catch { return this.unavailablePeer(peer); }
   }
 

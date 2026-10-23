@@ -71,6 +71,7 @@ import { PlanFollowUps } from "./server/plan-follow-ups";
 import { labelDaemon, StateLabels } from "./server/state-labels";
 import { LabelSync, PullRequestFiles } from "./server/label-sync";
 import { RelatedWork } from "./server/related-work";
+import { ApprovalClaims, ClaimRequests } from "./server/approval-claims";
 import { ProjectFlow, ProjectStore } from "./server/project-flow";
 import { ProjectIssueCache } from "./server/project-issues";
 import { Presence } from "./server/presence";
@@ -148,6 +149,11 @@ export default function contribute(server: PluginServerContext) {
   // The candidate list of related work in every planning launch's context file (README, "Overlap check").
   const relatedWork = new RelatedWork({ linear, pullRequests: pullRequestFiles });
   launcher.useCandidates((teamId) => relatedWork.candidates(teamId));
+  // The approval coordinator (README, "Plan risk and auto-approval"): the dispatch host grants every
+  // automatic approval and keeps the approval ledger; other hosts ask it. The requester side is
+  // built with the bridge below.
+  let claimRequests: ClaimRequests | null = null;
+  const approvalClaims = new ApprovalClaims({ linear, related: relatedWork, holder: (claimId) => claimRequests ? claimRequests.holder(claimId) : Promise.resolve(null) });
   // Present or away (README, "Present and away"): every start path asks the starter's scheduler.
   const presence = new Presence();
   // Model tiers (README, "Model tiers"): the tier each ticket implements on.
@@ -429,6 +435,10 @@ export default function contribute(server: PluginServerContext) {
     origin: () => tailnetOrigin(),
     // Reported on `/api/inbox` so peers trust this host's replan comments (plan-requests.ts).
     appUserId: () => linear.appUserId(),
+    // The coordinator's routes and `/api/inbox` `dispatch` (README, "Plan risk and auto-approval").
+    claims: async () => (await settings.read()).dispatch.enabled ? approvalClaims : null,
+    dispatch: async () => (await settings.read()).dispatch.enabled,
+    holder: (claimId) => claimRequests ? claimRequests.holder(claimId) : Promise.resolve(null),
     decide: decideReview,
     decisions: { applying: () => decisionJournal.applying(), resolve: (entryId, action): Promise<void> => plannotator.resolve(entryId, action) },
     linearWorkspace: () => linear.workspaceUrl(),
@@ -539,6 +549,17 @@ export default function contribute(server: PluginServerContext) {
   plannotator.usePlanRequests(planRequests);
   // The risk policy's overlap check (README, "Plan risk and auto-approval").
   plannotator.useRelated(relatedWork);
+  // The requester side: a plan that would be auto-approved claims the coordinator's grant first,
+  // settles it once its `Plan:` document is written, and reports owner approvals from an outbox.
+  claimRequests = new ClaimRequests({
+    linear,
+    local: async () => (await settings.read()).dispatch.enabled ? approvalClaims : null,
+    peers: async () => (await settings.read()).reviewPeers,
+    origin: () => tailnetOrigin(),
+    state: (record) => plannotator.claimReviewState(record),
+    rejudge: (record) => plannotator.rejudgeClaim(record),
+  });
+  plannotator.useClaims(claimRequests);
   let commentWake: NodeJS.Timeout | null = null;
   const wakeComments = () => {
     if (commentWake) return;
@@ -726,6 +747,7 @@ export default function contribute(server: PluginServerContext) {
       });
       asCaller("drain", () => drain.start());
       asCaller("intake", () => intake.start());
+      asCaller("approval-claims", () => approvalClaims.start());
       if (first) asCaller("parked-plans", () => { void startHost(); });
     }
     asCaller("plan-pipeline", () => pipeline.attach(paseo));
@@ -942,7 +964,7 @@ export default function contribute(server: PluginServerContext) {
     webhook.stop(); reviewLinks.stop(); pipeline.stop(); health.stop();
     const stoppedPullRequests = pullRequests.stop();
     pullBoard.stop(); manualTasks.stop(); modelGuard.stop(); planRequests.stop();
-    stateLabels.stop(); labelSync.stop(); drain.stop(); intake.stop(); deputy.stop();
+    stateLabels.stop(); labelSync.stop(); drain.stop(); intake.stop(); deputy.stop(); approvalClaims.stop();
     ownerAsks.stop(); queuedLabels.stop();
     void closeInternalDaemon();
     await stoppedPullRequests;
