@@ -234,8 +234,7 @@ test("AC-18: a crash between the ledger write and the claim removal leaves the a
     await first.committed(one.issueId, X);
     const ledger = await world.file(join(world.root, "coordinator"), "ledger.json");
     assert.deepEqual(Object.keys(ledger ?? {}), [`${one.issueId}:${planHash(X)}`]);
-    const grant = (await world.file(join(world.root, "coordinator"), "granted.json"))?.granted;
-    assert.equal(grant, undefined, "the claim left the table");
+    assert.deepEqual(await world.file(join(world.root, "coordinator"), "granted.json"), {}, "the claim left the table");
     const record = { claimId, issueId: one.issueId, identifier: one.identifier, planHash: planHash(X), footprint: planFootprint(X, one.identifier), roundStartedAt: START, origin: null, grantedAt: new Date(world.clock.now()).toISOString() };
     // A crash after the ledger write, before the claim's removal: a restart reads both copies.
     const both = join(world.root, "both");
@@ -243,16 +242,18 @@ test("AC-18: a crash between the ledger write and the claim removal leaves the a
     await world.write(both, "granted.json", { [claimId]: record });
     const restarted = world.claims({ directory: both });
     assert.equal(await restarted.status(claimId), "granted");
-    assert.equal((await world.claim(world.requester({ directory: join(world.root, "second") }), five, X)).state, "denied");
+    assert.equal((await world.claim(world.requester({ directory: join(world.root, "second"), local: async () => restarted }), five, X)).state, "denied");
     // The requester's retried settle finishes the commit; the duplicate is tolerated.
     assert.deepEqual(await restarted.settle(claimId, "committed"), { state: "committed" });
     assert.deepEqual(Object.keys((await world.file(both, "ledger.json")) ?? {}), [`${one.issueId}:${planHash(X)}`]);
+    assert.deepEqual(await world.file(both, "granted.json"), {}, "the finished commit removes the surviving grant");
     // The other side of the crash: only the claim survived, which keeps blocking too.
     const claimOnly = join(world.root, "claim-only");
     await world.write(claimOnly, "granted.json", { [claimId]: record });
     const survivor = world.claims({ directory: claimOnly });
     assert.equal(await survivor.status(claimId), "granted");
-    assert.equal((await world.claim(world.requester({ directory: join(world.root, "third") }), five, X)).state, "denied");
+    assert.equal((await world.claim(world.requester({ directory: join(world.root, "third"), local: async () => survivor }), five, X)).state, "denied");
+    assert.deepEqual(Object.keys((await world.file(claimOnly, "granted.json")) ?? {}), [claimId]);
   });
 });
 
@@ -440,7 +441,8 @@ test("AC-18: a restart reads back its grants, ledger and terminal answers", asyn
     world.rows.length = 0;
     const restarted = world.claims();
     assert.equal(await restarted.status(claimId), "committed");
-    assert.equal((await world.claim(world.requester({ directory: join(world.root, "second") }), five, X)).state, "denied");
+    assert.deepEqual(await world.file(join(world.root, "coordinator"), "granted.json"), {});
+    assert.equal((await world.claim(world.requester({ directory: join(world.root, "second"), local: async () => restarted }), five, X)).state, "denied", "the restarted ledger alone denies it");
   });
 });
 
