@@ -24,6 +24,7 @@ import { type RepairExclusion, withEffect } from "./repair-exclusion";
 import type { ReviewIssueInfo } from "./review-issue-info";
 import type { PipelineReview } from "./plan-pipeline";
 import { ClaimBody, RecordBody, SettleBody, type ApprovalClaims, type HolderAnswer } from "./approval-claims";
+import { withPriority } from "./rate-budget";
 import { ReviewClosedError } from "./sessions";
 
 // The checked inbox backend. The browser-facing port 127.0.0.1:47832 and the tailnet origin
@@ -762,7 +763,9 @@ export class ReviewLinks {
       if (!target) {
         const request = ClaimBody.safeParse(body);
         if (!request.success) return json(400, { error: "That is not an approval claim." });
-        return json(200, await claims.claim({ ...request.data, origin: request.data.origin ?? null }));
+        // The judge on the asking host runs at the owner's priority; its claim here does too, so a
+        // remote plan is not refused at a reserve the same plan's in-process claim would pass.
+        return json(200, await withPriority("owner", "plan review", () => claims.claim({ ...request.data, origin: request.data.origin ?? null })));
       }
       if (target === "settle") {
         const request = SettleBody.safeParse(body);
