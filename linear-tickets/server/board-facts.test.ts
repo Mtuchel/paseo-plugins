@@ -6,7 +6,7 @@ import test, { type TestContext } from "node:test";
 import type { PaseoAgent, PaseoApi } from "@getpaseo/client";
 import { BoardHostFacts } from "../shared/board";
 import { AgentDirectory } from "./agent-directory";
-import { collectBoardFacts } from "./board-facts";
+import { BoardInsides, collectBoardFacts } from "./board-facts";
 
 const NOW = new Date("2026-10-23T12:00:00.000Z");
 const ago = (minutes: number) => new Date(NOW.getTime() - minutes * 60_000).toISOString();
@@ -18,7 +18,7 @@ function factsDirectory(paseo: PaseoApi): AgentDirectory {
   directory.attach(paseo);
   return directory;
 }
-function fakePaseo(agents: Partial<PaseoAgent>[], timelines: Record<string, Entry[] | "fail">): PaseoApi {
+function fakePaseo(agents: Partial<PaseoAgent>[], timelines: Record<string, Entry[] | "fail">, reads: string[] = []): PaseoApi {
   return {
     agents: {
       list: async () => ({ requestId: "r", entries: agents.map((agent) => ({ agent })), pageInfo: { hasMore: false, nextCursor: null } }),
@@ -28,6 +28,7 @@ function fakePaseo(agents: Partial<PaseoAgent>[], timelines: Record<string, Entr
           id,
           timeline: {
             refetch: async () => {
+              reads.push(id);
               const entries = timelines[id];
               if (entries === "fail" || !entries) throw new Error("timeline unavailable");
               return { entries, error: null };
@@ -106,7 +107,7 @@ test("a host's facts come from its ledgers and its live ticket agents", async (t
     ],
     "a-2": "fail",
   });
-  const facts = await collectBoardFacts({ host: "server087", home: directory, paseo: () => paseo, agentDirectory: factsDirectory(paseo), maxRunning: async () => 50, now: () => NOW });
+  const facts = await collectBoardFacts({ host: "server087", home: directory, paseo: () => paseo, agentDirectory: factsDirectory(paseo), insides: new BoardInsides(), maxRunning: async () => 50, now: () => NOW });
 
   assert.equal(BoardHostFacts.safeParse(facts).success, true);
   assert.equal(facts.host, "server087");
@@ -148,7 +149,7 @@ test("a host's facts come from its ledgers and its live ticket agents", async (t
 test("a host without ledgers still answers with its agents", async (t) => {
   const directory = await home(t, {});
   const paseo = fakePaseo([liveAgent("a", "error", ticket("T-1"))], { a: [] });
-  const facts = await collectBoardFacts({ host: "mbp", home: directory, paseo: () => paseo, agentDirectory: factsDirectory(paseo), maxRunning: async () => null, now: () => NOW });
+  const facts = await collectBoardFacts({ host: "mbp", home: directory, paseo: () => paseo, agentDirectory: factsDirectory(paseo), insides: new BoardInsides(), maxRunning: async () => null, now: () => NOW });
   assert.equal(facts.steward, null);
   assert.equal(facts.ownership, null);
   assert.deepEqual(facts.watchdog, []);
@@ -160,5 +161,35 @@ test("a host without ledgers still answers with its agents", async (t) => {
 
 test("facts fail loudly without the Paseo daemon", async (t) => {
   const directory = await home(t, {});
-  await assert.rejects(collectBoardFacts({ host: "mbp", home: directory, paseo: () => null, agentDirectory: new AgentDirectory(), maxRunning: async () => null, now: () => NOW }));
+  await assert.rejects(collectBoardFacts({ host: "mbp", home: directory, paseo: () => null, agentDirectory: new AgentDirectory(), insides: new BoardInsides(), maxRunning: async () => null, now: () => NOW }));
+});
+
+test("a tail is read again only once its agent moved, and a failed read is retried", async (t) => {
+  const directory = await home(t, {});
+  const said = (text: string): Entry[] => [{ timestamp: ago(1), item: { type: "assistant_message", text } }];
+  const agents = [liveAgent("a", "running", ticket("T-1")), liveAgent("b", "idle", ticket("T-2")), liveAgent("c", "idle", ticket("T-3"))];
+  const timelines: Record<string, Entry[] | "fail"> = { a: said("first"), b: said("idle"), c: "fail" };
+  const reads: string[] = [];
+  const paseo = fakePaseo(agents, timelines, reads);
+  const insides = new BoardInsides();
+  const collect = () => collectBoardFacts({ host: "mbp", home: directory, paseo: () => paseo, agentDirectory: factsDirectory(paseo), insides, maxRunning: async () => null, now: () => NOW });
+
+  await collect();
+  assert.deepEqual(reads.sort(), ["a", "b", "c"]);
+
+  reads.length = 0;
+  timelines.a = said("second");
+  timelines.c = said("back");
+  agents[0] = { ...agents[0], updatedAt: ago(0) };
+  const facts = await collect();
+  assert.deepEqual(reads.sort(), ["a", "c"]);
+  assert.deepEqual(facts.agents.map((agent) => [agent.id, agent.inside?.said]), [["a", "second"], ["b", "idle"], ["c", "back"]]);
+
+  // An agent that left the board and comes back with the same updatedAt is read afresh.
+  const b = agents.splice(1, 1)[0]!;
+  await collect();
+  agents.push(b);
+  reads.length = 0;
+  await collect();
+  assert.deepEqual(reads, ["b"]);
 });

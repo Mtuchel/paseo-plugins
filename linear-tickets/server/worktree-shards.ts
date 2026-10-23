@@ -1,4 +1,5 @@
 import { execFile } from "./child-processes";
+import { listProjects } from "./projects";
 import { createHash } from "node:crypto";
 import { statSync } from "node:fs";
 import { resolve } from "node:path";
@@ -135,7 +136,7 @@ export class ShardAssignor {
     const settings = await this.deps.settings();
     const pool = shardPool(settings.worktreeShards, input.requested.rootPath);
     if (!pool) return null;
-    const projects = (await paseo.projects.list()).projects;
+    const projects = await listProjects(paseo);
     const byRoot = new Map<string, ShardProject>();
     for (const project of projects) {
       if (project.projectRootPath) byRoot.set(normalized(project.projectRootPath), { projectId: project.projectId, rootPath: project.projectRootPath, label: project.projectCustomName || project.projectDisplayName || project.projectRootPath });

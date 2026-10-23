@@ -1,11 +1,27 @@
 import { execFile } from "./child-processes";
-import type { PaseoApi } from "@getpaseo/client";
+import type { PaseoApi, PaseoProject } from "@getpaseo/client";
 
 export class ProjectUnavailableError extends Error {}
 
+const PROJECTS_TTL_MS = 60_000;
+const projectLists = new WeakMap<PaseoApi, { at: number; flight: Promise<PaseoProject[]> }>();
+
+// One start asks for its project up to six times (mapping, shard pool, shard, launch), and the
+// daemon answers every project.list by describing each project through its shared git queue
+// (0.5 s and more on server087). One listing per daemon connection therefore serves a minute, and
+// a project it does not name is looked up afresh, so a project added since is still found.
+export function listProjects(paseo: PaseoApi, options: { fresh?: boolean } = {}): Promise<PaseoProject[]> {
+  const kept = projectLists.get(paseo);
+  if (kept && !options.fresh && Date.now() - kept.at < PROJECTS_TTL_MS) return kept.flight;
+  const entry = { at: Date.now(), flight: paseo.projects.list().then((result) => result.projects) };
+  projectLists.set(paseo, entry);
+  entry.flight.catch(() => { if (projectLists.get(paseo) === entry) projectLists.delete(paseo); });
+  return entry.flight;
+}
+
 export async function findProject(paseo: PaseoApi, id: string) {
-  const result = await paseo.projects.list();
-  const project = result.projects.find((item) => item.projectId === id);
+  const named = (projects: PaseoProject[]) => projects.find((item) => item.projectId === id && item.projectRootPath);
+  const project = named(await listProjects(paseo)) ?? named(await listProjects(paseo, { fresh: true }));
   if (!project?.projectRootPath) throw new ProjectUnavailableError("This project is no longer available. Refresh projects and select one again.");
   return project;
 }

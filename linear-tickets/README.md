@@ -5592,9 +5592,12 @@ host you open joins its own facts with every `reviewPeers` peer's (8 s deadline;
 not answer valid facts is listed as unreachable), the open and last-24-hour Linear tickets carrying
 the dispatch label, and the open GitHub pull requests of the repositories pr-watch follows. Facts
 are cached for 30 seconds, Linear and GitHub for two minutes, each collected by one flight; nothing
-is read until the board is opened. When Linear or GitHub cannot be read the board stays up from
-the hosts' facts and marks that source unavailable. The page refreshes every minute and shows
-when each source was last read.
+is read until the board is opened. An agent's timeline tail is read again only when its
+`updatedAt` moved since the last read (the daemon moves it with every stream event); an agent that
+has not moved keeps the tail read before, so an open board costs the daemon one tail read per
+agent that worked in the last minute instead of one per live ticket agent. When Linear or GitHub
+cannot be read the board stays up from the hosts' facts and marks that source unavailable. The
+page refreshes every minute and shows when each source was last read.
 
 ## Owner asks
 
@@ -5936,7 +5939,9 @@ agents share one directory instead of polling on their own timers: live agents a
 seconds, the archived index for 10 minutes, and an agent created or archived drops the live cache
 at once.
 Work that starts, claims or decides ownership still reads the daemon directly, so a decision never
-runs on a cached list.
+runs on a cached list. Only the Paseo project listing a start resolves its project and shard pool
+from is shared for a minute (the daemon describes every project through its git queue for each
+listing); a project the shared listing does not name is looked up again at once.
 
 The CPU profiler only runs while the owner asks for it. The switch is the file
 `$PASEO_HOME/linear-tickets/diagnostics/profile-until` holding an ISO end time with its zone, for
