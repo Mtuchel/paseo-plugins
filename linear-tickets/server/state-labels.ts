@@ -1,5 +1,6 @@
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import { UUID, type LinearService, type WrittenState } from "./linear";
+import { loadProbe } from "./load-probe";
 import { RateLimitedError, withPriority } from "./rate-budget";
 import { PLAN_APPROVED_STATE, PLAN_REVIEW_STATE, PLANNING_STATE, planStage, type PlanStage } from "./plan-policy";
 
@@ -211,7 +212,7 @@ export class StateLabels {
 
   sync(): Promise<void> {
     if (this.running) { this.again = true; return this.running; }
-    this.running = this.run().catch((error: unknown) => this.report(error)).finally(() => {
+    this.running = loadProbe.time("state-labels", () => this.run()).catch((error: unknown) => this.report(error)).finally(() => {
       this.running = null;
       if (this.again && !this.stopped) { this.again = false; void this.sync(); }
     });

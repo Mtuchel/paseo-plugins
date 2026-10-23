@@ -2,6 +2,7 @@ import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/p
 import { join } from "node:path";
 import type { PaseoApi } from "@getpaseo/client";
 import type { LinearService } from "./linear";
+import { loadProbe } from "./load-probe";
 import { PLAN_LABEL } from "./plan-policy";
 import { RateLimitedError, withPriority } from "./rate-budget";
 import { paseoHome } from "./ticket-mcp";
@@ -61,7 +62,7 @@ export class PlanRequests {
 
   poll(): Promise<void> {
     if (this.polling) return this.polling;
-    this.polling = withPriority("background", "plan-requests", () => this.run()).catch((error: unknown) => {
+    this.polling = loadProbe.time("plan-requests", () => withPriority("background", "plan-requests", () => this.run())).catch((error: unknown) => {
       const message = error instanceof Error ? error.message : String(error);
       const kind = error instanceof RateLimitedError ? `rate:${error.pool}` : message;
       if (kind !== this.lastError) console.error(`[linear-tickets] plan request poll failed: ${message}`);
