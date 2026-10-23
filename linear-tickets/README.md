@@ -5591,7 +5591,8 @@ in place never extends a recording, and a rewritten file moves the end time from
 While the switch holds, an in-process inspector session records consecutive one-minute chunks and
 keeps a chunk as `diagnostics/<start time>.cpuprofile` only when its minute held a stall of at least
 5 seconds; open it in Chrome DevTools or `speedscope`. Profiles are written apart from the
-recording, so a slow disk delays neither the next chunk nor the end time. At most 30 profiles and
+recording and the switch reads, so a slow disk delays neither the next chunk, the end time, nor
+noticing a removed or rewritten switch. At most 30 profiles and
 500 MB are kept, the oldest are deleted first; a profile that cannot be deleted counts as a profiler
 failure. The recording ends at the end time, when the file is deleted, or when the plugin unloads,
 keeping its last chunk under the same stall rule; an unload also disconnects a session the

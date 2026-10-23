@@ -199,13 +199,15 @@ export function startLoadProbe(options: LoadProbeOptions = {}): LoadProbe {
   // Profiler: only while $PASEO_HOME/linear-tickets/diagnostics/profile-until names a future end
   // time at most 24 h after the file was written. Consecutive one-minute chunks; a chunk is kept
   // only when its minute held a stall of at least 5 s. Any profiler failure ends it until reload.
-  // Two queues: the inspector's (start, chunk ends, end times) and the files' (switch reads,
-  // profile writes, pruning), so a slow disk never delays a chunk's end or the switch's end time.
+  // Three queues: the inspector's (start, chunk ends, end times), the switch reads, and the profile
+  // writes with their pruning, so a slow disk delays neither a chunk's end, the switch's end time,
+  // nor the reading of a removed or rewritten switch.
   let disabled = false;
   const reported = new Set<string>();
   const once = (key: string, message: string) => { if (!reported.has(key)) { reported.add(key); log(message); } };
   type Queue = { tail: Promise<void> };
   const inspectorQueue: Queue = { tail: Promise.resolve() };
+  const switchQueue: Queue = { tail: Promise.resolve() };
   const fileQueue: Queue = { tail: Promise.resolve() };
   const enqueue = (queue: Queue, work: () => Promise<void>) => {
     queue.tail = queue.tail.then(work).catch((error: unknown) => once(`queue:${String(error)}`, `profiler step failed: ${error instanceof Error ? error.message : error}`));
@@ -235,6 +237,9 @@ export function startLoadProbe(options: LoadProbeOptions = {}): LoadProbe {
     return { until, key };
   };
 
+  // The session between its connect and its first chunk: a stop() or a failure then disconnects it
+  // at once, whether or not the inspector ever answers.
+  let connecting: InspectorSessionLike | null = null;
   const fail = (phase: string, error: unknown) => {
     disabled = true;
     const current = recording;
@@ -243,6 +248,7 @@ export function startLoadProbe(options: LoadProbeOptions = {}): LoadProbe {
       if (current.timer !== null) cancelAfter(current.timer);
       disconnect(current.session);
     }
+    if (connecting) { disconnect(connecting); connecting = null; }
     once("disabled", `profiler disabled until reload: ${phase} failed (${error instanceof Error ? error.message : error})`);
   };
 
@@ -344,9 +350,8 @@ export function startLoadProbe(options: LoadProbeOptions = {}): LoadProbe {
     await startChunk(current);
   };
 
-  // The session between its connect and its first chunk: a stop() then disconnects it at once,
-  // whether or not the inspector ever answers.
-  let connecting: InspectorSessionLike | null = null;
+  // A stop() or a failure while the inspector answers has already disconnected the session and
+  // cleared `connecting`; nothing proceeds on it then.
   const begin = async (read: { until: number; key: string }): Promise<void> => {
     let session: InspectorSessionLike | null = null;
     try {
@@ -354,15 +359,17 @@ export function startLoadProbe(options: LoadProbeOptions = {}): LoadProbe {
       connecting = session;
       session.connect();
       await post(session, "Profiler.enable");
+      if (connecting !== session) return;
       await post(session, "Profiler.start");
     } catch (error) {
+      if (session !== null && connecting !== session) return;
       connecting = null;
       if (session) disconnect(session);
-      if (!stopped) fail("Profiler.start", error);
+      fail("Profiler.start", error);
       return;
     }
+    if (connecting !== session) return;
     connecting = null;
-    if (stopped || disabled) { disconnect(session); return; }
     const current: Recording = { session, until: read.until, key: read.key, running: true, chunkStall: 0, chunkStartedAt: wallNow(), timer: null };
     recording = current;
     log(`profiler recording until ${iso(read.until)}`);
@@ -397,8 +404,8 @@ export function startLoadProbe(options: LoadProbeOptions = {}): LoadProbe {
     const read = await readSwitch();
     if (!disabled && !stopped) enqueue(inspectorQueue, () => apply(read));
   };
-  const switchTimer = unref(every(() => enqueue(fileQueue, pollSwitch), SWITCH_POLL_MS));
-  enqueue(fileQueue, pollSwitch);
+  const switchTimer = unref(every(() => enqueue(switchQueue, pollSwitch), SWITCH_POLL_MS));
+  enqueue(switchQueue, pollSwitch);
 
   const probe: LoadProbe = {
     time,
@@ -429,12 +436,12 @@ export function startLoadProbe(options: LoadProbeOptions = {}): LoadProbe {
       if (active === probe) active = null;
     },
     idle: async () => {
-      let inspector: Promise<void>, files: Promise<void>;
+      const queues = [inspectorQueue, switchQueue, fileQueue];
+      let tails: Promise<void>[];
       do {
-        inspector = inspectorQueue.tail;
-        files = fileQueue.tail;
-        await Promise.all([inspector, files]);
-      } while (inspector !== inspectorQueue.tail || files !== fileQueue.tail);
+        tails = queues.map((queue) => queue.tail);
+        await Promise.all(tails);
+      } while (queues.some((queue, index) => queue.tail !== tails[index]));
     },
   };
   active = probe;

@@ -591,7 +591,22 @@ function gatedSessions(world: { sessions: FakeSession[] }) {
   return { session, enabling, open };
 }
 
-test("a profile write that has not finished delays neither the next chunk's end nor the switch's end time", async () => {
+// A log that hands each awaited line over as a signal, for steps that wait on the disk.
+function lineLog() {
+  const lines: string[] = [];
+  const waiting: { text: string; resolve: () => void }[] = [];
+  const log = (line: string) => {
+    lines.push(line);
+    for (const entry of waiting) if (line.includes(entry.text)) entry.resolve();
+  };
+  const seen = (text: string) => new Promise<void>((resolve) => {
+    if (lines.some((line) => line.includes(text))) resolve();
+    else waiting.push({ text, resolve });
+  });
+  return { lines, log, seen };
+}
+
+test("a profile write that has not finished delays neither the next chunk's end nor the switch's end time", { timeout: 10_000 }, async () => {
   const writes: string[] = [];
   let release = () => {};
   const released = new Promise<void>((resolve) => { release = resolve; });
@@ -614,6 +629,70 @@ test("a profile write that has not finished delays neither the next chunk's end 
     await world.settle();
     assert.equal(writes.length, 1, "the second chunk held no long stall");
   } finally { release(); await world.cleanup(); }
+});
+
+test("a profile write that has not finished does not hide a removed switch", { timeout: 10_000 }, async () => {
+  const log = lineLog();
+  let release = () => {};
+  const released = new Promise<void>((resolve) => { release = resolve; });
+  let requested = () => {};
+  const writeRequested = new Promise<void>((resolve) => { requested = resolve; });
+  const world = await profilerWorld({ log: log.log, writeProfile: async () => { requested(); await released; } });
+  try {
+    await world.writeSwitch(world.clock.wallNow() + 60 * MINUTE);
+    await world.clock.run(70_000, world.settle);
+    // The first chunk ends at 120 s with a long stall; its write does not finish.
+    world.clock.block(6000);
+    world.clock.advance(44_000);
+    await writeRequested;
+    await rm(join(world.directory, "profile-until"));
+    world.clock.advance(MINUTE);
+    await log.seen("profiler stopped (switch removed)");
+    assert.equal((world.sessions[0] as FakeSession).calls.at(-1), "disconnect");
+  } finally { release(); await world.cleanup(); }
+});
+
+test("a profile write that fails while the next session connects disconnects it, and nothing starts on it", { timeout: 10_000 }, async () => {
+  const log = lineLog();
+  let failWrite = () => {};
+  const writeFails = new Promise<void>((resolve) => { failWrite = resolve; });
+  let requested = () => {};
+  const writeRequested = new Promise<void>((resolve) => { requested = resolve; });
+  let answerEnable = () => {};
+  const enableAnswered = new Promise<void>((resolve) => { answerEnable = resolve; });
+  let enabling = () => {};
+  const secondEnabling = new Promise<void>((resolve) => { enabling = resolve; });
+  const sessions: FakeSession[] = [];
+  const session = () => {
+    const created = new FakeSession();
+    if (sessions.length === 1) {
+      created.gate = { method: "Profiler.enable", open: enableAnswered };
+      created.onPost = (method) => { if (method === "Profiler.enable") enabling(); };
+    }
+    sessions.push(created);
+    return created;
+  };
+  const world = await profilerWorld({ log: log.log, session, writeProfile: async () => { requested(); await writeFails; throw new Error("disk full"); } });
+  try {
+    // The first recording ends at 100 s with a stalled chunk whose write waits; a rewritten switch
+    // starts a second session at the 120 s poll, and the inspector has not answered its enable.
+    await world.writeSwitch(world.clock.wallNow() + 100_000);
+    await world.clock.run(70_000, world.settle);
+    world.clock.block(6000);
+    world.clock.advance(24_000);
+    await writeRequested;
+    await log.seen("profiler stopped (switch expired)");
+    await world.writeSwitch(world.clock.wallNow() + 60 * MINUTE);
+    world.clock.advance(20_000);
+    await secondEnabling;
+    failWrite();
+    await log.seen("profiler disabled until reload: writing the profile failed (disk full)");
+    assert.deepEqual(sessions[1]?.calls, ["connect", "Profiler.enable", "disconnect"]);
+    answerEnable();
+    await world.settle();
+    assert.deepEqual(sessions[1]?.calls, ["connect", "Profiler.enable", "disconnect"], "no Profiler.start once disabled");
+    assert.equal(log.lines.filter((line) => line.includes("profiler recording until")).length, 1);
+  } finally { failWrite(); answerEnable(); await world.cleanup(); }
 });
 
 test("a poll that reads an earlier end time ends the recording at that time, not at the chunk's end", async () => {
