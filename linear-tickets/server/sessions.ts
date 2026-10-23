@@ -109,6 +109,12 @@ export type Succession =
   | { kind: "started" | "live"; agent: { id: string; title: string | null; cwd: string } }
   | { kind: "wait"; reason: string }
   | { kind: "impossible"; reason: string; tooLarge?: true };
+// Why a successor was started for a broken pull request, carried as its agent label
+// `linear-tickets.repair` (the board's repair slot reads it). Only a successor started *for* a
+// repair carries it: a crash restart or a policy message is the ticket's ordinary next agent. The
+// label never changes ownership — the successor is the ticket's one owner like any other.
+export const REPAIR_LABEL = "linear-tickets.repair";
+export type RepairKind = "ci" | "conflict" | "draft" | "changes" | "findings" | "drop" | "replay";
 // What a restart (SessionRouter.restartFor) came to. `started`: a new agent runs (`marked`: the
 // running label was written). `live`: a live agent already works on the ticket. `forwarded`: the
 // peer host owns the start. `skipped`: the ticket is deleted or paused for deletion. `deferred`:
@@ -2306,8 +2312,8 @@ export class SessionRouter {
   // follows the start (thread, archive, record) is best effort and never undoes it. A null
   // `predecessorId` is a ticket that took a pull request over without an agent of its own
   // (Handover.transfer): there is no gone agent to exclude, archive or name.
-  succeed(issueId: string, identifier: string, predecessorId: string | null, lead: string, onDispatch: () => Promise<void>): Promise<Succession> {
-    return this.exclusive(issueId, () => this.succeedNow({ id: issueId, identifier }, predecessorId, lead, onDispatch));
+  succeed(issueId: string, identifier: string, predecessorId: string | null, lead: string, onDispatch: () => Promise<void>, repair: RepairKind | null = null): Promise<Succession> {
+    return this.exclusive(issueId, () => this.succeedNow({ id: issueId, identifier }, predecessorId, lead, onDispatch, false, repair));
   }
 
   // A parent verifier may find implementation work before any parent branch exists. This is
@@ -2345,7 +2351,7 @@ export class SessionRouter {
     }
   }
 
-  private async succeedNow(issue: { id: string; identifier: string }, predecessorId: string | null, lead: string, onDispatch: () => Promise<void>, verifiedParent = false): Promise<Succession> {
+  private async succeedNow(issue: { id: string; identifier: string }, predecessorId: string | null, lead: string, onDispatch: () => Promise<void>, verifiedParent = false, repair: RepairKind | null = null): Promise<Succession> {
     const gone = predecessorId ? `gone agent ${predecessorId.slice(0, 8)}` : "the ticket without an agent";
     if (await this.deps.deletions?.blocked(issue.id)) return { kind: "impossible", reason: "the ticket was deleted or is paused for deletion" };
     if (!this.paseo) return { kind: "wait", reason: "Paseo is not connected yet" };
@@ -2427,7 +2433,7 @@ export class SessionRouter {
       await this.deps.linear.addLabel(issue.id, running).catch(() => {});
       let agentId: string;
       try {
-        agentId = (await this.deps.starter.start(issue.id, paseo, settings, { retryHint: "assign Paseo again", resumeOnly: !verifiedParent || Boolean(target), lead })).agentId;
+        agentId = (await this.deps.starter.start(issue.id, paseo, settings, { retryHint: "assign Paseo again", resumeOnly: !verifiedParent || Boolean(target), lead, ...(repair ? { labels: { [REPAIR_LABEL]: repair } } : {}) })).agentId;
       } catch (error) {
         await this.deps.linear.removeLabel(issue.id, running).catch(() => {});
         // The repair holds the ticket briefly and the start made nothing; the claimed message

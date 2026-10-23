@@ -21,9 +21,10 @@ import { EXCLUSION_CLOSED_MESSAGE, REPAIR_BUSY_MESSAGE, RepairBusyError } from "
 import type { ReviewDeletions } from "./review-deletions";
 import { RESPONSIBILITY_GRACE_MS, type ResponsibilityCheck, type ResponsibilityTicket } from "./responsibility";
 import { AWAY_REASON } from "./scheduler";
+import { recordedCiFails } from "./pr-nudge";
 import type { HostOwnership, RestartResult, SessionRouter, Succession } from "./sessions";
 import type { PluginSettings, Settings } from "./settings";
-import { classifyTicketAgents, issueAgents, WAITING_PLAN_REASON, type TicketStarter } from "./starter";
+import { classifyTicketAgents, issueAgents, markedAgents, WAITING_PLAN_REASON, type TicketStarter } from "./starter";
 import { paseoHome } from "./ticket-mcp";
 import { takeLease, releaseLease, type TicketRoots, type WatchedAgent, type WatchdogFile, type WatchdogStore } from "./watchdog";
 import { NEEDS_INPUT_STATE, STEWARD_WAIT_ANCHOR, type Writeback } from "./writeback";
@@ -1094,6 +1095,10 @@ export class Steward {
     // reading, before this pass's effects add new debt.
     await this.settleLabels(paseo, names, roots);
     const pass: Pass = { actions: 0, cap: settings.steward.maxActionsPerPass };
+    // Longest-unacted first, so the per-pass cap rotates: a ticket whose action keeps deferring
+    // (its claim is new each pass) moves behind the others instead of taking the same slots in
+    // Linear's order every pass.
+    candidates.sort((a, b) => (stewardActionAt(a.ticket) ?? 0) - (stewardActionAt(b.ticket) ?? 0) || a.issue.identifier.localeCompare(b.issue.identifier));
     for (const candidate of candidates) {
       if (!this.alive()) return;
       try {
@@ -1348,9 +1353,15 @@ export class Steward {
       return;
     }
     // A ticket already escalated for this reason waits for the owner, whatever its situation now is.
+    // An escalation about a failed action (a successor with no branch record yet, a checkout that
+    // timed out) names facts that change without the owner, so it holds for one steward window;
+    // then the action is tried once more and the hold renewed (below); the same question is not
+    // asked again (escalate). A situation whose own action is to escalate holds until answered.
     const key = situation === "escalated" ? (stored?.escalated?.key ?? "escalated") : situation;
     const ownerNewer = Boolean(stored?.ownerAt && stored.escalated && Date.parse(stored.ownerAt) > Date.parse(stored.escalated.at));
-    const escalated = Boolean(stored?.escalated && stored.escalated.key === key && !ownerNewer);
+    const ownAction = situation === "escalated" ? "escalate" : STEWARD_ACTION[situation];
+    const lapsed = Boolean(stored?.escalated && ownAction && ownAction !== "escalate" && now - Date.parse(stored.escalated.at) >= STEWARD_WINDOW_MS);
+    const escalated = Boolean(stored?.escalated && stored.escalated.key === key && !ownerNewer && !lapsed);
     const action = situation === "escalated" || escalated ? "escalate" : STEWARD_ACTION[situation];
     if (!action) {
       await this.verdict(paseo, settings, names, candidate, pass, now);
@@ -1365,6 +1376,13 @@ export class Steward {
       return;
     }
     if (!this.cap(pass, candidate, action)) return;
+    // The lapsed hold's one retry renews it: whatever the retry's outcome, the next is a window away.
+    if (lapsed && stored?.escalated?.key === key && !ownerNewer) {
+      await this.deps.store.update((file) => {
+        const ticket = file.tickets[issue.id];
+        if (ticket?.escalated?.key === key) ticket.escalated = { ...ticket.escalated, at: this.iso(now) };
+      });
+    }
     await this.act(paseo, settings, names, candidate, situation, action, now);
   }
 
@@ -1424,14 +1442,21 @@ export class Steward {
     });
   }
 
-  private async finishDiagnostic(paseo: PaseoApi, issueId: string, diagnostic: RecoveryDiagnostic, outcome: string): Promise<void> {
-    const helperIds = diagnostic.agentId ? [diagnostic.agentId] : (await issueAgents(paseo, issueId)).filter((agent) => agent.labels?.[STEWARD_VERIFIER_LABEL] === diagnostic.marker).map((agent) => agent.id);
-    // A timed-out create is not a cancelled create. Keep its original marker reserved until
-    // an exact helper is discovered or the transport returns its identity, across reloads.
-    if (!helperIds.length && (diagnostic.launchPending || diagnostic.state === "launching")) {
+  // Whether the diagnostic finished: false while a pending create may still land (see below).
+  private async finishDiagnostic(paseo: PaseoApi, issueId: string, diagnostic: RecoveryDiagnostic, outcome: string): Promise<boolean> {
+    const pending = !diagnostic.agentId && (diagnostic.launchPending || diagnostic.state === "launching");
+    const listed = diagnostic.agentId ? { ids: [diagnostic.agentId], complete: true } : await markedAgents(paseo, issueId, STEWARD_VERIFIER_LABEL, diagnostic.marker);
+    // A timed-out create is not a cancelled create: its original marker stays reserved until an
+    // agent carrying it (archived included) is found, across reloads. Without one it is released
+    // only once the create can no longer land unseen — its deadline plus the reaction window — and
+    // a complete listing proves no agent carries it; an unreadable listing never releases it. A
+    // new diagnostic still refuses beside any live recovery helper (see the launch below).
+    const unconfirmed = pending && !listed.ids.length;
+    if (unconfirmed && (!listed.complete || this.clock() < Date.parse(diagnostic.deadline) + RECOVERY_REACTION_MS)) {
       await this.diagnosticWait(issueId, "Diagnostic create outcome unknown; original marker remains reserved", "Find and retire the original diagnostic helper");
-      return;
+      return false;
     }
+    const helperIds = listed.ids;
     for (const id of helperIds) {
       const helper = await paseo.agents.ref(id).refresh();
       if (helper && !helper.agent.archivedAt) {
@@ -1446,9 +1471,11 @@ export class Steward {
       ticket.diagnosticRequested = null;
       ticket.recoveryOutcomes ??= {};
       ticket.recoveryOutcomes[outcome] = (ticket.recoveryOutcomes[outcome] ?? 0) + 1;
+      if (unconfirmed && outcome !== "launch-unknown") ticket.recoveryOutcomes["launch-unknown"] = (ticket.recoveryOutcomes["launch-unknown"] ?? 0) + 1;
       if (outcome === "replaced") ticket.recoveryObservation = { key: diagnostic.marker, at: this.iso() };
-      ticket.log = [...ticket.log, { at: this.iso(), action: `diagnostic: ${outcome}` }].slice(-LOG_LIMIT);
+      ticket.log = [...ticket.log, { at: this.iso(), action: `diagnostic: ${outcome}${unconfirmed ? " (its launch was never confirmed; marker released)" : ""}` }].slice(-LOG_LIMIT);
     });
+    return true;
   }
 
   private async recovery(paseo: PaseoApi, settings: PluginSettings, names: DispatchLabels & { trigger: string }, candidate: Candidate, pass: Pass, now: number): Promise<boolean> {
@@ -1500,8 +1527,15 @@ export class Steward {
       const read = this.deps.verdicts ?? ((issueId: string) => readVerdicts(join(paseoHome(), "linear-tickets", STEWARD_VERDICT_DIRECTORY, issueId)));
       const verdict = (await read(issue.id)).map(parseVerdict).find((entry): entry is StewardVerdict => entry !== null && entry.issueId === issue.id && entry.verifier === diagnostic!.marker && Date.parse(entry.at) >= Date.parse(diagnostic!.at) && Date.parse(entry.at) <= Math.min(now, Date.parse(diagnostic!.deadline)) && ["continue", "replace", "wait", "ask_owner"].includes(entry.verdict));
       if (!diagnostic.agentId && (diagnostic.launchPending || diagnostic.state === "launching") && now >= Date.parse(diagnostic.deadline)) {
+        if (now >= Date.parse(diagnostic.deadline) + RECOVERY_REACTION_MS) {
+          if (await this.finishDiagnostic(paseo, issue.id, diagnostic, "launch-unknown")) {
+            await this.requestDiagnosis(issue, "Bounded diagnosis produced no usable verdict");
+            return true;
+          }
+          await this.escalate(candidate, "Read-only diagnostic launch and bounded reconciliation have no confirmed outcome, and the ticket's agents cannot be fully listed. Its original marker stays reserved; another launch could duplicate it.");
+          return true;
+        }
         await this.diagnosticWait(issue.id, "Diagnostic create outcome unknown; do not repeat the launch", "Find the original diagnostic marker");
-        if (now >= Date.parse(diagnostic.deadline) + RECOVERY_REACTION_MS) await this.escalate(candidate, "Read-only diagnostic launch and bounded reconciliation have no confirmed outcome. Its original marker stays reserved; another launch could duplicate it.");
         return true;
       }
       if (!verdict) {
@@ -1850,15 +1884,19 @@ export class Steward {
     if (!pull) return { state: "failed", reason: "no pull request to continue", permanent: true };
     const now = this.clock();
     const record = (await this.deps.handover.all()).find((item) => item.issueId === issue.id) ?? null;
-    const lead = facts.openPulls.some((entry) => entry.url === pull!.url) ? successorText(issue.identifier, pull) : replayText(issue.identifier, pull, record?.worktreePath ?? null);
+    const open = facts.openPulls.some((entry) => entry.url === pull!.url);
+    const lead = open ? successorText(issue.identifier, pull) : replayText(issue.identifier, pull, record?.worktreePath ?? null);
     const attempt = facts.restarts + 1;
     await this.deps.store.update((file) => {
       const ticket = this.deps.store.ticket(file, issue.id, issue.identifier, this.iso(now));
       ticket.restarts = [...recent(ticket.restarts, now), this.iso(now)];
     });
+    // A closed pull request is replayed; an open one whose recorded checks fail is a CI repair. A
+    // green open one is the ticket's plain continuation and carries no repair label.
+    const repair = !open ? "replay" : recordedCiFails(pull.ci) ? "ci" : null;
     const result: Succession = await this.deps.sessions.succeed(issue.id, issue.identifier, record?.agentId ?? null, lead, async () => {
       console.log(`[linear-tickets] ${issue.identifier}: steward: successor ${attempt} of ${RESTART_CAP}`);
-    }).catch((error: unknown): Succession => ({ kind: "impossible", reason: message(error) }));
+    }, repair).catch((error: unknown): Succession => ({ kind: "impossible", reason: message(error) }));
     if (result.kind === "wait" || result.kind === "impossible") {
       const reason = result.kind === "wait" ? `the successor waits: ${result.reason}` : `no successor can start: ${successionReason(result)}`;
       if (result.kind === "wait" && queueWait(result.reason)) {

@@ -2338,6 +2338,15 @@ comment mentioning you. The same happens for a pull request labelled `do-not-mer
 start (the plugin stops in that second) loses the message: the log names the claim, and it is not
 repeated.
 
+**Repair label.** A successor started because the pull request is broken carries the agent label
+`linear-tickets.repair=<kind>`, so boards and `paseo ls` can tell repair work from ordinary work:
+`ci` (failing checks, the merge queue's own check not counted), `conflict`, `draft`, `changes`
+(changes requested), `findings` (unresolved review threads), `drop` (dropped from the merge
+queue) and `replay` (closed without merging; its work is replayed onto a new pull request). The
+steward's successor for an open pull request whose recorded checks fail is labelled `ci`, one
+for a closed pull request `replay`. A crash successor, a policy message and a successor that only
+continues a green pull request carry no repair label.
+
 **Native process ownership.** `CLOSED`, archive and a closed-process error do not prove an OMP
 worker exited. Native thread starts, automatic resumes, successor dispatch
 and recovery prompts check all same-ticket root snapshots, including archived ones, while
@@ -3189,7 +3198,9 @@ a start for an unblocked ticket that never started, one resume for a silent agen
 a stale owner wait (a ticket in Needs input that no recorded wait and no live agent back, however
 it got there), the archive of a finished ticket's agents, or an escalation. Restarts are capped at three per ticket within 24 hours and at `steward.maxActionsPerPass`
 starts, successors, verifiers and resumes per pass, so a backlog never floods the capacity; closes,
-archives and escalations are not capped. A deliberate wait — the `hold`/`manual`/`do-not-merge`
+archives and escalations are not capped. The pass visits tickets longest-unacted first (by the
+steward's last claim or log entry), so a ticket whose action keeps waiting in the queue moves
+behind the others and cannot hold the same slots every pass. A deliberate wait — the `hold`/`manual`/`do-not-merge`
 labels, a plan under review or a parked plan, the watchdog's owner Stop, a pending permission, a
 Needs-you item, focus mode, the peer host — is never recovered or escalated by any of them: only
 the owner's own answer, retry (the trigger label) or a fresh instruction ends it.
@@ -3256,7 +3267,11 @@ through the same waiting path an agent's question takes — so it appears in Lin
 decision inbox and in the Paseo Agents menu bar, and you can answer it like any other ask. The
 watchdog's spent recovery cycle ends the same way. The escalation is remembered per ticket and per
 reason, so a pass that keeps finding the same defect does not comment again; adding the trigger
-label or starting the agent yourself clears it and begins a fresh round.
+label or starting the agent yourself clears it and begins a fresh round. An escalation about a
+failed action (a successor refused because no branch was recorded yet, a branch that could not be
+reopened) names facts that change without you, so it holds for 24 hours; then the steward tries the
+action once more and holds again for 24 hours, without a second comment. An escalation that is
+itself the situation's action (a spent budget, a closed pull request) holds until you answer.
 
 **State and safety.** `steward.json` (next to the other state files under
 `~/.paseo/linear-tickets/`) holds per ticket the last situation and its since-time, the claimed
@@ -3301,6 +3316,13 @@ the recorded branch and requires the old worker to be absent. A wait names its r
 check within five minutes. Owner escalation must identify the actual decision and choices.
 An uncertain helper launch retains its marker across reloads; timeout is not cancellation and
 never permits a second blind launch. Late matching helpers are retired, not implementation roots.
+The reservation is bounded: an agent carrying the marker, archived ones included, settles the
+launch; without one, the marker is released once the deadline plus five minutes has passed and a
+complete listing of the ticket's agents (archived included) carries no agent with it. The
+diagnostic then finishes (its outcome, plus a `launch-unknown` count) and a ticket that did not
+advance asks for the next bounded diagnosis. A listing that cannot be fully read never releases
+it; the owner is told instead. A new helper is still refused while any recovery helper of the
+ticket lives.
 
 The browser flow exposes recovery-control health, overdue checks, unattended age, responsible
 generation, last advancement and recovery outcomes. These are operational signals, not proof that

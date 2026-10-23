@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { test, type TestContext } from "node:test";
 import {
   calendarDate, classifyTicket, DEFECT_GRACE_MS, DoneTickets, isDefect, parseVerdict, Steward, StewardStateError, StewardStore, STEWARD_ACTION, STEWARD_SITUATIONS, STEWARD_STATES, STEWARD_VERIFIER_LABEL,
-  RESTART_CAP, type StewardDeps, type StewardFacts, type StewardSituation,
+  RESTART_CAP, STEWARD_WINDOW_MS, type StewardDeps, type StewardFacts, type StewardSituation,
 } from "./steward";
 import type { ParentProgress } from "./parents";
 import { ManualTasks, type ManualTask } from "./manual-tasks";
@@ -15,7 +15,7 @@ import { TicketStarter } from "./starter";
 import type { Launcher } from "./launch";
 import { detailSchema } from "../shared/contracts";
 import type { WatchdogFile } from "./watchdog";
-import { SessionRouter, SessionStore, type HostOwnership } from "./sessions";
+import { SessionRouter, SessionStore, type HostOwnership, type Succession } from "./sessions";
 import { hostname } from "node:os";
 import { stageEvidence } from "./recovery-diagnostic";
 import { NeedsYouIssues } from "./needs-you";
@@ -326,6 +326,8 @@ async function passFixture(t: any, over: {
   records?: any[];
   pullStates?: Map<string, any>;
   freshOpenPulls?: (urls: string[]) => Promise<{ open: string[]; unreadable: boolean }>;
+  // A listing whose pages cannot be followed: it proves no agent absent.
+  unpaged?: boolean;
   cap?: number;
   clockNow?: number;
   verdicts?: (issueId: string) => Promise<any[]>;
@@ -382,14 +384,17 @@ async function passFixture(t: any, over: {
   const fail = { complete: false, escalate: false };
   // The roots map is the fixture's own object: a test can give a ticket an agent between passes.
   const roots = over.roots ?? new Map<string, any>();
-  // A Paseo whose every listing is empty and whose agents answer like the real API: the steward
-  // reads its ticket's agents and archives the ones it is done with through it.
-  const page = () => ({ entries: [], pageInfo: { hasMore: false }, nextCursor: null });
+  // A Paseo whose listing is `over.listing` (archived agents only when asked for) and whose agents
+  // answer like the real API: the steward reads its ticket's agents and archives the ones it is done
+  // with through it.
   const paseo: any = {
     agents: {
-      list: async () => ({ ...page(), entries: (over.listing ?? []).map((agent) => ({ agent })) }),
+      list: async (input?: { filter?: { includeArchived?: boolean } }) => ({
+        entries: (over.listing ?? []).filter((agent) => input?.filter?.includeArchived || !agent.archivedAt).map((agent) => ({ agent })),
+        ...(over.unpaged ? {} : { pageInfo: { hasMore: false } }),
+      }),
       ref: (agentId: string) => ({
-        refresh: async () => ({ agent: { id: agentId, archivedAt: null, updatedAt: new Date(clock.now).toISOString(), labels: over.listing?.find((agent) => agent.id === agentId)?.labels ?? (agentId === "v1" ? calls.startOptions.at(-1)?.labels : {}) } }),
+        refresh: async () => ({ agent: { id: agentId, archivedAt: over.listing?.find((agent) => agent.id === agentId)?.archivedAt ?? null, updatedAt: new Date(clock.now).toISOString(), labels: over.listing?.find((agent) => agent.id === agentId)?.labels ?? (agentId === "v1" ? calls.startOptions.at(-1)?.labels : {}) } }),
         archive: async () => { calls.archives.push(agentId); over.onArchive?.(agentId); },
       }),
     },
@@ -716,6 +721,23 @@ test("the per-pass cap spreads heavy actions over passes, deterministically", as
   assert.deepEqual(f.calls.restarts, ["i1", "i2"], "the next pass takes the ticket the cap deferred");
 });
 
+test("a ticket whose action keeps deferring does not take the per-pass cap from the tickets behind it", async (t) => {
+  const ids = ["i1", "i2", "i3"];
+  const f = await passFixture(t, {
+    issues: ids.map((id, index) => ticketIssue({ id, identifier: `ENG-${index + 1}` })),
+    records: ids.map((id, index) => recordFor(id, `ENG-${index + 1}`)),
+    restart: async () => ({ kind: "deferred", reason: "Queued: 50 of 50 agents are running." }),
+    cap: 1,
+    clockNow: T0,
+  });
+  for (const [index, id] of ids.entries()) await f.seed(id, `ENG-${index + 1}`, { situation: "stalled", since: at(120) });
+  for (let pass = 0; pass < 3; pass++) {
+    await f.pass(1);
+    f.clock.now += 5 * 60_000;
+  }
+  assert.deepEqual(f.calls.restarts, ["i1", "i2", "i3"], "each pass's one slot goes to the ticket the steward acted on longest ago");
+});
+
 // The registry read is the pass's, not each ticket's: every candidate carries the agent snapshot
 // the pass already read for classification, so N tickets cost the same read as one. The snapshot's
 // roots still pick the ticket's own newest live agent — not a verifier, not a sub-agent, not a
@@ -932,6 +954,58 @@ test("a successor continues the pull request that is still open, not a stale one
   assert.equal(leads.length, 1);
   assert.match(leads[0], /open pull request https:\/\/github\.com\/o\/r\/pull\/3869/);
   assert.doesNotMatch(leads[0], /3868/, "the closed pull request is not the successor's work");
+});
+
+// TUC-945/204/941 on server087: a successor refused once for "no branch is recorded" escalated
+// with the situation as its key, and that key froze the ticket for days after the agent recorded
+// its branch. A failed action's escalation lapses after the steward window; its one retry renews
+// the hold, so the retry is once per window and the owner is not asked twice.
+test("an escalated failed successor is retried once per steward window, not frozen and not re-asked", async (t) => {
+  const url = "https://github.com/o/r/pull/3869";
+  let outcome: Succession = { kind: "impossible", reason: "no branch is recorded for the ticket" };
+  const f = await passFixture(t, {
+    issues: [ticketIssue()],
+    records: [recordFor("i1", "ENG-1", [url])],
+    pullStates: new Map([[url, pull(url)]]),
+    succeed: async () => outcome,
+    clockNow: T0,
+  });
+  await f.seed("i1", "ENG-1", { situation: "open-pr", since: at(60), escalated: { key: "open-pr", signature: "open-pr:No branch recorded", at: at(30) } });
+  await f.pass();
+  assert.deepEqual(f.calls.successions, [], "inside the window the owner's question holds");
+
+  f.clock.now += STEWARD_WINDOW_MS;
+  await f.pass();
+  assert.deepEqual(f.calls.successions, ["i1"], "a lapsed escalation lets the successor be tried again");
+  assert.deepEqual(f.calls.escalates, [], "the same refusal does not ask the owner again");
+  assert.equal((await f.ticket("i1"))?.escalated?.at, new Date(f.clock.now).toISOString(), "it renews the hold instead");
+  f.clock.now += 30 * 60_000;
+  await f.pass();
+  assert.deepEqual(f.calls.successions, ["i1"], "the renewed hold stops a retry every pass");
+
+  outcome = { kind: "started", agent: { id: "a10", title: null, cwd: "" } };
+  f.clock.now += STEWARD_WINDOW_MS;
+  await f.pass();
+  assert.deepEqual(f.calls.successions, ["i1", "i1"], "once the branch is recorded the next window's retry starts the successor");
+});
+
+test("a steward successor is labelled a CI repair only while the open pull request's recorded checks fail", async (t) => {
+  const url = "https://github.com/o/r/pull/7";
+  for (const [ci, expected] of [['[["Graphite / mergeability_check","failed","failure"],["unit","failed","failure"]]', "ci"], ['[["Graphite / mergeability_check","failed","failure"],["unit","passed","success"]]', null], [null, null]] as const) {
+    const repairs: (string | null)[] = [];
+    const f = await passFixture(t, {
+      issues: [ticketIssue()],
+      records: [recordFor("i1", "ENG-1", [url])],
+      pullStates: new Map([[url, pull(url, { ci })]]),
+      succeed: async (...args: Parameters<SessionRouter["succeed"]>) => {
+        repairs.push(args[5] ?? null);
+        return { kind: "started", agent: { id: "a10", title: null, cwd: "" } };
+      },
+    });
+    await f.seed("i1", "ENG-1", { situation: "open-pr", since: at(60) });
+    await f.pass();
+    assert.deepEqual(repairs, [expected], `ci ${ci}: the queue check alone is no repair the agent can do`);
+  }
 });
 
 test("a verdict never starts a successor beside a deliberate wait", async (t) => {
@@ -1755,6 +1829,47 @@ function diagnosticSeed(issue: StewardIssue, overrides: Record<string, unknown> 
 }
 
 const diagnosticHelper = () => ({ id: "helper", status: "running", labels: { "linear-tickets.steward": "diagnostic-test", "linear.coordination": "recovery-diagnostic", "paseo.parent-agent-id": "steward-diagnostic" }, createdAt: at(0) });
+
+test("a diagnostic create whose outcome never arrived releases its marker only after its deadline and reaction window, on a complete listing", async (t) => {
+  const issue = ticketIssue();
+  const pending = { marker: "diagnostic-test", generation: "generation-1", host: hostname(), agentId: null, at: at(0), deadline: new Date(T0 + 5 * 60_000).toISOString(), reason: "No advancement", state: "launching", launchPending: true };
+  const run = async (clockNow: number, advanced: boolean, over: { listing?: any[]; unpaged?: boolean } = {}) => {
+    const f = await passFixture(t, { issues: [issue], clockNow, ...over });
+    const seed = diagnosticSeed(issue, { diagnostic: pending });
+    await f.seed("i1", "ENG-1", { ...seed, responsibility: { ...seed.responsibility, lastVerifiedAdvancementAt: advanced ? new Date(T0 + 60_000).toISOString() : null } });
+    await f.pass();
+    return { f, ticket: (await f.ticket("i1"))! };
+  };
+  const RESERVED = "Diagnostic create outcome unknown; original marker remains reserved";
+  const early = await run(T0 + 9 * 60_000, true);
+  assert.equal(early.ticket.diagnostic?.launchPending, true, "inside the reaction window the create may still land");
+  assert.equal(early.ticket.responsibility?.waitReason, RESERVED);
+
+  const released = await run(T0 + 11 * 60_000, true);
+  assert.equal(released.ticket.diagnostic?.state, "done", "the ticket advanced and no agent ever carried the marker");
+  assert.equal(released.ticket.diagnostic?.outcome, "advanced");
+  assert.equal(released.ticket.recoveryOutcomes?.["launch-unknown"], 1);
+  assert.notEqual(released.ticket.responsibility?.waitReason, RESERVED);
+  assert.deepEqual([released.f.calls.startOptions.length, released.f.calls.archives, released.f.calls.escalates], [0, [], []]);
+
+  const archived = await run(T0 + 2 * 60_000, true, { listing: [{ ...diagnosticHelper(), archivedAt: at(-1) }] });
+  assert.equal(archived.ticket.diagnostic?.state, "done", "an archived helper with the marker settles the create's outcome");
+  assert.equal(archived.ticket.recoveryOutcomes?.["launch-unknown"], undefined);
+  assert.deepEqual(archived.f.calls.archives, [], "it is not archived again");
+
+  const blind = await run(T0 + 11 * 60_000, true, { unpaged: true });
+  assert.equal(blind.ticket.diagnostic?.launchPending, true, "a listing that cannot be followed proves nothing absent");
+  assert.equal(blind.ticket.responsibility?.waitReason, RESERVED);
+
+  const stuck = await run(T0 + 11 * 60_000, false);
+  assert.equal(stuck.ticket.diagnostic?.outcome, "launch-unknown", "without advancement the deadline path finishes it too");
+  assert.equal(stuck.ticket.diagnosticRequested, "Bounded diagnosis produced no usable verdict", "and asks for the next bounded diagnosis");
+  assert.deepEqual(stuck.f.calls.escalates, []);
+
+  const stuckBlind = await run(T0 + 11 * 60_000, false, { unpaged: true });
+  assert.equal(stuckBlind.ticket.diagnostic?.launchPending, true);
+  assert.equal(stuckBlind.f.calls.escalates.length, 1, "the owner hears when absence cannot be proven");
+});
 
 test("a retired replacement is queued, not evidence that the ticket is moving", () => {
   assert.equal(classifyTicket(facts({ live: false, watchdog: "queued" })), "queued");

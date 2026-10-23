@@ -26,11 +26,13 @@ import {
   type ActionRecord, type DropClass, type DropJudgment, type GitRunner, type PreparedRetarget, type Problem, type Refusal, type RetargetRecord, type RetriggerRun, type ScriptRunner,
 } from "./queue-backstop";
 import { githubBudget, GitHubPausedError, GitHubRateLimitedError, RateLimitedError, refusalHeaders, refusalOf, utcClock, withPriority, type GitHubBudget } from "./rate-budget";
-import { crashResume, unverifiedResume, type PromptOutcome, type Recovery, type SessionRouter, type Succession } from "./sessions";
+import { crashResume, unverifiedResume, type PromptOutcome, type Recovery, type RepairKind, type SessionRouter, type Succession } from "./sessions";
 import type { Settings } from "./settings";
 import { paseoHome } from "./ticket-mcp";
 import type { Watchdog } from "./watchdog";
 
+// The repair label a successor started for a stalled step carries (sessions.ts REPAIR_LABEL).
+const STAGE_REPAIR: Record<Stage, RepairKind> = { draft: "draft", red: "ci", conflict: "conflict", changes: "changes", findings: "findings" };
 const INTERVAL_MS = 2 * 60 * 1000;
 // The queue backstop (see queueBackstop) runs this often, and right after a poll claimed a drop
 // it re-enqueues.
@@ -3217,7 +3219,7 @@ export class PullRequestWatch {
         if (outcome === "crashed" && !this.crashOf(record)?.successor) return;
         gone = outcome === "gone";
       }
-      const next = gone ? await this.succession(record, labels, fix, toAgent) : null;
+      const next = gone ? await this.succession(record, labels, fix, toAgent, "drop") : null;
       if (next?.kind === "started") {
         await delivered().catch((error: unknown) => console.error(`[linear-tickets] ${record.identifier}: recording the drop of ${url} as delivered failed: ${error instanceof Error ? error.message : error}`));
         await this.succeeded(record, next.agent, reserved, step);
@@ -3374,7 +3376,7 @@ export class PullRequestWatch {
         else if (outcome !== "crashed") await this.crashLine(record, outcome, STAGE_STEP[stage]);
         if (outcome !== "gone") return true;
       }
-      const next = await this.succession(record, view.labels, prompt, toAgent);
+      const next = await this.succession(record, view.labels, prompt, toAgent, STAGE_REPAIR[stage]);
       if (next?.kind === "started") {
         // The claim stands: what follows the start is only logged when it fails.
         claimed = false;
@@ -3472,7 +3474,7 @@ export class PullRequestWatch {
         if (outcome === "crashed" && !this.crashOf(record)?.successor) return;
         gone = outcome === "gone";
       }
-      const next = gone ? await this.succession(record, view.labels, text, toAgent) : null;
+      const next = gone ? await this.succession(record, view.labels, text, toAgent, "replay") : null;
       if (next?.kind === "started") {
         // The claim stands: what follows the start is only logged when it fails.
         claimed = false;
@@ -4218,10 +4220,11 @@ export class PullRequestWatch {
   // the pull request (`do-not-merge`); else null and the caller hands it back. `claim` runs right
   // before the start, so a claimed message never starts a second successor. `wait` and `live`
   // claim nothing: the message is judged again on the next poll, which reads the record `live`
-  // moved to the running agent. `impossible` is handed back too.
-  private async succession(record: HandoverRecord, labels: string[], lead: string, claim: () => Promise<void>): Promise<Succession | null> {
+  // moved to the running agent. `impossible` is handed back too. `repair` names the broken step a
+  // started successor is for (sessions.ts REPAIR_LABEL); a crash or policy successor has none.
+  private async succession(record: HandoverRecord, labels: string[], lead: string, claim: () => Promise<void>, repair: RepairKind | null = null): Promise<Succession | null> {
     if (!(await this.deps.settings.read()).writeback.autoResume || labels.includes(DO_NOT_MERGE_LABEL)) return null;
-    const next = await this.deps.sessions.succeed(record.issueId, record.identifier, record.agentId, lead, claim);
+    const next = await this.deps.sessions.succeed(record.issueId, record.identifier, record.agentId, lead, claim, repair);
     const gone = record.agentId ? `gone agent ${record.agentId.slice(0, 8)}` : "the ticket without an agent";
     if (next.kind === "wait") console.log(`[linear-tickets] ${record.identifier}: the message for ${gone} waits for a successor: ${next.reason}`);
     else if (next.kind === "live") console.log(`[linear-tickets] ${record.identifier}: live agent ${next.agent.id.slice(0, 8)} took over the record of ${gone}; it gets the message on the next poll`);

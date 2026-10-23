@@ -256,8 +256,9 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
     idle: async () => "ran",
   };
   const calls: string[] = [];
-  // Every successor start asked for, as `<issue id> <predecessor>`.
+  // Every successor start asked for, as `<issue id> <predecessor>`, and the repair label it asked for.
   const successions: string[] = [];
+  const repairs: (string | null)[] = [];
   const daemon = agent.crash ? crashDaemon(t, calls) : null;
   // This host's Paseo server id, as the tickets' `Paseo agent` attachments name it (see ownership).
   const server = { id: "srv_test" };
@@ -284,8 +285,9 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
         return outcome;
       },
       crashed: async (agentId) => daemon ? daemon.router.crashed(agentId) : null,
-      succeed: async (_issueId, _identifier, predecessor, lead, onDispatch) => {
+      succeed: async (_issueId, _identifier, predecessor, lead, onDispatch, repair) => {
         successions.push(`${_issueId} ${predecessor}`);
+        repairs.push(repair ?? null);
         const next = await paseo.succeed(onDispatch);
         if (next.kind === "started") calls.push(`succeed ${predecessor}\n${lead}`);
         if (next.kind === "started" || next.kind === "live") records[0] = { ...records[0], agentId: next.agent.id, agentTitle: next.agent.title ?? "", status: "working" };
@@ -509,7 +511,7 @@ function harness(t: TestContext, agent: { status?: HandoverRecord["status"]; liv
   };
   // The stack policy's state file (caps and reopens), read as is (empty before the first write).
   const policyFile = async () => readFile(join(await directory, "stack-policy.json"), "utf8").catch(() => "");
-  return { github, git, linear, paseo, daemon: daemon!, records, blockers, gate, calls, successions, scripts, poll, backstop, restart, state, crashFile, policyFile, waits, server, home: () => directory, watch: () => watch };
+  return { github, git, linear, paseo, daemon: daemon!, records, blockers, gate, calls, successions, repairs, scripts, poll, backstop, restart, state, crashFile, policyFile, waits, server, home: () => directory, watch: () => watch };
 }
 
 test("a pull request the merge queue closed with the externally-merged label counts as merged and releases after-merge tasks", async (t) => {
@@ -2466,6 +2468,7 @@ test("a crashed agent is restarted at once, then after its backoff, and the cras
   assert.match(succeeded[0], /^succeed a1\nYour previous run crashed \(`OMP RPC process is closed`\), and Paseo restarted you\.[\s\S]*Continue the lifecycle step you were on\.$/);
   assert.equal(succeeded[1], `say thought The agent crashed 3 times in all; Paseo started a successor (agent s2a2b3c4) and asked it to resume and continue the step it was on.`);
   assert.equal(h.records[0].agentId, SUCCESSOR.id, "the record names the successor");
+  assert.equal(h.repairs.at(-1), null, "a crash successor resumes its step; it is not a repair");
   assert.ok(JSON.parse(await h.crashFile()).a1.successor, "marked: this session is never restarted again");
   h.daemon.agent = RESTARTED;
   assert.deepEqual(await h.poll(), [], "no restart, no owner comment, no further message");
@@ -3041,6 +3044,7 @@ test("a gone agent's stalled stage starts one successor with the nudge as its le
     assert.equal(calls[1], STARTED_LINE("fix the failing checks"));
     assert.equal(calls.length, 2, JSON.stringify(agent));
     assert.equal(h.records[0].agentId, SUCCESSOR.id, "the record names the successor");
+    assert.equal(h.repairs.at(-1), "ci", "a successor for failing checks is a CI repair");
     h.paseo.answer = async () => "sent";
     h.paseo.succeed = async () => { throw new Error("no second successor"); };
     assert.deepEqual(await h.poll(), [], "the claimed head is not sent again, to the successor either");
@@ -3100,6 +3104,7 @@ test("a gone agent's queue drop stays pending while no successor can start yet, 
   assert.match(calls[0], /^succeed a1\n[^]*Reason: Sep 29, 7:01 AM UTC: The Graphite merge queue couldn't merge this PR because it had merge conflicts\./);
   assert.equal(calls[1], STARTED_LINE("fix the merge queue drop"));
   assert.equal(calls.length, 2);
+  assert.deepEqual(h.repairs, ["drop", "drop", "drop"], "every attempt for the drop asks for the drop label");
   assert.deepEqual(await h.poll(), [], "delivered");
   await h.restart();
   assert.deepEqual(await h.poll(), [], "also after a restart");
@@ -3116,6 +3121,7 @@ test("a gone agent's replay request starts a successor and the closed pull reque
   const calls = await h.poll();
   assert.match(calls[0], new RegExp(`^succeed a1\\n\\[The pull request\\]\\(${PR}\\) was closed without merging[^]*gt track mtuchel/tuc-1-fix --parent main`));
   assert.equal(calls[1], STARTED_LINE("open the replacement pull request"));
+  assert.deepEqual(h.repairs, ["replay"]);
   h.paseo.succeed = async () => { throw new Error("no second successor"); };
   assert.deepEqual(await h.poll(), [], "asked once");
   h.github.open = [listed(NEXT, OPEN_PR)];
