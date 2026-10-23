@@ -326,6 +326,8 @@ async function passFixture(t: any, over: {
   records?: any[];
   pullStates?: Map<string, any>;
   freshOpenPulls?: (urls: string[]) => Promise<{ open: string[]; unreadable: boolean }>;
+  // A listing whose pages cannot be followed: it proves no agent absent.
+  unpaged?: boolean;
   cap?: number;
   clockNow?: number;
   verdicts?: (issueId: string) => Promise<any[]>;
@@ -382,14 +384,17 @@ async function passFixture(t: any, over: {
   const fail = { complete: false, escalate: false };
   // The roots map is the fixture's own object: a test can give a ticket an agent between passes.
   const roots = over.roots ?? new Map<string, any>();
-  // A Paseo whose every listing is empty and whose agents answer like the real API: the steward
-  // reads its ticket's agents and archives the ones it is done with through it.
-  const page = () => ({ entries: [], pageInfo: { hasMore: false }, nextCursor: null });
+  // A Paseo whose listing is `over.listing` (archived agents only when asked for) and whose agents
+  // answer like the real API: the steward reads its ticket's agents and archives the ones it is done
+  // with through it.
   const paseo: any = {
     agents: {
-      list: async () => ({ ...page(), entries: (over.listing ?? []).map((agent) => ({ agent })) }),
+      list: async (input?: { filter?: { includeArchived?: boolean } }) => ({
+        entries: (over.listing ?? []).filter((agent) => input?.filter?.includeArchived || !agent.archivedAt).map((agent) => ({ agent })),
+        ...(over.unpaged ? {} : { pageInfo: { hasMore: false } }),
+      }),
       ref: (agentId: string) => ({
-        refresh: async () => ({ agent: { id: agentId, archivedAt: null, updatedAt: new Date(clock.now).toISOString(), labels: over.listing?.find((agent) => agent.id === agentId)?.labels ?? (agentId === "v1" ? calls.startOptions.at(-1)?.labels : {}) } }),
+        refresh: async () => ({ agent: { id: agentId, archivedAt: over.listing?.find((agent) => agent.id === agentId)?.archivedAt ?? null, updatedAt: new Date(clock.now).toISOString(), labels: over.listing?.find((agent) => agent.id === agentId)?.labels ?? (agentId === "v1" ? calls.startOptions.at(-1)?.labels : {}) } }),
         archive: async () => { calls.archives.push(agentId); over.onArchive?.(agentId); },
       }),
     },
@@ -1774,6 +1779,47 @@ function diagnosticSeed(issue: StewardIssue, overrides: Record<string, unknown> 
 }
 
 const diagnosticHelper = () => ({ id: "helper", status: "running", labels: { "linear-tickets.steward": "diagnostic-test", "linear.coordination": "recovery-diagnostic", "paseo.parent-agent-id": "steward-diagnostic" }, createdAt: at(0) });
+
+test("a diagnostic create whose outcome never arrived releases its marker only after its deadline and reaction window, on a complete listing", async (t) => {
+  const issue = ticketIssue();
+  const pending = { marker: "diagnostic-test", generation: "generation-1", host: hostname(), agentId: null, at: at(0), deadline: new Date(T0 + 5 * 60_000).toISOString(), reason: "No advancement", state: "launching", launchPending: true };
+  const run = async (clockNow: number, advanced: boolean, over: { listing?: any[]; unpaged?: boolean } = {}) => {
+    const f = await passFixture(t, { issues: [issue], clockNow, ...over });
+    const seed = diagnosticSeed(issue, { diagnostic: pending });
+    await f.seed("i1", "ENG-1", { ...seed, responsibility: { ...seed.responsibility, lastVerifiedAdvancementAt: advanced ? new Date(T0 + 60_000).toISOString() : null } });
+    await f.pass();
+    return { f, ticket: (await f.ticket("i1"))! };
+  };
+  const RESERVED = "Diagnostic create outcome unknown; original marker remains reserved";
+  const early = await run(T0 + 9 * 60_000, true);
+  assert.equal(early.ticket.diagnostic?.launchPending, true, "inside the reaction window the create may still land");
+  assert.equal(early.ticket.responsibility?.waitReason, RESERVED);
+
+  const released = await run(T0 + 11 * 60_000, true);
+  assert.equal(released.ticket.diagnostic?.state, "done", "the ticket advanced and no agent ever carried the marker");
+  assert.equal(released.ticket.diagnostic?.outcome, "advanced");
+  assert.equal(released.ticket.recoveryOutcomes?.["launch-unknown"], 1);
+  assert.notEqual(released.ticket.responsibility?.waitReason, RESERVED);
+  assert.deepEqual([released.f.calls.startOptions.length, released.f.calls.archives, released.f.calls.escalates], [0, [], []]);
+
+  const archived = await run(T0 + 2 * 60_000, true, { listing: [{ ...diagnosticHelper(), archivedAt: at(-1) }] });
+  assert.equal(archived.ticket.diagnostic?.state, "done", "an archived helper with the marker settles the create's outcome");
+  assert.equal(archived.ticket.recoveryOutcomes?.["launch-unknown"], undefined);
+  assert.deepEqual(archived.f.calls.archives, [], "it is not archived again");
+
+  const blind = await run(T0 + 11 * 60_000, true, { unpaged: true });
+  assert.equal(blind.ticket.diagnostic?.launchPending, true, "a listing that cannot be followed proves nothing absent");
+  assert.equal(blind.ticket.responsibility?.waitReason, RESERVED);
+
+  const stuck = await run(T0 + 11 * 60_000, false);
+  assert.equal(stuck.ticket.diagnostic?.outcome, "launch-unknown", "without advancement the deadline path finishes it too");
+  assert.equal(stuck.ticket.diagnosticRequested, "Bounded diagnosis produced no usable verdict", "and asks for the next bounded diagnosis");
+  assert.deepEqual(stuck.f.calls.escalates, []);
+
+  const stuckBlind = await run(T0 + 11 * 60_000, false, { unpaged: true });
+  assert.equal(stuckBlind.ticket.diagnostic?.launchPending, true);
+  assert.equal(stuckBlind.f.calls.escalates.length, 1, "the owner hears when absence cannot be proven");
+});
 
 test("a retired replacement is queued, not evidence that the ticket is moving", () => {
   assert.equal(classifyTicket(facts({ live: false, watchdog: "queued" })), "queued");

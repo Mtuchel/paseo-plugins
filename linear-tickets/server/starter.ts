@@ -263,6 +263,25 @@ export async function issueAgents(paseo: PaseoApi, issueId: string): Promise<Pas
   return agents;
 }
 
+// The ticket's agents carrying `label: value`, archived ones included, read strictly: `complete` is
+// false when any page could not be followed (no page info, a missing or repeated cursor, too many
+// pages), so an empty list proves absence only when `complete` is true.
+export async function markedAgents(paseo: PaseoApi, issueId: string, label: string, value: string): Promise<{ ids: string[]; complete: boolean }> {
+  const ids: string[] = [];
+  const cursors = new Set<string>();
+  let cursor: string | undefined;
+  for (let pageNumber = 0; pageNumber < 50; pageNumber++) {
+    const page = await paseo.agents.list({ filter: { labels: { "linear.issueId": issueId }, includeArchived: true }, page: { limit: 200, ...(cursor ? { cursor } : {}) } });
+    ids.push(...page.entries.filter((entry) => entry.agent.labels?.[label] === value).map((entry) => entry.agent.id));
+    if (!page.pageInfo) return { ids, complete: false };
+    if (!page.pageInfo.hasMore) return { ids, complete: true };
+    cursor = page.pageInfo.nextCursor ?? undefined;
+    if (!cursor || cursors.has(cursor)) return { ids, complete: false };
+    cursors.add(cursor);
+  }
+  return { ids, complete: false };
+}
+
 // Every agent of one planner run (README, "Projects"), by its `linear.plannerRun` label: a run has
 // no Linear ticket. Archived agents are not listed; subagents are filtered by the caller.
 export async function runAgents(paseo: PaseoApi, runId: string): Promise<PaseoAgent[]> {

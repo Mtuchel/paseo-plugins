@@ -24,7 +24,7 @@ import { AWAY_REASON } from "./scheduler";
 import { recordedCiFails } from "./pr-nudge";
 import type { HostOwnership, RestartResult, SessionRouter, Succession } from "./sessions";
 import type { PluginSettings, Settings } from "./settings";
-import { classifyTicketAgents, issueAgents, WAITING_PLAN_REASON, type TicketStarter } from "./starter";
+import { classifyTicketAgents, issueAgents, markedAgents, WAITING_PLAN_REASON, type TicketStarter } from "./starter";
 import { paseoHome } from "./ticket-mcp";
 import { takeLease, releaseLease, type TicketRoots, type WatchedAgent, type WatchdogFile, type WatchdogStore } from "./watchdog";
 import { NEEDS_INPUT_STATE, STEWARD_WAIT_ANCHOR, type Writeback } from "./writeback";
@@ -1425,14 +1425,21 @@ export class Steward {
     });
   }
 
-  private async finishDiagnostic(paseo: PaseoApi, issueId: string, diagnostic: RecoveryDiagnostic, outcome: string): Promise<void> {
-    const helperIds = diagnostic.agentId ? [diagnostic.agentId] : (await issueAgents(paseo, issueId)).filter((agent) => agent.labels?.[STEWARD_VERIFIER_LABEL] === diagnostic.marker).map((agent) => agent.id);
-    // A timed-out create is not a cancelled create. Keep its original marker reserved until
-    // an exact helper is discovered or the transport returns its identity, across reloads.
-    if (!helperIds.length && (diagnostic.launchPending || diagnostic.state === "launching")) {
+  // Whether the diagnostic finished: false while a pending create may still land (see below).
+  private async finishDiagnostic(paseo: PaseoApi, issueId: string, diagnostic: RecoveryDiagnostic, outcome: string): Promise<boolean> {
+    const pending = !diagnostic.agentId && (diagnostic.launchPending || diagnostic.state === "launching");
+    const listed = diagnostic.agentId ? { ids: [diagnostic.agentId], complete: true } : await markedAgents(paseo, issueId, STEWARD_VERIFIER_LABEL, diagnostic.marker);
+    // A timed-out create is not a cancelled create: its original marker stays reserved until an
+    // agent carrying it (archived included) is found, across reloads. Without one it is released
+    // only once the create can no longer land unseen — its deadline plus the reaction window — and
+    // a complete listing proves no agent carries it; an unreadable listing never releases it. A
+    // new diagnostic still refuses beside any live recovery helper (see the launch below).
+    const unconfirmed = pending && !listed.ids.length;
+    if (unconfirmed && (!listed.complete || this.clock() < Date.parse(diagnostic.deadline) + RECOVERY_REACTION_MS)) {
       await this.diagnosticWait(issueId, "Diagnostic create outcome unknown; original marker remains reserved", "Find and retire the original diagnostic helper");
-      return;
+      return false;
     }
+    const helperIds = listed.ids;
     for (const id of helperIds) {
       const helper = await paseo.agents.ref(id).refresh();
       if (helper && !helper.agent.archivedAt) {
@@ -1447,9 +1454,11 @@ export class Steward {
       ticket.diagnosticRequested = null;
       ticket.recoveryOutcomes ??= {};
       ticket.recoveryOutcomes[outcome] = (ticket.recoveryOutcomes[outcome] ?? 0) + 1;
+      if (unconfirmed && outcome !== "launch-unknown") ticket.recoveryOutcomes["launch-unknown"] = (ticket.recoveryOutcomes["launch-unknown"] ?? 0) + 1;
       if (outcome === "replaced") ticket.recoveryObservation = { key: diagnostic.marker, at: this.iso() };
-      ticket.log = [...ticket.log, { at: this.iso(), action: `diagnostic: ${outcome}` }].slice(-LOG_LIMIT);
+      ticket.log = [...ticket.log, { at: this.iso(), action: `diagnostic: ${outcome}${unconfirmed ? " (its launch was never confirmed; marker released)" : ""}` }].slice(-LOG_LIMIT);
     });
+    return true;
   }
 
   private async recovery(paseo: PaseoApi, settings: PluginSettings, names: DispatchLabels & { trigger: string }, candidate: Candidate, pass: Pass, now: number): Promise<boolean> {
@@ -1501,8 +1510,15 @@ export class Steward {
       const read = this.deps.verdicts ?? ((issueId: string) => readVerdicts(join(paseoHome(), "linear-tickets", STEWARD_VERDICT_DIRECTORY, issueId)));
       const verdict = (await read(issue.id)).map(parseVerdict).find((entry): entry is StewardVerdict => entry !== null && entry.issueId === issue.id && entry.verifier === diagnostic!.marker && Date.parse(entry.at) >= Date.parse(diagnostic!.at) && Date.parse(entry.at) <= Math.min(now, Date.parse(diagnostic!.deadline)) && ["continue", "replace", "wait", "ask_owner"].includes(entry.verdict));
       if (!diagnostic.agentId && (diagnostic.launchPending || diagnostic.state === "launching") && now >= Date.parse(diagnostic.deadline)) {
+        if (now >= Date.parse(diagnostic.deadline) + RECOVERY_REACTION_MS) {
+          if (await this.finishDiagnostic(paseo, issue.id, diagnostic, "launch-unknown")) {
+            await this.requestDiagnosis(issue, "Bounded diagnosis produced no usable verdict");
+            return true;
+          }
+          await this.escalate(candidate, "Read-only diagnostic launch and bounded reconciliation have no confirmed outcome, and the ticket's agents cannot be fully listed. Its original marker stays reserved; another launch could duplicate it.");
+          return true;
+        }
         await this.diagnosticWait(issue.id, "Diagnostic create outcome unknown; do not repeat the launch", "Find the original diagnostic marker");
-        if (now >= Date.parse(diagnostic.deadline) + RECOVERY_REACTION_MS) await this.escalate(candidate, "Read-only diagnostic launch and bounded reconciliation have no confirmed outcome. Its original marker stays reserved; another launch could duplicate it.");
         return true;
       }
       if (!verdict) {

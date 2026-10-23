@@ -3310,6 +3310,13 @@ the recorded branch and requires the old worker to be absent. A wait names its r
 check within five minutes. Owner escalation must identify the actual decision and choices.
 An uncertain helper launch retains its marker across reloads; timeout is not cancellation and
 never permits a second blind launch. Late matching helpers are retired, not implementation roots.
+The reservation is bounded: an agent carrying the marker, archived ones included, settles the
+launch; without one, the marker is released once the deadline plus five minutes has passed and a
+complete listing of the ticket's agents (archived included) carries no agent with it. The
+diagnostic then finishes (its outcome, plus a `launch-unknown` count) and a ticket that did not
+advance asks for the next bounded diagnosis. A listing that cannot be fully read never releases
+it; the owner is told instead. A new helper is still refused while any recovery helper of the
+ticket lives.
 
 The browser flow exposes recovery-control health, overdue checks, unattended age, responsible
 generation, last advancement and recovery outcomes. These are operational signals, not proof that
