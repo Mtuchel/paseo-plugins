@@ -2024,7 +2024,9 @@ the ticket itself changing, or a deleted ticket, shows up with the next full rea
   and no ghost: see **Ghost agents**). For failures other than provider rate/usage limits, ten
   minutes after its last start without one, the plugin starts another agent for the same run;
   its stopped agents are archived. A start that cannot succeed (no project mapped, no provider
-  chosen) leaves the run to you right away instead of retrying. After three ordinary restarts
+  chosen) leaves the run to you right away instead of retrying. A start refused because a repair
+  holds the ticket or Linear's budget is paused counts as no start: the next read tries again
+  without spending a restart. After three ordinary restarts
   without a live agent the plugin posts one update on the project, marked at risk, and stops:
   press Plan in the menu bar app to start again, or Skip to hand the tickets out without an order.
   Every start and restart is kept with the project's record in `projects.json`, and a late

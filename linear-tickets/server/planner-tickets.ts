@@ -6,6 +6,7 @@ import { availability, LIMIT_DAY, LIMIT_SPACING, limitError, limitSchedule, limi
 import { SetupError } from "./launch";
 import { activeModel } from "./model";
 import type { ProcessInspector } from "./process-liveness";
+import { RateLimitedError } from "./rate-budget";
 import { RepairBusyError } from "./repair-exclusion";
 import type { PluginSettings } from "./settings";
 import type { TicketAgents } from "./starter";
@@ -364,13 +365,15 @@ export class PlannerTickets<State extends PlannerHolder> {
     try {
       agentId = (await target.start({ runId: run.id, requestId, brief }, paseo, settings)).agentId;
     } catch (error) {
-      if (error instanceof RepairBusyError) {
-        // Nothing was created: undo this attempt's restart count and grace start so the next pass
-        // tries again instead of spending the restart budget the owner is asked about.
+      if (error instanceof RepairBusyError || error instanceof RateLimitedError) {
+        // A repair holding the ticket, or Linear's budget refusing the start's reads or writes, is
+        // transient: undo this attempt's restart count and grace start so the next pass tries again
+        // instead of spending the restart budget the owner is asked about. An agent the start
+        // created before the refusal is adopted by the next pass before anything is started.
         await this.store.update(run.id, (record, current) => current.startedAt === attemptAt
           ? { ...record, planner: { ...current, restarts: run.restarts, startedAt: run.startedAt } }
           : null);
-        console.log(`[linear-tickets] ${target.label}: the planner start waits for a repair; the next pass retries`);
+        console.log(`[linear-tickets] ${target.label}: the planner start waits (${message(error)}); the next pass retries`);
         return;
       }
       if (error instanceof SetupError) {
