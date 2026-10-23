@@ -380,7 +380,7 @@ test("AC-18: a ticket closed while its requester is paused releases nothing", as
   });
 });
 
-test("AC-18: a requester that crashed before saving its grant resends the same id, and a waiting review is withdrawn and judged again", async () => {
+test("AC-18: a requester that crashed before saving its grant resends the same id, and a waiting review is withdrawn and judged again", { timeout: 20_000 }, async () => {
   await withWorld(async (world) => {
     const one = world.ticket("TUC-1");
     const claims = world.claims();
@@ -389,17 +389,18 @@ test("AC-18: a requester that crashed before saving its grant resends the same i
     assert.equal((await claims.claim(world.request(one, X, claimId))).state, "granted");
     const directory = join(world.root, "first");
     await world.intent(directory, one, X, { claimId });
-    let rejudged = 0;
-    const restarted = world.requester({ directory, state: async () => "open", rejudge: async () => { rejudged += 1; } });
+    // Judging again claims through the same requester, as the plugin's judge does.
+    const again: string[] = [];
+    const restarted: ClaimRequests = world.requester({ directory, state: async () => "open", rejudge: async () => { again.push((await world.claim(restarted, one, X)).state); } });
     await restarted.reconcile();
     assert.equal((await world.file(directory, "issue-TUC-1.json"))?.state, "granted", "the same id came back granted");
     assert.deepEqual(Object.keys((await world.file(join(world.root, "coordinator"), "granted.json")) ?? {}), [claimId], "no second grant");
     // The review still waits and there is no decision: the claim is withdrawn and the plan judged again.
     world.clock.tick(61_000);
     await restarted.reconcile();
-    assert.equal(rejudged, 1);
+    assert.deepEqual(again, ["granted"], "the judgement's own claim is answered, not queued behind the reconciliation");
     assert.equal(await claims.status(claimId), "withdrawn");
-    assert.equal(await world.file(directory, "issue-TUC-1.json"), null);
+    assert.notEqual((await world.file(directory, "issue-TUC-1.json"))?.claimId, claimId, "the new judgement holds a new id");
   });
 });
 

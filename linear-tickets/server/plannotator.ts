@@ -265,6 +265,9 @@ export class PlannotatorBridge {
   // The approval coordinator (README, "Plan risk and auto-approval"): a plan that would otherwise be
   // auto-approved claims it first; owner approvals leave through its outbox.
   private claims: Pick<ClaimRequests, "claim" | "committed" | "ownerApproval" | "reconcile" | "holder"> | null = null;
+  // Reviews with a judgement in flight: a granted claim reaches `journal.begin` only after more
+  // awaits, and reconciliation must not withdraw it meanwhile (claimReviewState answers `pending`).
+  private readonly judging = new Map<string, number>();
   // Reviews already opened on this machine, so a retried event does not open a second tab.
   private readonly shown = new Set<string>();
   // Where the owner's review feedback is kept for the weekly decision candidates (owner-decisions.ts).
@@ -699,7 +702,22 @@ export class PlannotatorBridge {
   // approval it had when nothing else changed. A planner run's work order never comes here
   // (deliverWorkOrder). The approval is journaled before Plannotator is told.
   // null: the plan has no readable rating.
-  private async judge(review: ReviewGeneration, localUrl: string, agentId: string, issueId: string, planText: string, settings: PluginSettings): Promise<Judgement | null> {
+  private judge(review: ReviewGeneration, localUrl: string, agentId: string, issueId: string, planText: string, settings: PluginSettings): Promise<Judgement | null> {
+    return this.whileJudging(review.id, () => this.judgeNow(review, localUrl, agentId, issueId, planText, settings));
+  }
+
+  private async whileJudging<T>(reviewId: string, work: () => Promise<T>): Promise<T> {
+    this.judging.set(reviewId, (this.judging.get(reviewId) ?? 0) + 1);
+    try {
+      return await work();
+    } finally {
+      const left = (this.judging.get(reviewId) ?? 1) - 1;
+      if (left) this.judging.set(reviewId, left);
+      else this.judging.delete(reviewId);
+    }
+  }
+
+  private async judgeNow(review: ReviewGeneration, localUrl: string, agentId: string, issueId: string, planText: string, settings: PluginSettings): Promise<Judgement | null> {
     // A replayed `opened` event: the review's decision is in the journal already.
     const decided = this.journal.attempts(review.id).find((attempt) => attempt.state !== "void");
     if (decided) return { approved: decided.approved, line: decided.approved ? "Approved; the decision is being applied." : "Sent back; the decision is being applied.", reasons: [] };
@@ -753,8 +771,10 @@ export class PlannotatorBridge {
 
   // What became of a claimed plan's review (approval-claims.ts, reconciliation): its own decision
   // with this plan's document written; a decision with another plan; a decision still being applied;
-  // the review still waiting; or gone with nothing recorded. `null` when this host cannot list it.
+  // the review still waiting; or gone with nothing recorded. `pending` while this instance does not
+  // hold the loaded journal, or a judgement of the review is still on its way to the journal.
   async claimReviewState(record: ClaimIntent): Promise<ClaimReviewState> {
+    if (!this.journal.active || this.judging.has(record.reviewId)) return "pending";
     const attempts = this.journal.attempts(record.reviewId);
     const applied = attempts.filter((attempt) => attempt.state === "applied");
     if (applied.length) return applied.some((attempt) => attempt.approved && attempt.planHash === record.planHash) ? "applied" : "other";
@@ -795,19 +815,21 @@ export class PlannotatorBridge {
       const hosted = this.journal.latestReview(parked.agentId, { parked: true });
       const review = hosted && hosted.openedAt >= parked.parkedAt ? hosted : await this.journal.ensureReview({ agentId: parked.agentId, localUrl: `parked:${parked.issueId}`, openedAt: parked.parkedAt, parked: true, planHash: planHash(parked.plan), legacy: true });
       const roundStartedAt = parked.roundStartedAt ?? await this.roundStart(parked.agentId) ?? parked.parkedAt;
-      const claim = this.claims ? await this.claims.claim({ issueId: parked.issueId, identifier: parked.identifier, planHash: planHash(parked.plan), footprint: planFootprint(parked.plan, parked.identifier), roundStartedAt, agentId: parked.agentId, localUrl: review.localUrl, reviewId: review.id, parked: true }) : { state: "granted" as const };
-      if (claim.state === "granted") {
-        try {
-          await this.journal.begin({ review, agentId: parked.agentId, planContent: parked.plan, approved: true, feedback: `Auto-approved by the risk policy. ${rating}`, source: "risk-policy", state: "pending", snapshot: await this.snapshot(parked.agentId, review) });
-          console.log(`[linear-tickets] ${parked.identifier}: parked plan auto-approved once its advisor review was recorded (${rating})`);
-        } catch (error) {
-          // The owner decided it meanwhile: theirs stands.
-          if (!(error instanceof DecisionPendingError)) throw error;
+      await this.whileJudging(review.id, async () => {
+        const claim = this.claims ? await this.claims.claim({ issueId: parked.issueId, identifier: parked.identifier, planHash: planHash(parked.plan), footprint: planFootprint(parked.plan, parked.identifier), roundStartedAt, agentId: parked.agentId, localUrl: review.localUrl, reviewId: review.id, parked: true }) : { state: "granted" as const };
+        if (claim.state === "granted") {
+          try {
+            await this.journal.begin({ review, agentId: parked.agentId, planContent: parked.plan, approved: true, feedback: `Auto-approved by the risk policy. ${rating}`, source: "risk-policy", state: "pending", snapshot: await this.snapshot(parked.agentId, review) });
+            console.log(`[linear-tickets] ${parked.identifier}: parked plan auto-approved once its advisor review was recorded (${rating})`);
+          } catch (error) {
+            // The owner decided it meanwhile: theirs stands.
+            if (!(error instanceof DecisionPendingError)) throw error;
+          }
+        } else {
+          approved = false;
+          reasons = [claim.state === "unreachable" ? "the approval coordinator could not be reached" : claim.state === "denied" ? claim.reason ?? "another plan overlaps this one" : `its automatic approval was ${claim.state}`];
         }
-      } else {
-        approved = false;
-        reasons = [claim.state === "unreachable" ? "the approval coordinator could not be reached" : claim.state === "denied" ? claim.reason ?? "another plan overlaps this one" : `its automatic approval was ${claim.state}`];
-      }
+      });
     }
     await this.parking!.retire(null, parked.agentId, paseo, "The plan stays parked for the owner: stop now and do not implement anything.");
     if (approved) return;

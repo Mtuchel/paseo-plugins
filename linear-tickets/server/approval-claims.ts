@@ -577,15 +577,23 @@ export class ClaimRequests {
     const now = this.deps.now?.() ?? Date.now();
     if (this.reconciling || now - this.lastReconcile < RECONCILE_MS) return this.reconciling ?? Promise.resolve();
     this.lastReconcile = now;
+    // A withdrawn claim is judged again only once the queue is released: that judgement claims
+    // through this same queue.
     this.reconciling = this.serial(async () => {
+      const again: ClaimIntent[] = [];
       for (const record of await this.all()) {
         try {
-          await this.reconcileOne(record, now);
+          if (await this.reconcileOne(record, now)) again.push(record);
         } catch (error) {
           console.error(`[linear-tickets] reconciling the automatic approval of ${record.identifier} failed: ${error instanceof Error ? error.message : error}`);
         }
       }
       await this.flushOnce();
+      return again;
+    }).then(async (again) => {
+      for (const record of again) await this.deps.rejudge(record).catch((error: unknown) => {
+        console.error(`[linear-tickets] judging ${record.identifier}'s plan again failed: ${error instanceof Error ? error.message : error}`);
+      });
     }).catch((error: unknown) => {
       console.error(`[linear-tickets] reconciling automatic approvals failed: ${error instanceof Error ? error.message : error}`);
     }).finally(() => { this.reconciling = null; });
@@ -598,39 +606,38 @@ export class ClaimRequests {
     return { claim: "none" };
   }
 
-  private async reconcileOne(record: ClaimIntent, now: number): Promise<void> {
+  // True when the claim was withdrawn with its review still waiting, so the plan is judged again.
+  private async reconcileOne(record: ClaimIntent, now: number): Promise<boolean> {
     const created = claimIdTime(record.claimId);
     // `unclear` never acts again, but an owner item whose comment did not get through is retried.
-    if (record.state === "unclear") { if (!record.item) await this.unconfirmedItem(record); return; }
+    if (record.state === "unclear") { if (!record.item) await this.unconfirmedItem(record); return false; }
     if (record.state === "claiming") {
       // A requester stops resending after 30 days: the claim can never be granted by then. The
       // record stays as `unclear` so it answers the holder and blocks a new claim for the ticket.
       if (created === null || now - created > EXPIRED_DAYS * DAY_MS) {
         await this.unconfirmedItem(record);
-        return;
+        return false;
       }
       const answer = await this.sendClaim(record);
-      if (!answer || answer.state === "unreachable") return;
-      if (answer.state === "granted") { await this.write({ ...record, state: "granted" }); return; }
+      if (!answer || answer.state === "unreachable") return false;
+      if (answer.state === "granted") { await this.write({ ...record, state: "granted" }); return false; }
       await this.remove(record.issueId);
-      return;
+      return false;
     }
-    if (record.state !== "granted") return;
+    if (record.state !== "granted") return false;
     const state = await this.deps.state(record);
     if (state === "applied") {
       await this.settleOnce(record.claimId, "committed");
       await this.remove(record.issueId);
-      return;
+      return false;
     }
-    if (state === "pending") return;
+    if (state === "pending") return false;
     // The review is gone with nothing recorded: the claim is neither committed nor withdrawn. Its
     // record becomes `unclear` (the holder's own answer that it can no longer act), which is what
     // releases the coordinator's claim once the owner answers the item.
-    if (state === "gone") { await this.unconfirmedItem(record); return; }
+    if (state === "gone") { await this.unconfirmedItem(record); return false; }
     await this.withdrawOnce(record);
-    if (state === "open" && !record.parked) await this.deps.rejudge(record).catch((error: unknown) => {
-      console.error(`[linear-tickets] judging ${record.identifier}'s plan again failed: ${error instanceof Error ? error.message : error}`);
-    });
+    return state === "open" && !record.parked;
   }
 
   private async withdrawOnce(record: ClaimIntent): Promise<void> {

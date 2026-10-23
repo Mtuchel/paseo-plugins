@@ -17,7 +17,7 @@ import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
 import { planHash } from "./review-outcome";
 import type { PlanDocument } from "./linear";
 import { RelatedWork } from "./related-work";
-import { ApprovalClaims, ClaimRequests } from "./approval-claims";
+import { ApprovalClaims, ClaimRequests, newClaimId, type ClaimIntent } from "./approval-claims";
 import { PlanRelations } from "./plan-relations";
 import { DecisionLog, type LogEntry } from "./owner-decisions";
 import { ReviewDeletions } from "./review-deletions";
@@ -524,6 +524,36 @@ test("AC-3: two overlapping plans opened before either decision get exactly one 
     const answers = JSON.parse(await readFile(join(root, "coordinator", "answers.json"), "utf8")) as Record<string, { state: string }>;
     assert.deepEqual(Object.values(answers).map((answer) => answer.state).sort(), ["committed", "denied"]);
   } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+// Reconciliation withdraws a granted claim whose review still waits with no decision. A judgement
+// holding its grant on the way to the journal, and a journal this instance has not loaded yet, are
+// not that: reading them as waiting or gone would release a grant an approval is about to use.
+test("AC-18: a claim reads as pending while its judgement heads for the journal and before the journal is loaded", async () => {
+  const plan = `Change \`server/x.ts\`.\n\n${RISKY(1)}`;
+  const { linear, paseo } = setup({ "linear.issueId": "issue-1", "linear.identifier": "TUC-1" }, undefined, "2026-10-15T10:41:10.500Z");
+  const seen: string[] = [];
+  const decisions: boolean[] = [];
+  await withEvents([
+    { type: "advised", agentId: "agent-1", verdict: "agreed", hash: planHash(plan), at: "2026-10-15T10:45:00Z" },
+    { type: "opened", agentId: "agent-1", localUrl: "http://localhost:4000/", remoteUrl: "https://host.ts.net:4000/", at: "2026-10-15T10:50:00Z" },
+  ], async (directory) => {
+    const bridge = new PlannotatorBridge(linear, { read: async () => settings }, directory, undefined, async () => plan, undefined, undefined, undefined,
+      async (_url, approve) => { decisions.push(approve); }, () => {});
+    const intent = (input: Omit<ClaimIntent, "claimId" | "state" | "at">): ClaimIntent => ({ ...input, claimId: newClaimId(), state: "granted", at: "2026-10-15T10:50:00Z" });
+    seen.push(await bridge.claimReviewState(intent({ issueId: "issue-1", identifier: "TUC-1", planHash: planHash(plan), footprint: { files: [], places: [], tickets: [], ticket: null }, roundStartedAt: "2026-10-15T10:41:10.500Z", agentId: "agent-1", localUrl: "http://localhost:4000/", reviewId: "review-left-by-a-reload" })));
+    bridge.attach(paseo);
+    bridge.useRelated(relatedPlans([]));
+    bridge.useClaims({
+      // The coordinator granted; reconciliation runs before the judgement reaches the journal.
+      claim: async (input) => { seen.push(await bridge.claimReviewState(intent(input))); return { state: "granted" }; },
+      committed: async () => {}, ownerApproval: async () => {}, reconcile: async () => {}, holder: async () => ({ claim: "none" }),
+    });
+    await bridge.drain();
+    bridge.stop();
+  });
+  assert.deepEqual(seen, ["pending", "pending"]);
+  assert.deepEqual(decisions, [true], "the granted plan is approved");
 });
 
 // A plugin reload (a rollout, a daemon restart) between the planner's record and its hand-off used
