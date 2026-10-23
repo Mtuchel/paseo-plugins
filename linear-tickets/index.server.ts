@@ -69,6 +69,7 @@ import { PlanRequests } from "./server/plan-requests";
 import { PlanFollowUps } from "./server/plan-follow-ups";
 import { labelDaemon, StateLabels } from "./server/state-labels";
 import { LabelSync, PullRequestFiles } from "./server/label-sync";
+import { RelatedWork } from "./server/related-work";
 import { ProjectFlow, ProjectStore } from "./server/project-flow";
 import { ProjectIssueCache } from "./server/project-issues";
 import { Presence } from "./server/presence";
@@ -141,6 +142,11 @@ export default function contribute(server: PluginServerContext) {
   const launcher = new Launcher(linear, undefined, undefined, (url) => linear.downloadUpload(url), undefined, undefined, agentEnvs, (issueId) => activationGuard(issueId), shards);
   launcher.useDeletions(deletions);
   launcher.useExclusion(exclusion);
+  // GitHub pull request files, shared by the label sync and the planners' candidate list.
+  const pullRequestFiles = new PullRequestFiles();
+  // The candidate list of related work in every planning launch's context file (README, "Overlap check").
+  const relatedWork = new RelatedWork({ linear, pullRequests: pullRequestFiles });
+  launcher.useCandidates((teamId) => relatedWork.candidates(teamId));
   // Present or away (README, "Present and away"): every start path asks the starter's scheduler.
   const presence = new Presence();
   // Model tiers (README, "Model tiers"): the tier each ticket implements on.
@@ -540,7 +546,7 @@ export default function contribute(server: PluginServerContext) {
   const stateLabels = new StateLabels({ linear, covered: () => coverage.covers("Issue"), daemon: async () => { const client = await internalDaemon(); return client ? labelDaemon(client) : null; } });
   linear.onStateWritten((issueId, state) => stateLabels.noteState(issueId, state));
   // Label groups kept current on every issue of some teams ("Area", "Type"), from label-rules.json.
-  const labelSync = new LabelSync({ linear, pullRequests: new PullRequestFiles(), covered: () => coverage.covers("Issue") && coverage.covers("IssueLabel") && coverage.covers("Attachment") });
+  const labelSync = new LabelSync({ linear, pullRequests: pullRequestFiles, covered: () => coverage.covers("Issue") && coverage.covers("IssueLabel") && coverage.covers("Attachment") });
   // The Paseo Agents menu bar's pull request view: polled only while the app asks (README, "Pull request view").
   const pullBoard = new PullRequestBoard();
   let funnel: FunnelStatus | null = null;

@@ -763,14 +763,6 @@ const BLOCKER_STATES_BATCH = 50;
 export const ISSUE_DESCRIPTIONS_QUERY = `query issueDescriptions($ids: [ID!]!) {
   issues(first: 50, filter: { id: { in: $ids } }) { nodes { id description } }
 }`;
-// The planner's view beyond its project (README, "Projects"): every open ticket of the teams,
-// most recently updated first.
-export const TEAM_OPEN_ISSUES_QUERY = `query teamOpenIssues($teams: [ID!]!, $after: String) {
-  issues(first: 100, after: $after, orderBy: updatedAt, filter: { team: { id: { in: $teams } }, state: { type: { nin: ["completed", "canceled", "duplicate"] } } }) {
-    nodes { id identifier title state { name } project { id name } }
-    pageInfo { hasNextPage endCursor }
-  }
-}`;
 // A ticket by its identifier, in any state; an empty list when no such ticket exists.
 export const ISSUE_BY_NUMBER_QUERY = `query issueByNumber($team: String!, $number: Float!) {
   issues(first: 1, includeArchived: true, filter: { team: { key: { eqIgnoreCase: $team } }, number: { eq: $number } }) { nodes { id identifier title } }
@@ -781,7 +773,15 @@ export const ORGANIZATION_QUERY = `query organizationUrlKey {
 }`;
 export type LabeledProject = { id: string; name: string };
 export type TicketRef = { id: string; identifier: string; title: string };
-export type TeamIssue = TicketRef & { status: string; projectId: string | null; projectName: string };
+// An open ticket of the candidate list (related-work.ts). `labels`: grouped ones as "Area: Sales".
+// `planDocuments`: its "Plan: " documents, without content. `pullRequests`: its pull request links.
+export type CandidateIssue = {
+  id: string; identifier: string; title: string; description: string; updatedAt: string; status: string; statusType: string;
+  labels: string[]; pullRequests: string[]; planDocuments: { id: string; title: string; updatedAt: string }[];
+};
+export type DoneIssue = { id: string; identifier: string; title: string; completedAt: string; pullRequests: string[] };
+// `complete`: false when Linear had more pages than the plugin reads (see WINDOW_PAGES).
+export type Pages<T> = { items: T[]; complete: boolean };
 // `parentId`: the ticket's parent when it is open and in the same project (the parent's group hands it out).
 // `blocks`: ids of open tickets this one blocks. `linked`: tickets it is related to, a duplicate of
 // ("duplicates") or duplicated by.
@@ -886,6 +886,10 @@ export type CatalogLabel = { id: string; name: string; isGroup: boolean; parentI
 export const LABEL_SWEEP_PAGE = 50;
 const HISTORY_PAGES = 5;
 const PULL_REQUEST_URL = /^https:\/\/github\.com\/[^/\s]+\/[^/\s]+\/pull\/\d+/;
+// The pull request URLs among an `attachments` connection's nodes, without suffixes, deduplicated.
+function pullRequestUrls(attachments: unknown): string[] {
+  return [...new Set(connection(attachments ?? { nodes: [] }).nodes.map((node) => label(record(node).url).match(PULL_REQUEST_URL)?.[0] ?? "").filter(Boolean))];
+}
 // A user's profile URL (https://linear.app/<workspace>/profiles/<name>): in a comment, Linear
 // renders it as an @mention and notifies that user.
 export const USER_URL_QUERY = `query userUrl($id: String!) {
@@ -1121,6 +1125,27 @@ export const PLAN_DOCUMENTS_QUERY = `query planDocuments($since: DateTimeOrDurat
     pageInfo { hasNextPage endCursor }
   }
 }`;
+// The candidate list (related-work.ts): every open ticket of a team with what a planner compares,
+// the team's tickets done since a time, and the content of plan documents by id.
+export const TEAM_CANDIDATES_QUERY = `query teamCandidates($team: ID!, $after: String) {
+  issues(first: 50, after: $after, orderBy: updatedAt, filter: { team: { id: { eq: $team } }, state: { type: { nin: ["completed", "canceled", "duplicate"] } } }) {
+    nodes { id identifier title description updatedAt state { name type }
+      labels(first: 25) { nodes { name parent { name } } }
+      attachments(first: 25) { nodes { url } }
+      documents(first: 10, filter: { title: { startsWith: "Plan: " } }) { nodes { id title updatedAt } } }
+    pageInfo { hasNextPage endCursor }
+  }
+}`;
+export const DONE_SINCE_QUERY = `query doneSince($team: ID!, $since: DateTimeOrDuration!, $after: String) {
+  issues(first: 100, after: $after, orderBy: updatedAt, filter: { team: { id: { eq: $team } }, completedAt: { gte: $since } }) {
+    nodes { id identifier title completedAt attachments(first: 25) { nodes { url } } }
+    pageInfo { hasNextPage endCursor }
+  }
+}`;
+export const DOCUMENT_CONTENTS_QUERY = `query documentContents($ids: [ID!]!) {
+  documents(first: 50, filter: { id: { in: $ids } }) { nodes { id content updatedAt } }
+}`;
+const DOCUMENT_CONTENTS_BATCH = 50;
 export const MENTIONING_ISSUES_QUERY = `query mentioningIssues($filter: IssueFilter!, $after: String) {
   issues(first: 50, after: $after, includeArchived: true, filter: $filter) {
     nodes { id identifier title url state { name type } description project { name } comments(first: 100) { nodes { body createdAt url user { name } } } }
@@ -1793,20 +1818,72 @@ export class LinearService {
     return descriptions;
   }
 
-  // Open tickets of the teams, most recently updated first, up to `limit`.
-  async openTeamIssues(teamIds: string[], limit: number): Promise<TeamIssue[]> {
-    const issues: TeamIssue[] = [];
-    let after: string | null = null;
-    do {
-      const page = record(record(await this.read(TEAM_OPEN_ISSUES_QUERY, { teams: teamIds, after })).issues ?? {});
-      for (const node of connection(page).nodes.map((item) => record(item))) {
-        const project = record(node.project ?? {});
-        issues.push({ id: label(node.id), identifier: label(node.identifier), title: label(node.title), status: label(record(node.state ?? {}).name), projectId: label(project.id) || null, projectName: label(project.name) });
+  // Every page of a candidate-list read (at most WINDOW_PAGES), at background priority.
+  private async candidatePages(query: string, variables: Record<string, unknown>): Promise<Pages<Record<string, unknown>>> {
+    return withPriority("background", "candidate list", async () => {
+      const nodes: Record<string, unknown>[] = [];
+      let after: string | null = null;
+      for (let page = 0; page < WINDOW_PAGES; page++) {
+        const found = connection(record(record(await this.read(query, { ...variables, after })).issues ?? {}));
+        nodes.push(...found.nodes.map((node) => record(node)));
+        if (!found.hasNextPage || !found.endCursor) return { items: nodes, complete: true };
+        after = found.endCursor;
       }
-      const info = record(page.pageInfo ?? {});
-      after = issues.length < limit && info.hasNextPage === true && label(info.endCursor) ? label(info.endCursor) : null;
-    } while (after);
-    return issues.slice(0, limit);
+      return { items: nodes, complete: false };
+    });
+  }
+
+  // The team's open tickets for the candidate list (related-work.ts), most recently updated first.
+  async teamCandidates(teamId: string): Promise<Pages<CandidateIssue>> {
+    const pages = await this.candidatePages(TEAM_CANDIDATES_QUERY, { team: teamId });
+    return {
+      complete: pages.complete,
+      items: pages.items.map((node) => {
+        const state = record(node.state ?? {});
+        return {
+          id: label(node.id), identifier: label(node.identifier), title: label(node.title), description: typeof node.description === "string" ? node.description : "",
+          updatedAt: label(node.updatedAt), status: label(state.name), statusType: label(state.type),
+          labels: connection(node.labels ?? { nodes: [] }).nodes.map((item) => {
+            const entry = record(item);
+            const parent = entry.parent ? label(record(entry.parent).name) : "";
+            return parent ? `${parent}: ${label(entry.name)}` : label(entry.name);
+          }).filter(Boolean),
+          pullRequests: pullRequestUrls(node.attachments),
+          planDocuments: connection(node.documents ?? { nodes: [] }).nodes.map((item) => {
+            const entry = record(item);
+            return { id: label(entry.id), title: label(entry.title), updatedAt: label(entry.updatedAt) };
+          }).filter((document) => document.id && document.title.startsWith("Plan: ")),
+        };
+      }).filter((issue) => issue.id),
+    };
+  }
+
+  // The team's tickets completed at or after `since`.
+  async doneSince(teamId: string, since: string): Promise<Pages<DoneIssue>> {
+    const pages = await this.candidatePages(DONE_SINCE_QUERY, { team: teamId, since });
+    return {
+      complete: pages.complete,
+      items: pages.items.map((node) => ({
+        id: label(node.id), identifier: label(node.identifier), title: label(node.title), completedAt: label(node.completedAt),
+        pullRequests: pullRequestUrls(node.attachments),
+      })).filter((issue) => issue.id),
+    };
+  }
+
+  // The content of these documents by id; a document Linear does not return is missing from the map.
+  async documentContents(ids: string[]): Promise<Map<string, { content: string; updatedAt: string }>> {
+    return withPriority("background", "candidate list", async () => {
+      const contents = new Map<string, { content: string; updatedAt: string }>();
+      const unique = [...new Set(ids)];
+      for (let start = 0; start < unique.length; start += DOCUMENT_CONTENTS_BATCH) {
+        const batch = unique.slice(start, start + DOCUMENT_CONTENTS_BATCH);
+        const data = record(await this.read(DOCUMENT_CONTENTS_QUERY, { ids: batch }, (found) => connection(record(found.documents ?? {})).nodes.length === batch.length));
+        for (const node of connection(record(data.documents ?? {})).nodes.map((item) => record(item))) {
+          if (label(node.id)) contents.set(label(node.id), { content: typeof node.content === "string" ? node.content : "", updatedAt: label(node.updatedAt) });
+        }
+      }
+      return contents;
+    });
   }
 
   // The ticket with this identifier (for example TUC-12), in any state; null when there is none.
@@ -2106,12 +2183,11 @@ export class LinearService {
     const ids = (value: unknown) => connection(value ?? { nodes: [] }).nodes.map((node) => label(record(node).id)).filter(Boolean);
     const issues = page.nodes.map((item) => record(item)).map((node): SweptIssue => {
       const parent = node.parent ? record(node.parent) : null;
-      const urls = connection(node.attachments ?? { nodes: [] }).nodes.map((attachment) => label(record(attachment).url).match(PULL_REQUEST_URL)?.[0]);
       return {
         id: label(node.id), identifier: label(node.identifier), title: label(node.title), description: typeof node.description === "string" ? node.description : "",
         createdAt: label(node.createdAt), updatedAt: label(node.updatedAt), projectName: label(node.project ?? null) || null,
         parentId: parent ? label(parent.id) || null : null, parentLabelIds: parent ? ids(parent.labels) : [], labelIds: ids(node.labels),
-        pullRequests: [...new Set(urls.filter((url): url is string => Boolean(url)))],
+        pullRequests: pullRequestUrls(node.attachments),
       };
     }).filter((issue) => issue.id && issue.createdAt);
     return { issues, next: page.hasNextPage ? page.endCursor : null };

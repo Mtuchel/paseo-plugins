@@ -841,12 +841,43 @@ approved plan later replaces the route: every unfinished attempt is closed, the 
 ticket's first.
 
 **Overlap check.** Tickets are filed (by you, by agents, by intake) without a look at what else is
-open, so every plan starts with one. The prompt has the agent search Linear's open tickets
-(`search_issues`, or another Linear read tool), across every team and project and including work
-in review whose pull request is not merged yet, for tickets that change the same feature, files or
-data or already ask for the same thing, and read each candidate in full. The plan gets an
+open, so every plan starts with one, from one shared **candidate list**. Every planning launch (a
+ticket planner on any provider, and a project's planner run) gets the list of its ticket's team
+at the end of the context file `LINEAR_TICKETS_CONTEXT` names, under `# Candidate list`
+([`server/related-work.ts`](server/related-work.ts)). It holds, each section marked `Complete.`
+or `Incomplete:` with what to look up by hand:
+
+- the team's open tickets (every state but done, canceled and duplicate), each with status, labels and a 240-character
+  excerpt of its description;
+- the approved `Plan: <ticket>` documents of open tickets, newest approval first, each with its
+  `## Reach`, the files the plan names and whether it has a `## Related work` list (a plan sent
+  back is left out);
+- the tickets in Planning;
+- the files of the open tickets' pull requests, open ones and merged ones (newest merge first,
+  with the ticket's status); those closed without merging are left out, and those not read yet
+  are named with the `gh pr view` command that reads them;
+- the team's tickets done in the last 60 days.
+
+The list starts with the precedence rule the planner follows when sources disagree: the code as
+merged is the current baseline; a plan written before a later merged change that contradicts it
+is re-planned; a later approved plan that deliberately replaces behaviour is the newer decision;
+open pull requests are proposed work to check for conflicts, not authority; ticket descriptions
+count least; when unsure whether a merged change still holds, read the file on `origin/main`.
+
+One build serves every planner of the team for two minutes; the planners started in that time
+read the same snapshot. It is read at background priority: open tickets in pages of 50 and done
+tickets in pages of 100, plan documents only when their `updatedAt` changed, and pull request files
+through the same cache as the label sync: a build waits for at most 20 `gh` reads (about half a
+second each), the label sync adds up to 150 per cycle, and the rest come with later builds. For
+team TUC (1,195 open tickets, 199 plan documents, 1,343 done in 60 days) the Linear reads take
+about 10 seconds and the list runs to some 1.8 million characters, so the planner searches it
+(for its files, words and places) rather than reading it whole. A build that fails is not kept: the launch warns, its context file says the list
+could not be built and asks the agent to search Linear instead, and the next planner tries again.
+The list covers the ticket's own team: the prompt has the agent search Linear (`search_issues`,
+or another Linear read tool) only for other teams' tickets and for what the list marks
+incomplete, read each candidate in full and follow the precedence rule. The plan gets an
 `## Overlapping tickets` section (each overlap and what the plan does about it, or "None found"
-with the search terms). With [agent access to Linear](#agent-access-to-linear) on, real overlaps
+with what was checked). With [agent access to Linear](#agent-access-to-linear) on, real overlaps
 are linked with `add_relation related` while the agent plans; a ticket another one fully covers
 gets a plan that proposes closing it as that ticket's duplicate. A planner run gets its own
 overlap instructions (see **Projects** below).
@@ -1071,9 +1102,12 @@ remove and add it again to ask once more.
 The planner (the model you launch tickets with; the model guard keeps it there) creates a GPT-6
 Astra advisor (`omp/openai-codex/gpt-6-astra`, thinking `medium`) with Paseo's `create_agent`, in
 its own workspace, so the advisor can read the same code. Both work from the same ticket context:
-each launch saves the agent's first prompt to `$PASEO_HOME/linear-tickets/plan-context/<request>.md`
-and passes the path in `LINEAR_TICKETS_CONTEXT`, and the advisor reads that file first (when the
-save fails, the launch warns and the planner pastes the ticket into the advisor's prompt). The
+each launch saves the agent's first prompt (with the candidate list, see **Overlap check**) to
+`$PASEO_HOME/linear-tickets/plan-context/<request>.md` and passes the path in
+`LINEAR_TICKETS_CONTEXT`, and the advisor reads that file first (when the save fails, the launch
+warns and the planner pastes the ticket into the advisor's prompt). Besides the plan's scope,
+reach and rules, the advisor is asked whether the plan misses a candidate from the candidate list.
+The
 planner adopts or answers each point and sends changes back to the same advisor with
 `send_agent_prompt` until they agree, at most three rounds. The plan then ends with an
 `## Advisor review` section: the advisor's model, the rounds, what changed, and every point still
@@ -1708,15 +1742,16 @@ the ticket itself changing, or a deleted ticket, shows up with the next full rea
   in one line with its state, priority, labels, open blockers and links, the new ones marked and
   also given in full (up to 4,000 characters each and 30,000 in all; past that the agent reads
   them in Linear) — a follow-up Paseo filed in Backlog is listed but never marked new (see
-  **Plan follow-ups**) — and the 300 most recently updated open tickets of the same team outside the
-  project by title. The brief stays within 120,000 characters, so it fits any project size (the
-  ticket planners before it rode Linear's 200,000-character agent context, and ERP's 409 open
-  tickets went past it: TUC-1094 never started); every new ticket is always listed, and when the
-  room runs out the other project tickets, then those outside it, are cut, with a note to search
-  Linear for them. Its agent looks for overlap first:
-  it compares every new ticket with all of those, searches Linear with its read tools for open
-  tickets the lists miss, reads the full text of any candidate, and its plan lists every overlap
-  in an `## Overlaps` section (or "None found" with the search terms). It then reads the code and
+  **Plan follow-ups**). The team's other work is not in the brief: the run's context file ends
+  with the team's candidate list (see **Overlap check**). The brief stays within 120,000
+  characters, so it fits any project size (the ticket planners before it rode Linear's
+  200,000-character agent context, and ERP's 409 open tickets went past it: TUC-1094 never
+  started); every new ticket is always listed, and when the room runs out the other project
+  tickets are cut, with a note to search Linear for them. Its agent looks for overlap first:
+  it compares every new ticket with the project's tickets and the candidate list, searches Linear
+  with its read tools only for other teams' tickets and what the list marks incomplete, reads the
+  full text of any candidate, and its plan lists every overlap in an `## Overlaps` section (or
+  "None found" with what it checked). It then reads the code and
   plans which tickets block which (because one builds on another, or both touch the same files),
   which duplicate or relate to other tickets, which must wait for you, and which may need you
   while they run. Its plan is always approved automatically: it only changes Linear, and every
@@ -3609,9 +3644,11 @@ For each issue and group, the first piece of evidence that decides wins:
 
 A tie keeps the label the issue already has when it is among the best. Otherwise the next step
 decides. With no evidence the issue keeps what it has, and nothing is ever removed without a
-replacement. Pull request files are read with `gh`, up to 150 pull requests per cycle. Merged
-and closed ones are kept in `$PASEO_HOME/linear-tickets/pr-files.json`, and open ones are read
-again after 30 minutes.
+replacement. Pull request files are read with `gh`, up to 150 pull requests per cycle, together
+with the pull request's state and merge time (the candidate list shows them, see **Overlap
+check**, and reads through the same cache). Merged and closed ones are kept in
+`$PASEO_HOME/linear-tickets/pr-files.json`, and open ones are read again after 30 minutes; an
+entry saved before the state was kept is read again once.
 
 **Labels people choose stay.** Before it changes an issue's label, the plugin reads the issue's
 history. If the last change to that group's labels was not the Paseo app's, it leaves the issue

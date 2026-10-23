@@ -17,20 +17,25 @@ const FULL_SWEEP_MS = 30 * 60 * 1000;
 // Incremental sweeps overlap by this much, so an update made while a sweep ran is not missed.
 const SWEEP_OVERLAP_MS = 60 * 1000;
 const MAX_FAILURES = 3;
-// GitHub reads per cycle: a first sweep over many tickets reads its pull requests over several cycles.
+// GitHub reads per cycle: a first sweep over many tickets reads its pull requests over several
+// cycles.
 const PULL_REQUEST_READS = 150;
 // An open pull request's files are read again after this; merged and closed ones never change.
 const OPEN_FRESH_MS = 30 * 60 * 1000;
 
 // `final`: merged, closed or missing on GitHub, so its files never change and are kept on disk.
-type FilesEntry = { files: string[]; final: boolean; at: number };
-export type PullRequestRead = { state: string; files: string[] };
+// `state`: GitHub's state (OPEN, MERGED, CLOSED), MISSING for a pull request GitHub does not know,
+// or "" when unknown: a failed read, or an entry saved before the state was kept (`legacy`, read
+// again once).
+type FilesEntry = { files: string[]; state: string; mergedAt: string | null; final: boolean; at: number; legacy?: boolean };
+export type PullRequestRead = { state: string; files: string[]; mergedAt: string | null };
+export type PullRequestState = { state: string; mergedAt: string | null };
 
-// A pull request's changed files as "owner/repo/path".
+// A pull request's changed files as "owner/repo/path", with its state and merge time.
 export async function readPullRequestFiles(url: string): Promise<PullRequestRead> {
   const repo = url.match(/github\.com\/([^/]+\/[^/]+)\/pull\//)?.[1] ?? "";
-  const data = await ghJson<{ state?: string; files?: { path?: string }[] }>(["pr", "view", url, "--json", "state,files"]);
-  return { state: data.state ?? "", files: (data.files ?? []).flatMap((file) => file.path ? [`${repo}/${file.path}`] : []) };
+  const data = await ghJson<{ state?: string; files?: { path?: string }[]; mergedAt?: string | null }>(["pr", "view", url, "--json", "state,files,mergedAt"]);
+  return { state: data.state ?? "", files: (data.files ?? []).flatMap((file) => file.path ? [`${repo}/${file.path}`] : []), mergedAt: data.mergedAt || null };
 }
 
 export class PullRequestFiles {
@@ -49,6 +54,13 @@ export class PullRequestFiles {
     return this.entries.get(url)?.files ?? null;
   }
 
+  // The pull request's state as last read; null while it is unknown (never read, a failed read, or
+  // an entry saved before the state was kept).
+  stateOf(url: string): PullRequestState | null {
+    const entry = this.entries.get(url);
+    return entry?.state ? { state: entry.state, mergedAt: entry.mergedAt } : null;
+  }
+
   // Reads up to `limit` pull requests not known yet or open and stale, in the order given. A read
   // GitHub refuses counts as no files until it is retried; throttling ends the reads for this cycle.
   async refresh(urls: string[], limit: number): Promise<void> {
@@ -56,18 +68,20 @@ export class PullRequestFiles {
     const now = this.now();
     const due = [...new Set(urls)].filter((url) => {
       const entry = this.entries.get(url);
-      return !entry || (!entry.final && now - entry.at > OPEN_FRESH_MS);
+      return !entry || ((entry.legacy || !entry.final) && now - entry.at > OPEN_FRESH_MS);
     }).slice(0, limit);
     for (const url of due) {
       try {
-        const { state, files } = await this.read(url);
+        const { state, files, mergedAt } = await this.read(url);
         const final = state === "MERGED" || state === "CLOSED";
-        this.entries.set(url, { files, final, at: now });
+        this.entries.set(url, { files, state, mergedAt, final, at: now });
         if (final) this.dirty = true;
       } catch (error) {
         if (error instanceof GitHubRateLimitedError) break;
-        if (error instanceof PullRequestNotFoundError) { this.entries.set(url, { files: [], final: true, at: now }); this.dirty = true; continue; }
-        this.entries.set(url, { files: [], final: false, at: now });
+        if (error instanceof PullRequestNotFoundError) { this.entries.set(url, { files: [], state: "MISSING", mergedAt: null, final: true, at: now }); this.dirty = true; continue; }
+        // A legacy entry keeps its files until a read succeeds.
+        const known = this.entries.get(url);
+        this.entries.set(url, known?.legacy ? { ...known, at: now } : { files: [], state: "", mergedAt: null, final: false, at: now });
         const message = error instanceof Error ? error.message.split("\n")[0] : String(error);
         if (!this.logged.has(message)) { this.logged.add(message); console.error(`[linear-tickets] label rules: reading ${url} failed: ${message}`); }
       }
@@ -78,8 +92,13 @@ export class PullRequestFiles {
   private async load(): Promise<void> {
     try {
       const saved = JSON.parse(await readFile(this.path, "utf8")) as { pullRequests?: Record<string, unknown> };
-      for (const [url, files] of Object.entries(saved.pullRequests ?? {})) {
-        if (Array.isArray(files) && files.every((file) => typeof file === "string")) this.entries.set(url, { files, final: true, at: 0 });
+      const strings = (value: unknown): value is string[] => Array.isArray(value) && value.every((file) => typeof file === "string");
+      for (const [url, value] of Object.entries(saved.pullRequests ?? {})) {
+        // Saved before the state was kept: the files stay usable, the state is read again once.
+        if (strings(value)) { this.entries.set(url, { files: value, state: "", mergedAt: null, final: true, at: 0, legacy: true }); continue; }
+        const entry = value && typeof value === "object" ? value as Record<string, unknown> : {};
+        if (!strings(entry.files) || typeof entry.state !== "string" || !entry.state) continue;
+        this.entries.set(url, { files: entry.files, state: entry.state, mergedAt: typeof entry.mergedAt === "string" ? entry.mergedAt : null, final: true, at: 0 });
       }
     } catch {
       // No cache yet, or an unreadable one: the files are read from GitHub again.
@@ -88,7 +107,7 @@ export class PullRequestFiles {
 
   private async save(): Promise<void> {
     if (!this.dirty) return;
-    const pullRequests = Object.fromEntries([...this.entries].filter(([, entry]) => entry.final).map(([url, entry]) => [url, entry.files]));
+    const pullRequests = Object.fromEntries([...this.entries].filter(([, entry]) => entry.final).map(([url, entry]) => [url, entry.legacy ? entry.files : { files: entry.files, state: entry.state, mergedAt: entry.mergedAt }]));
     const temporary = `${this.path}.${randomUUID()}.tmp`;
     try {
       await mkdir(dirname(this.path), { recursive: true, mode: 0o700 });

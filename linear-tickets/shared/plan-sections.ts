@@ -73,6 +73,12 @@ function sectionText(plan: string, name: string): { body: string; text: string }
   return { body: match[2], text: `${match[1].replace(/^\s*[:—–-]\s*/, "")}\n${match[2]}`.trim() };
 }
 
+// The body of the plan's `## Reach` section, trimmed; null when it has none.
+export function reachBody(plan: string): string | null {
+  const reach = sectionText(plan, REACH_SECTION);
+  return reach ? reach.body.trim() : null;
+}
+
 const ITEM = String.raw`^\s*(?:[-*+]|\d+[.)])\s+`;
 // `- <place>: include | follow-up | existing | n/a <rest>`
 const DECISION = new RegExp(`${ITEM}(?:\\*\\*)?(.+?)(?:\\*\\*)?\\s*:(?:\\*\\*)?\\s*(include|follow-up|existing|n/a)\\b(?:\\*\\*)?\\s*(?:[—–:-]+\\s*)?(.*)$`, "i");
