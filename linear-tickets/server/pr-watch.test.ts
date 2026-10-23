@@ -17,6 +17,7 @@ import { BACKSTOP_ENQUEUE, ENQUEUE_READY, GREPTILE_REQUEST, marker, RETARGET_ORP
 import { GitHubBudget, GitHubPausedError, GitHubRateLimitedError, RateLimitedError, withPriority } from "./rate-budget";
 import { PermissionReplies } from "./permission-replies";
 import { ParentStore } from "./parents";
+import { AgentDirectory } from "./agent-directory";
 import { SessionRouter, type IdleRun, type Succession } from "./sessions";
 import { DEFAULT_ACTIVATION, DEFAULT_DISPATCH, DEFAULT_WATCHDOG, DEFAULT_WRITEBACK, type PluginSettings } from "./settings";
 import { Watchdog, WatchdogStore, type WatchedAgent } from "./watchdog";
@@ -127,6 +128,7 @@ function crashDaemon(t: TestContext, calls: string[]) {
   t.after(() => rm(directory, { recursive: true, force: true }));
   const replies = new PermissionReplies({ directory, daemon: async () => null });
   daemon.router = new SessionRouter({
+    agentDirectory: new AgentDirectory(),
     launcher: { gate: () => {
       if (held) return null;
       held = true;

@@ -5,6 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import type { PaseoApi } from "@getpaseo/client";
 import type { HandoverRecord } from "./handover";
+import { AgentDirectory } from "./agent-directory";
 import type { OwnerAskComment, OwnerAskIssue } from "./linear";
 import { answerText, askRoute, deliveryText, extractionInputParts, OwnerAsks, ownerAsksPage, selectAskSources, type AnswerAskInput, type ContinueOutcome, type OwnerAsksDeps } from "./owner-asks";
 import { answerAskRpc, ownerAsksRpc, triageAskRpc, type OwnerAsk } from "../shared/contracts";
@@ -54,6 +55,7 @@ async function setup(options: {
   queueError?: string;
 } = { issues: [] }): Promise<Harness> {
   const directory = await mkdtemp(join(tmpdir(), "owner-asks-"));
+  const agentDirectory = new AgentDirectory({ liveTtlMs: 0 });
   const events: string[] = [];
   const extractedWith: { identifier: string; kind: string }[] = [];
   const state = {
@@ -96,6 +98,7 @@ async function setup(options: {
       queued.push({ text, from });
     },
     directory,
+    agentDirectory,
     now: () => state.now,
   };
   const paseo = {
@@ -106,6 +109,7 @@ async function setup(options: {
       }),
     },
   } as unknown as PaseoApi;
+  agentDirectory.attach(paseo);
   const ownerAsks = new OwnerAsks(deps);
   return { ownerAsks, paseo, directory, events, delivered, continued, queued, extractedWith, deps, state };
 }

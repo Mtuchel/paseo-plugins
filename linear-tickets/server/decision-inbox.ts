@@ -9,6 +9,7 @@ import { askQuestionSchema, decisionReceiptSchema, type DecisionReceipt } from "
 import { browserOwnerAskSchema, decisionHostSchema, isSourceReview, liveDecisionSchema, recoveryTicketPageSchema, recoveryTicketSchema, SOURCE_REVIEW_PAGE_LIMIT, SOURCE_REVIEW_PAGE_MAX, sourceReviewPageSchema, type BrowserDecisionAction, type DecisionHost, type DecisionView, type LiveDecision, type RecoveryTicketPage, type StewardFlow } from "../shared/decision-inbox";
 import { summarizeDecisions } from "../shared/decision-summary";
 import type { ActivationRoute } from "./activation";
+import type { AgentDirectory } from "./agent-directory";
 import { decisionPage } from "./decision-page";
 import type { OwnerAsks, OwnerAskSnapshot } from "./owner-asks";
 import type { DeliveryResult, PermissionReplies, ReplyRecord } from "./permission-replies";
@@ -21,6 +22,8 @@ import type { MergeStatusSnapshot } from "../shared/merge-status";
 export type BrowserDecisionInboxDeps = {
   ownerAsks: Pick<OwnerAsks, "snapshot" | "answer" | "triage">;
   paseo: () => PaseoApi | null;
+  // The shared read-only agent listing (TUC-3006).
+  agentDirectory: Pick<AgentDirectory, "live">;
   replies: PermissionReplies;
   peers: () => Promise<string[]>;
   canonicalPeer: () => Promise<string | null>;
@@ -352,40 +355,32 @@ export class BrowserDecisionInbox {
     if (!paseo) errors.push("Live agents unavailable: Paseo is disconnected.");
     else {
       try {
-        let cursor: string | undefined;
-        const seen = new Set<string>();
         const seenRequests = new Set<string>();
-        do {
-          const page = await paseo.agents.list({ filter: { includeArchived: false }, page: { limit: 200, ...(cursor ? { cursor } : {}) } });
-          for (const { agent } of page.entries) {
-            if (agent.archivedAt) continue;
-            for (const request of agent.pendingPermissions ?? []) {
-              const key = hash([agent.id, request.id]);
-              if (seenRequests.has(key)) continue;
-              seenRequests.add(key);
-              const currentRevision = revision(request);
-              const deferred = deferrals.deferrals[key];
-              // Checked replies from Linear, native and browser bind the same exact round.
-              const activity = Object.values(records).filter(record => record.agentId === agent.id
-                && record.requestId === request.id && record.request && revision(record.request) === currentRevision);
-              if (activity.some(record => record.status === "applied")) continue;
-              const deliveryUnknown = activity.some(record => ["reserved", "submitted", "unconfirmed", "sent", "unchecked"].includes(record.status));
-              let agentUrl: string | null = null;
-              try { agentUrl = await this.deps.agentUrl?.(agent.id) ?? null; }
-              catch (error) { errors.push(`Agent link ${agent.id} unavailable: ${reasonOf(error)}`); }
-              live.push({ agentId: agent.id, requestId: request.id, revision: currentRevision,
-                title: request.title || request.name, identifier: agent.labels?.["linear.identifier"] ?? null,
-                issueUrl: agent.labels?.["linear.url"] ?? null, agentUrl, source: sourceOf(request),
-                questions: request.kind === "question" ? normalizedQuestions(request) : [], kind: request.kind === "question" ? "question" : "permission",
-                actions: request.kind === "question" ? [] : permissionActions(request),
-                deliveryUnknown,
-                deferredUntil: deferred?.revision === currentRevision && Date.parse(deferred.until) > this.now() ? deferred.until : null });
-            }
+        for (const agent of await this.deps.agentDirectory.live()) {
+          if (agent.archivedAt) continue;
+          for (const request of agent.pendingPermissions ?? []) {
+            const key = hash([agent.id, request.id]);
+            if (seenRequests.has(key)) continue;
+            seenRequests.add(key);
+            const currentRevision = revision(request);
+            const deferred = deferrals.deferrals[key];
+            // Checked replies from Linear, native and browser bind the same exact round.
+            const activity = Object.values(records).filter(record => record.agentId === agent.id
+              && record.requestId === request.id && record.request && revision(record.request) === currentRevision);
+            if (activity.some(record => record.status === "applied")) continue;
+            const deliveryUnknown = activity.some(record => ["reserved", "submitted", "unconfirmed", "sent", "unchecked"].includes(record.status));
+            let agentUrl: string | null = null;
+            try { agentUrl = await this.deps.agentUrl?.(agent.id) ?? null; }
+            catch (error) { errors.push(`Agent link ${agent.id} unavailable: ${reasonOf(error)}`); }
+            live.push({ agentId: agent.id, requestId: request.id, revision: currentRevision,
+              title: request.title || request.name, identifier: agent.labels?.["linear.identifier"] ?? null,
+              issueUrl: agent.labels?.["linear.url"] ?? null, agentUrl, source: sourceOf(request),
+              questions: request.kind === "question" ? normalizedQuestions(request) : [], kind: request.kind === "question" ? "question" : "permission",
+              actions: request.kind === "question" ? [] : permissionActions(request),
+              deliveryUnknown,
+              deferredUntil: deferred?.revision === currentRevision && Date.parse(deferred.until) > this.now() ? deferred.until : null });
           }
-          cursor = page.pageInfo.hasMore ? page.pageInfo.nextCursor ?? undefined : undefined;
-          if (page.pageInfo.hasMore && (!cursor || seen.has(cursor))) throw new Error("Paseo returned an incomplete or repeated agent-page cursor.");
-          if (cursor) seen.add(cursor);
-        } while (cursor);
+        }
       } catch (error) { errors.push(`Live agents incomplete: ${reasonOf(error)}`); }
     }
     const receipts = Object.values(records).filter((record) => record.request && (record.ref.startsWith(PREFIX) || record.responder.kind === "owner")).map((record): DecisionReceipt => ({

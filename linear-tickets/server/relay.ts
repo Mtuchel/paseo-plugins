@@ -4,6 +4,7 @@ import { dirname, join } from "node:path";
 import type { PaseoApi } from "@getpaseo/client";
 import type { AgentPermissionRequest, AgentPermissionResponse } from "@getpaseo/protocol/agent-types";
 import { filedIssues, pluginComments, postedComments } from "./agent-records";
+import type { AgentDirectory } from "./agent-directory";
 import { loadProbe } from "./load-probe";
 import type { LinearService, RelayComment } from "./linear";
 import type { ActivationSink, ActivationTake } from "./activation";
@@ -166,7 +167,8 @@ export class CommentRelay {
   // `route`: activation routing, so a comment for a ticket this host no longer owns goes to the
   // host that owns it instead of being delivered (or reported ❌) here.
   // `options.covered`: verified Comment webhook coverage; otherwise every poll reads history.
-  constructor(private readonly linear: Linear, private readonly path = join(paseoHome(), "linear-tickets", "relay-cursors.json"), private readonly needsYou?: NeedsYouIssues, private readonly route?: ActivationSink, private readonly replies = new PermissionReplies({ directory: dirname(path), daemon: async () => null }), private readonly options: { covered?: () => boolean } = {}) {
+  // `options.agentDirectory`: the shared read-only agent listing (TUC-3006).
+  constructor(private readonly linear: Linear, private readonly path = join(paseoHome(), "linear-tickets", "relay-cursors.json"), private readonly needsYou: NeedsYouIssues | undefined = undefined, private readonly route: ActivationSink | undefined = undefined, private readonly replies = new PermissionReplies({ directory: dirname(path), daemon: async () => null }), private readonly options: { covered?: () => boolean; agentDirectory: Pick<AgentDirectory, "live"> }) {
     this.directory = dirname(path);
   }
 
@@ -213,7 +215,7 @@ export class CommentRelay {
       // make the still-due inclusive history read enqueue that delivered comment again.
       const pendingAtStart = new Set(state.acks.map((ack) => ack.commentId));
       await this.acknowledge(state);
-      const linked = await this.linkedAgents(paseo);
+      const linked = await this.linkedAgents();
       const { watches, written } = await this.watches(linked);
       const active = watches.filter((watch) => !this.unseen.has(watch.issueId));
       const cursors: Record<string, Cursor> = {};
@@ -391,19 +393,14 @@ export class CommentRelay {
   }
 
   // The newest active root agent per ticket; older agents on the same ticket stay quiet.
-  private async linkedAgents(paseo: PaseoApi): Promise<LinkedAgent[]> {
+  private async linkedAgents(): Promise<LinkedAgent[]> {
     const byIssue = new Map<string, LinkedAgent & { updatedAt: string }>();
-    let cursor: string | undefined;
-    do {
-      const page = await paseo.agents.list({ filter: { includeArchived: false }, page: { limit: 200, ...(cursor ? { cursor } : {}) } });
-      for (const { agent } of page.entries) {
-        const issueId = agent.labels?.["linear.issueId"];
-        if (!issueId || agent.labels?.["paseo.parent-agent-id"]) continue;
-        const known = byIssue.get(issueId);
-        if (!known || agent.updatedAt > known.updatedAt) byIssue.set(issueId, { id: agent.id, issueId, identifier: agent.labels?.["linear.identifier"] ?? issueId, createdAt: agent.createdAt, updatedAt: agent.updatedAt });
-      }
-      cursor = page.pageInfo.hasMore ? page.pageInfo.nextCursor ?? undefined : undefined;
-    } while (cursor);
+    for (const agent of await this.options.agentDirectory.live()) {
+      const issueId = agent.labels?.["linear.issueId"];
+      if (!issueId || agent.labels?.["paseo.parent-agent-id"]) continue;
+      const known = byIssue.get(issueId);
+      if (!known || agent.updatedAt > known.updatedAt) byIssue.set(issueId, { id: agent.id, issueId, identifier: agent.labels?.["linear.identifier"] ?? issueId, createdAt: agent.createdAt, updatedAt: agent.updatedAt });
+    }
     return [...byIssue.values()];
   }
 

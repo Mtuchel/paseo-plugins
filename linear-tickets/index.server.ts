@@ -92,6 +92,8 @@ import { PlanPipeline } from "./server/plan-pipeline";
 import { pipelineOwnerEvidence } from "./server/plan-pipeline-source";
 import { Watchdog, WatchdogStore } from "./server/watchdog";
 import { asCaller, linearUsage, usageLines } from "./server/linear-usage";
+import { daemonUsage, daemonUsageLines } from "./server/daemon-usage";
+import { AgentDirectory } from "./server/agent-directory";
 import { githubUsage } from "./server/github-usage";
 import { LinearBroker } from "./server/linear-broker";
 import { upgradeTicketMcpScripts } from "./server/ticket-mcp";
@@ -116,6 +118,14 @@ export default function contribute(server: PluginServerContext) {
   const auth = new AppAuth();
   const agentApi = new AgentApi(auth);
   const linear = new LinearService(credentials, undefined, agentApi);
+  // One shared agent listing for the plugin's periodic readers (TUC-3006): the daemon rebuilds and
+  // sorts every agent per page, so the readers share one cached scan instead of each polling its own.
+  const agentDirectory = new AgentDirectory();
+  // The plugin's own connection (no SDK hook has arrived): every request it makes is metered too.
+  const meteredDaemon = async () => {
+    const client = await internalDaemon();
+    return client ? daemonUsage.meter(client) : null;
+  };
   const deletions = new ReviewDeletions();
   // Keeps the responsibility check's repair apart from every other effect on the same ticket
   // (repair-exclusion.ts, README "Responsibility check"): closed until the decision journal is
@@ -164,7 +174,7 @@ export default function contribute(server: PluginServerContext) {
   const acceptanceTests = new AcceptanceTestsStore();
   // Focus mode (README, "Focus mode"): while on, every start path admits only the tickets in focus.
   // Its phases also read the parked plans and the peer's claims (both built below).
-  const focus = new Focus({ linear, settings, parked: { all: () => parking.plans.all() }, intake: { claimedTickets: (): Promise<Set<string> | null> => intake.claimedTickets() } });
+  const focus = new Focus({ linear, settings, agentDirectory, parked: { all: () => parking.plans.all() }, intake: { claimedTickets: (): Promise<Set<string> | null> => intake.claimedTickets() } });
   // The small-ticket route (README, "Small-ticket route"): the bridge carries attempts out, the
   // starter relaunches on a recorded route. The model guard is built further down; it is only
   // called once the plugin runs.
@@ -219,7 +229,7 @@ export default function contribute(server: PluginServerContext) {
   // ticketOwnership): assigned once the activation routers exist below.
   let ticketOwner: (issueId: string) => Promise<HostOwnership> = async () => "unknown";
   const usage = new UsageReader();
-  const sessions = new SessionRouter({ api: agentApi, linear, starter, handover, launcher, settings, store: sessionStore, parents, needsYou, route, deletions, watchdog: watchdogStore, replies,
+  const sessions = new SessionRouter({ api: agentApi, agentDirectory, linear, starter, handover, launcher, settings, store: sessionStore, parents, needsYou, route, deletions, watchdog: watchdogStore, replies,
     limitResumes: new LimitResumeStore(), usage,
     webhookCovered: () => coverage.coversAgentSessions(),
     owner: (issueId) => ticketOwner(issueId),
@@ -231,14 +241,15 @@ export default function contribute(server: PluginServerContext) {
     recordOutcome: (agentId, outcome, review): Promise<void> => plannotator.recovered(agentId, review, outcome),
     // `paseo agent reload` for crashed agents (README, "Crashed agents"); the plugin SDK has no reload.
     reloader: async () => {
-      const client = await internalDaemon();
-      return client ? async (agentId) => { await client.refreshAgent(agentId); } : null;
+      const client = await meteredDaemon();
+      if (!client) return null;
+      return async (agentId) => { await client.refreshAgent(agentId); };
     },
   });
   const hostName = hostname().replace(/\.local$/, "");
   const pipeline = new PlanPipeline({
     host: hostName, sessions: () => sessionStore.all(), parked: () => parking.plans.all(),
-    owners: (issueIds) => pipelineOwnerEvidence(paseoHome(), issueIds),
+    owners: (issueIds) => pipelineOwnerEvidence(paseoHome(), issueIds), agentDirectory,
   });
   let pipelineServerId: string | null = null;
   void daemonServerId().then((id) => { pipelineServerId = id; });
@@ -304,7 +315,7 @@ export default function contribute(server: PluginServerContext) {
     // The responsibility check (README, "Responsibility check"), built below with the review stores.
     responsibility: { due: (now) => responsibility.due(now), holds: (issue) => responsibility.holds(issue), run: (input) => responsibility.run(input) },
   });
-  const relay = new CommentRelay(linear, undefined, needsYou, route, replies, { covered: () => coverage.covers("Comment") });
+  const relay = new CommentRelay(linear, undefined, needsYou, route, replies, { covered: () => coverage.covers("Comment"), agentDirectory });
   const dispatcher = new Dispatcher({ linear, starter, launcher, settings, route, relay, afterLaunch: openSession, handOff: (issueId, openChildren) => sessions.handOffGroup(issueId, openChildren), projects, steward, focus, parked: waitingPlans });
   // The owner's plan feedback and answers, for the weekly decision candidates (README, "Decision candidates").
   const decisions = new DecisionLog();
@@ -340,6 +351,7 @@ export default function contribute(server: PluginServerContext) {
   // answered through the same paths an owner's "@paseo" reply takes.
   const ownerAsks = new OwnerAsks({
     linear,
+    agentDirectory,
     issues: () => linear.ownerAskIssues(true),
     needsYou,
     handover,
@@ -379,7 +391,7 @@ export default function contribute(server: PluginServerContext) {
     admitted: () => starter.scheduler.admittedIds(),
   });
   const mergeStatus = new MergeStatus({
-    linear, teamKeys: async () => (await settings.read()).dispatch.teamKeys,
+    linear, agentDirectory, teamKeys: async () => (await settings.read()).dispatch.teamKeys,
     paseo: () => attachedPaseo, handover, parked: { all: () => parking.plans.all() }, sessions: sessionStore,
     waiting: () => starter.scheduler.waitingIds(),
     agentUrl: async (agentId) => {
@@ -389,6 +401,7 @@ export default function contribute(server: PluginServerContext) {
   });
   const browserDecisions = new BrowserDecisionInbox({
     ownerAsks,
+    agentDirectory,
     mergeStatus: async () => asCaller("merge-status", () => mergeStatus.feed()),
     paseo: () => attachedPaseo,
     replies,
@@ -412,12 +425,13 @@ export default function contribute(server: PluginServerContext) {
   // The factory board (/board): this host's live facts, its peers' answers, and the two shared
   // sources, derived into one view (shared/board.ts, server/board.ts).
   const board = new BoardInbox({
-    facts: () => collectBoardFacts({
+    facts: () => asCaller("board", () => collectBoardFacts({
       host: hostname().split(".")[0].toLowerCase(),
       home: join(paseoHome(), "linear-tickets"),
       paseo: () => attachedPaseo,
+      agentDirectory,
       maxRunning: async () => (await settings.read()).dispatch.maxRunning ?? null,
-    }),
+    })),
     peers: async () => (await settings.read()).reviewPeers,
     issues: () => boardIssues(linear, settings),
     pulls: (repos) => boardPulls(repos),
@@ -431,7 +445,7 @@ export default function contribute(server: PluginServerContext) {
   // browser's mutations with the instance they were displayed from.
   const reviewLinks: ReviewLinks = new ReviewLinks({
     peers: async () => (await settings.read()).reviewPeers,
-    inbox: { decisions: () => browserDecisions.view() },
+    inbox: { decisions: () => asCaller("decisions", () => browserDecisions.view()) },
     origin: () => tailnetOrigin(),
     // Reported on `/api/inbox` so peers trust this host's replan comments (plan-requests.ts).
     appUserId: () => linear.appUserId(),
@@ -541,7 +555,7 @@ export default function contribute(server: PluginServerContext) {
       }
     })),
   });
-  planRequests = new PlanRequests({ linear, apps: trustedApps, prompt: (agentId, text) => sessions.prompt(agentId, text), routes: smallRoutes });
+  planRequests = new PlanRequests({ linear, apps: trustedApps, agentDirectory, prompt: (agentId, text) => sessions.prompt(agentId, text), routes: smallRoutes });
   // An approved plan's `## Related work` written into Linear (README, "Related work"), and the
   // requests it leaves on other tickets' plans.
   const planRelations = new PlanRelations(linear, (issueId, identifier, since, hash) => planRequests!.requests(issueId, identifier, since, hash), () => hostName);
@@ -594,7 +608,7 @@ export default function contribute(server: PluginServerContext) {
     },
   );
   // Each ticket workspace shows its ticket's Linear state as a workspace label ("Linear: In Review").
-  const stateLabels = new StateLabels({ linear, covered: () => coverage.covers("Issue"), daemon: async () => { const client = await internalDaemon(); return client ? labelDaemon(client) : null; } });
+  const stateLabels = new StateLabels({ linear, covered: () => coverage.covers("Issue"), daemon: async () => { const client = await meteredDaemon(); return client ? labelDaemon(client, agentDirectory) : null; } });
   linear.onStateWritten((issueId, state) => stateLabels.noteState(issueId, state));
   // Label groups kept current on every issue of some teams ("Area", "Type"), from label-rules.json.
   const labelSync = new LabelSync({ linear, pullRequests: pullRequestFiles, covered: () => coverage.covers("Issue") && coverage.covers("IssueLabel") && coverage.covers("Attachment") });
@@ -716,8 +730,12 @@ export default function contribute(server: PluginServerContext) {
   // hooks are measured too, including those that arrive before any daemon connection.
   const probe = startLoadProbe();
   const attach = (paseo: PaseoApi) => {
+    paseo = daemonUsage.meter(paseo);
     const first = !attached;
     attached = true;
+    // Hooks hand in the same daemon on every event: re-attaching would drop the directory's
+    // cached scans each time, so only a different source re-attaches it.
+    if (attachedPaseo !== paseo) agentDirectory.attach(paseo);
     attachedPaseo = paseo;
     replies.attach(paseo);
     const ready = restoreOwnerHolds();
@@ -770,17 +788,17 @@ export default function contribute(server: PluginServerContext) {
   // ticket root that this host no longer owns, and the env hook below then only ever runs for the
   // opens this one lets through.
   server.before("agent.session_open", sessionOpenGuard({ settings, drain, attach, ready: () => drain.readyNow(), known: (agentId) => sessionStore.agentTicket(agentId) }));
-  server.on("agent.turn_started", (event, { paseo }) => { attach(paseo); return asCaller("writeback.turn-started", () => loadProbe.time("turn_started", () => writeback.turnStarted(event, paseo), "hook")); });
-  server.on("agent.turn_ended", (event, { paseo }) => { attach(paseo); return asCaller("writeback.turn-ended", () => loadProbe.time("turn_ended", () => writeback.turnEnded(event, paseo), "hook")); });
-  server.on("agent.permission_requested", (event, { paseo }) => { attach(paseo); return asCaller("writeback.permission-requested", () => writeback.permissionRequested(event, paseo)); });
-  server.on("agent.permission_resolved", (event, { paseo }) => asCaller("writeback.permission-resolved", () => writeback.permissionResolved(event, paseo)));
-  server.on("agent.archived", (event, { paseo }) => asCaller("writeback.archived", () => writeback.archived(event, paseo)));
-  server.on("agent.created", (_event, { paseo }) => { attach(paseo); asCaller("state-labels", () => stateLabels.soon()); wakeComments(); });
-  server.on("workspace.created", (_event, { paseo }) => { attach(paseo); asCaller("state-labels", () => stateLabels.soon()); wakeComments(); });
+  server.on("agent.turn_started", (event, { paseo }) => { paseo = daemonUsage.meter(paseo); attach(paseo); return asCaller("writeback.turn-started", () => loadProbe.time("turn_started", () => writeback.turnStarted(event, paseo), "hook")); });
+  server.on("agent.turn_ended", (event, { paseo }) => { paseo = daemonUsage.meter(paseo); attach(paseo); return asCaller("writeback.turn-ended", () => loadProbe.time("turn_ended", () => writeback.turnEnded(event, paseo), "hook")); });
+  server.on("agent.permission_requested", (event, { paseo }) => { paseo = daemonUsage.meter(paseo); attach(paseo); return asCaller("writeback.permission-requested", () => writeback.permissionRequested(event, paseo)); });
+  server.on("agent.permission_resolved", (event, { paseo }) => { paseo = daemonUsage.meter(paseo); return asCaller("writeback.permission-resolved", () => writeback.permissionResolved(event, paseo)); });
+  server.on("agent.archived", (event, { paseo }) => { paseo = daemonUsage.meter(paseo); agentDirectory.invalidate(); return asCaller("writeback.archived", () => writeback.archived(event, paseo)); });
+  server.on("agent.created", (_event, { paseo }) => { paseo = daemonUsage.meter(paseo); agentDirectory.invalidate(); attach(paseo); asCaller("state-labels", () => stateLabels.soon()); wakeComments(); });
+  server.on("workspace.created", (_event, { paseo }) => { paseo = daemonUsage.meter(paseo); attach(paseo); asCaller("state-labels", () => stateLabels.soon()); wakeComments(); });
   server.before("agent.session_open", sessionPrepare({ attach, plannotator: plannotatorHook, envs: agentEnvs }));
-  server.handle(statusRpc, (_input, { paseo }) => { attach(paseo); return linear.status(); });
+  server.handle(statusRpc, (_input, { paseo }) => { attach(daemonUsage.meter(paseo)); return linear.status(); });
   server.handle(dispatchStatusRpc, async (_input, { paseo }) => {
-    attach(paseo);
+    attach(daemonUsage.meter(paseo));
     // The steward's flow summary rides the dispatch status (README, "Ticket steward"); a failure to
     // read it is named here instead of hiding the dispatch state.
     const status = await dispatcher.snapshot();
@@ -792,38 +810,44 @@ export default function contribute(server: PluginServerContext) {
     }
   });
   server.handle(parentsStatusRpc, async () => ({ parents: await parents.all() }));
-  server.handle(projectsStatusRpc, (_input, { paseo }) => { attach(paseo); return projects.status(); });
-  server.handle(planProjectRpc, async ({ projectId }, { paseo }) => { attach(paseo); return asCaller("project-flow", async () => projects.planNow(projectId, await settings.read(), paseo, true)); });
-  server.handle(skipPlanRpc, async ({ projectId }, { paseo }) => { attach(paseo); return asCaller("project-flow", async () => projects.skipPlan(projectId, await settings.read(), paseo)); });
+  server.handle(projectsStatusRpc, (_input, { paseo }) => { attach(daemonUsage.meter(paseo)); return projects.status(); });
+  server.handle(planProjectRpc, async ({ projectId }, { paseo }) => { paseo = daemonUsage.meter(paseo); attach(paseo); return asCaller("project-flow", async () => projects.planNow(projectId, await settings.read(), paseo, true)); });
+  server.handle(skipPlanRpc, async ({ projectId }, { paseo }) => { paseo = daemonUsage.meter(paseo); attach(paseo); return asCaller("project-flow", async () => projects.skipPlan(projectId, await settings.read(), paseo)); });
   server.handle(presenceRpc, () => presence.state());
   server.handle(setPresenceRpc, (change) => presence.update(change));
-  server.handle(focusRpc, (_input, { paseo }) => { attach(paseo); return asCaller("focus", () => focus.status(paseo)); });
+  server.handle(focusRpc, (_input, { paseo }) => { paseo = daemonUsage.meter(paseo); attach(paseo); return asCaller("focus", () => focus.status(paseo)); });
   server.handle(setFocusRpc, async ({ active }, { paseo }) => {
+    paseo = daemonUsage.meter(paseo);
     attach(paseo);
-    if (active) return asCaller("focus", () => focus.enable(paseo));
-    const status = await focus.disable();
-    // What waited for focus starts at this poll, not the next one.
-    dispatcher.wake();
-    return status;
+    return asCaller("focus", async () => {
+      if (active) return focus.enable(paseo);
+      const status = await focus.disable();
+      // What waited for focus starts at this poll, not the next one.
+      dispatcher.wake();
+      return status;
+    });
   });
   // Memory lease (README, "Memory lease"): the menu bar app's RAM cap on new starts.
   const capacityState = async (paseo: PaseoApi): Promise<CapacityState> => {
     const { maxRunning } = (await settings.read()).dispatch;
     return { maxRunning, ...starter.capacity.limit(maxRunning), ...await starter.scheduler.observedCounts(paseo) };
   };
-  server.handle(capacityRpc, (_input, { paseo }) => loadProbe.time("capacity", () => capacityState(paseo), "hook"));
-  server.handle(setCapacityRpc, ({ lease }, { paseo }) => loadProbe.time("capacity.set", () => {
-    starter.capacity.set(lease);
-    return capacityState(paseo);
-  }, "hook"));
+  server.handle(capacityRpc, (_input, { paseo }) => { paseo = daemonUsage.meter(paseo); return loadProbe.time("capacity", () => asCaller("capacity", () => capacityState(paseo)), "hook"); });
+  server.handle(setCapacityRpc, ({ lease }, { paseo }) => {
+    paseo = daemonUsage.meter(paseo);
+    return loadProbe.time("capacity.set", () => asCaller("capacity", () => {
+      starter.capacity.set(lease);
+      return capacityState(paseo);
+    }), "hook");
+  });
   server.handle(pullRequestsRpc, ({ repository }) => pullBoard.read(repository));
   server.handle(labelPullsRpc, ({ repository, label, numbers }) => pullBoard.label(repository, label, numbers));
   // The owner's asks (README, "Owner asks"): read from cache at once (never waiting for the
   // model), answered through the same paths an "@paseo" reply takes.
-  server.handle(ownerAsksRpc, async (_input, { paseo }) => { attach(paseo); return ownerAsksPage(await ownerAsks.snapshot(paseo)); });
-  server.handle(mergeStatusRpc, async (_input, { paseo }) => { attach(paseo); return asCaller("merge-status", () => mergeStatus.snapshot()); });
-  server.handle(answerAskRpc, async (input, { paseo }) => { attach(paseo); return asCaller("owner-asks", () => ownerAsks.answer(input, paseo)); });
-  server.handle(triageAskRpc, async (input, { paseo }) => { attach(paseo); return asCaller("owner-asks", () => ownerAsks.triage(input, paseo)); });
+  server.handle(ownerAsksRpc, async (_input, { paseo }) => { paseo = daemonUsage.meter(paseo); attach(paseo); return asCaller("owner-asks", async () => ownerAsksPage(await ownerAsks.snapshot(paseo))); });
+  server.handle(mergeStatusRpc, async (_input, { paseo }) => { attach(daemonUsage.meter(paseo)); return asCaller("merge-status", () => mergeStatus.snapshot()); });
+  server.handle(answerAskRpc, async (input, { paseo }) => { paseo = daemonUsage.meter(paseo); attach(paseo); return asCaller("owner-asks", () => ownerAsks.answer(input, paseo)); });
+  server.handle(triageAskRpc, async (input, { paseo }) => { paseo = daemonUsage.meter(paseo); attach(paseo); return asCaller("owner-asks", () => ownerAsks.triage(input, paseo)); });
   server.handle(connectRpc, ({ apiKey }) => asCaller("sidebar", () => linear.authenticate(apiKey)));
   server.handle(disconnectRpc, () => linear.disconnect());
   server.handle(listIssuesRpc, async ({ cursor, stateNames, relation }) => {
@@ -848,7 +872,7 @@ export default function contribute(server: PluginServerContext) {
   });
   server.handle(searchIssuesRpc, ({ term, cursor }) => asCaller("sidebar", () => linear.searchIssues(term, cursor)));
   server.handle(issueContextRpc, ({ id }) => asCaller("sidebar", () => linear.detail(id)));
-  server.handle(branchesRpc, ({ projectId }, { paseo }) => projectBranches(paseo, projectId));
+  server.handle(branchesRpc, ({ projectId }, { paseo }) => projectBranches(daemonUsage.meter(paseo), projectId));
   server.handle(getDefaultPromptRpc, async () => ({ template: (await settings.read()).template, builtin: DEFAULT_PROMPT_TEMPLATE }));
   server.handle(setDefaultPromptRpc, ({ template }) => settings.save(template).then((saved) => ({ ...saved, builtin: DEFAULT_PROMPT_TEMPLATE })));
   // The settings screen sees the routing mode and whether a secret is stored; the secret itself
@@ -865,12 +889,12 @@ export default function contribute(server: PluginServerContext) {
   server.handle(getSettingsRpc, async () => settingsView(await settings.read()));
   server.handle(deputyStatusRpc, (input) => deputy.status(input));
   server.handle(reconcileDeputyRpc, async (_input, { paseo }) => {
-    await attach(paseo);
+    await attach(daemonUsage.meter(paseo));
     return deputy.reconcile();
   });
   server.handle(setSettingsRpc, async (input, { paseo }) => {
     const saved = await settings.patch(input);
-    const ready = attach(paseo);
+    const ready = attach(daemonUsage.meter(paseo));
     if (input.dispatch) dispatcher.wake();
     const policyChanged = input.deputy !== undefined || input.template !== undefined;
     const revoked = policyChanged ? await deputy.settingsChanged() : [];
@@ -885,7 +909,8 @@ export default function contribute(server: PluginServerContext) {
     }
     return settingsView(saved);
   });
-  server.handle(launchAgentRpc, async (input, { paseo }) => {
+  server.handle(launchAgentRpc, async (input, { paseo: rawPaseo }) => {
+    const paseo = daemonUsage.meter(rawPaseo);
     const current = await settings.read();
     // The sidebar starts an agent here and now; a draining host starts none, so it refuses
     // instead of forwarding a launch whose workspace the owner picked on this host.
@@ -912,7 +937,7 @@ export default function contribute(server: PluginServerContext) {
     return result;
   });
   server.handle(agentStatusRpc, async (_input, { paseo }) => {
-    attach(paseo);
+    attach(daemonUsage.meter(paseo));
     const installed = await startAgent();
     return { installed, funnel: funnel?.active ?? false, funnelNote: funnel?.note ?? null, lastWebhookAt: webhook.lastEventAt, webhooks: webhook.events, ...sessions.readStats(), usage: linearUsage.snapshot(), budget: { pools: rateBudget.snapshot(), hours: linearUsage.summary() } };
   });
@@ -929,7 +954,10 @@ export default function contribute(server: PluginServerContext) {
     });
   }, 3_000);
   startSoon.unref?.();
-  const usageTimer = setInterval(() => { for (const line of usageLines(linearUsage.snapshot())) console.log(line); }, 60 * 60 * 1000);
+  const usageTimer = setInterval(() => {
+    for (const line of usageLines(linearUsage.snapshot())) console.log(line);
+    for (const line of daemonUsageLines(daemonUsage.drain())) console.log(line);
+  }, 60 * 60 * 1000);
   usageTimer.unref?.();
   // Whether fresh ticket agents still plan with Plannotator's framing (README, "Planning smoke
   // check"): first run two minutes after load, then every 15 minutes when an input changed.

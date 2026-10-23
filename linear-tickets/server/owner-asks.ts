@@ -6,6 +6,7 @@ import type { PaseoApi } from "@getpaseo/client";
 import type { DecisionReceipt, OwnerAsk } from "../shared/contracts";
 import { isSourceReview, type BrowserOwnerAsk } from "../shared/decision-inbox";
 import type { Handover, HandoverRecord } from "./handover";
+import type { AgentDirectory } from "./agent-directory";
 import type { LinearService, OwnerAskComment, OwnerAskIssue } from "./linear";
 import type { NeedsYouIssue, NeedsYouIssues } from "./needs-you";
 import { askHash, askHashParts, EXTRACTION_POLICY, EXTRACTION_VERSION, MAX_SOURCE_CHARS, type AskQuestion, type ExtractInput, type Extraction, type ExtractedAsk } from "./owner-ask-extract";
@@ -34,7 +35,6 @@ const RETRY_DELAYS_MS = [15_000, 60_000, 300_000];
 const CURRENT_RETRY_DELAYS_MS = [60 * 60_000, 6 * 60 * 60_000];
 const CALLER = "owner-asks";
 const SNAPSHOT_READ_CONCURRENCY = 16;
-const AGENT_PAGE = 200;
 
 // Menu-bar polls must not rescan every open issue and its comments on each refresh.
 // A decision always bypasses this cache before delivery; external edits appear within a minute.
@@ -86,6 +86,8 @@ export type OwnerAsksDeps = {
   remoteAgent: (issueId: string) => Promise<boolean>;
   // `<trigger>-needs-you` and `<trigger>-manual` (dispatchLabels).
   labels: () => Promise<{ needsYou: string; manual: string }>;
+  // The shared read-only agent listing (TUC-3006).
+  agentDirectory: Pick<AgentDirectory, "live">;
   // `settings.deputy.model` when set, else the cheap tier's omp model.
   resolveModel: () => Promise<string>;
   extract: (input: ExtractInput, model: string) => Promise<Extraction>;
@@ -823,20 +825,15 @@ export class OwnerAsks {
     let asking: Set<string> | null = new Set<string>();
     if (!paseo) return { live, issues, newest, asking: null };
     try {
-      let cursor: string | undefined;
-      do {
-        const page = await paseo.agents.list({ filter: { includeArchived: false }, page: { limit: AGENT_PAGE, ...(cursor ? { cursor } : {}) } });
-        for (const { agent } of page.entries) {
-          if (LIVE_AGENT[agent.status]) live.add(agent.id);
-          const issueId = agent.labels?.["linear.issueId"];
-          if (issueId && LIVE_AGENT[agent.status] && (agent.pendingPermissions?.length ?? 0) > 0) asking.add(issueId);
-          if (!issueId || agent.labels?.["paseo.parent-agent-id"]) continue;
-          issues.add(issueId);
-          const known = newestAgent.get(issueId);
-          if (LIVE_AGENT[agent.status] && (!known || agent.createdAt > known.createdAt)) newestAgent.set(issueId, { id: agent.id, createdAt: agent.createdAt });
-        }
-        cursor = page.pageInfo.hasMore ? page.pageInfo.nextCursor ?? undefined : undefined;
-      } while (cursor);
+      for (const agent of await this.deps.agentDirectory.live()) {
+        if (LIVE_AGENT[agent.status]) live.add(agent.id);
+        const issueId = agent.labels?.["linear.issueId"];
+        if (issueId && LIVE_AGENT[agent.status] && (agent.pendingPermissions?.length ?? 0) > 0) asking.add(issueId);
+        if (!issueId || agent.labels?.["paseo.parent-agent-id"]) continue;
+        issues.add(issueId);
+        const known = newestAgent.get(issueId);
+        if (LIVE_AGENT[agent.status] && (!known || agent.createdAt > known.createdAt)) newestAgent.set(issueId, { id: agent.id, createdAt: agent.createdAt });
+      }
     } catch (error) {
       console.error(`[linear-tickets] reading this host's agents for the owner asks failed: ${error instanceof Error ? error.message : error}`);
       asking = null;

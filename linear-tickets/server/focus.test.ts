@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
 import type { PaseoApi } from "@getpaseo/client";
+import { AgentDirectory } from "./agent-directory";
 import { Focus, FOCUS_REASON } from "./focus";
 import type { FocusNode } from "./linear";
 import { DEFAULT_DISPATCH, type PluginSettings } from "./settings";
@@ -51,12 +52,14 @@ async function world(t: TestContext, tickets: FocusNode[], agents: Agent[], queu
       }),
     },
   } as unknown as PaseoApi;
+  const agentDirectory = new AgentDirectory({ liveTtlMs: 0 });
+  agentDirectory.attach(paseo);
   const path = join(directory, "focus.json");
   const parked = { all: async () => (options.parked ?? []).map((issueId) => ({ issueId, identifier: `TUC-${issueId}`, agentId: `planner-${issueId}`, plan: "# Plan", line: "", reasons: [], model: null, parkedAt: "2026-10-09T11:00:00Z", announced: true })) };
   const intake = { claimedTickets: options.peer ?? (async () => null) };
-  const make = () => new Focus({ linear, settings: { read: async () => settings }, parked, intake, path, now: () => clock });
+  const make = () => new Focus({ linear, settings: { read: async () => settings }, parked, intake, path, agentDirectory, now: () => clock });
   return {
-    focus: make(), make, paseo, nodes,
+    focus: make(), make, paseo, nodes, agents,
     advance: (ms: number) => { clock += ms; },
     fail: (value: boolean) => { failing = value; },
   };
@@ -176,7 +179,8 @@ test("the status says what each ticket waits for, and focus is complete once all
 
   for (const id of ["working", "asking", "blocked", "plan"]) w.nodes.set(id, { ...w.nodes.get(id)!, status: "In Review" });
   w.advance(5 * 60_000 + 1);
-  const later = await w.make().status({ agents: { list: async () => ({ entries: [], pageInfo: { hasMore: false } }) } } as unknown as PaseoApi);
+  w.agents.splice(0);
+  const later = await w.make().status(w.paseo);
   assert.deepEqual({ left: later.left, complete: later.complete }, { left: 0, complete: true }, "an open manual task leaves no work for the agents");
   assert.equal(later.tickets.find((ticket) => ticket.id === "manual")?.phase, "manual");
 });

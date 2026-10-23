@@ -3,6 +3,7 @@ import { join } from "node:path";
 import type { PaseoAgent, PaseoApi } from "@getpaseo/client";
 import type { BoardAgentFact, BoardFlowFacts, BoardHostFacts, BoardInside, BoardPlanFact, BoardPullFact, BoardStewardFact, BoardWatchdogFact, BoardWorkGroup } from "../shared/board";
 import { PipelineStage, PipelineStatus } from "../shared/plan-pipeline";
+import type { AgentDirectory } from "./agent-directory";
 
 // This host's raw half of the factory board (GET /api/board/local): its live ticket agents with
 // what each is doing right now, and the state its ledgers hold. Read-only and best effort: a
@@ -13,6 +14,8 @@ export type BoardFactsDeps = {
   host: string;
   home: string;
   paseo: () => PaseoApi | null;
+  // The shared read-only agent listing (TUC-3006).
+  agentDirectory: Pick<AgentDirectory, "live">;
   maxRunning: () => Promise<number | null>;
   now?: () => Date;
 };
@@ -113,22 +116,6 @@ function insideOf(entries: { item: unknown; timestamp: unknown }[]): BoardInside
   }
   const mix = [...counts].sort(([leftName, left], [rightName, right]) => right - left || leftName.localeCompare(rightName));
   return { checklist, mix, recent: steps.slice(-6), said };
-}
-
-async function agentsOf(paseo: PaseoApi): Promise<PaseoAgent[]> {
-  const agents: PaseoAgent[] = [];
-  const seen = new Set<string>();
-  let cursor: string | undefined;
-  for (let page = 0; page < 50; page++) {
-    // Archived agents are left out by the daemon: on server087 they are ~6,000 of ~7,000 and listing them took ~9 s.
-    const result = await paseo.agents.list({ page: { limit: 200, ...(cursor ? { cursor } : {}) } });
-    agents.push(...result.entries.map(({ agent }) => agent));
-    if (!result.pageInfo?.hasMore) { if (!result.pageInfo) throw new Error("Agent listing incomplete"); return agents; }
-    cursor = result.pageInfo.nextCursor ?? undefined;
-    if (!cursor || seen.has(cursor)) throw new Error("Agent listing incomplete");
-    seen.add(cursor);
-  }
-  throw new Error("Agent listing exceeds safe bound");
 }
 
 async function readInside(paseo: PaseoApi, agent: PaseoAgent): Promise<BoardInside> {
@@ -314,7 +301,7 @@ export async function collectBoardFacts(deps: BoardFactsDeps): Promise<BoardHost
   const collectedAt = now.toISOString();
   const paseo = deps.paseo();
   if (!paseo) throw new Error("Paseo daemon unavailable");
-  const [all, maxRunning] = await Promise.all([agentsOf(paseo), deps.maxRunning()]);
+  const [all, maxRunning] = await Promise.all([deps.agentDirectory.live(), deps.maxRunning()]);
   const agentCounts: BoardHostFacts["agentCounts"] = { running: 0, idle: 0, initializing: 0, error: 0, permission: 0 };
   const live: { agent: PaseoAgent; status: BoardAgentFact["status"] }[] = [];
   for (const agent of all) {

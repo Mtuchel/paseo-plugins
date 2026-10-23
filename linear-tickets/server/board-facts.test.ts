@@ -5,6 +5,7 @@ import { join } from "node:path";
 import test, { type TestContext } from "node:test";
 import type { PaseoAgent, PaseoApi } from "@getpaseo/client";
 import { BoardHostFacts } from "../shared/board";
+import { AgentDirectory } from "./agent-directory";
 import { collectBoardFacts } from "./board-facts";
 
 const NOW = new Date("2026-10-23T12:00:00.000Z");
@@ -12,6 +13,11 @@ const ago = (minutes: number) => new Date(NOW.getTime() - minutes * 60_000).toIS
 const hours = (h: number) => ago(h * 60);
 
 type Entry = { item: Record<string, unknown>; timestamp: string };
+function factsDirectory(paseo: PaseoApi): AgentDirectory {
+  const directory = new AgentDirectory({ liveTtlMs: 0 });
+  directory.attach(paseo);
+  return directory;
+}
 function fakePaseo(agents: Partial<PaseoAgent>[], timelines: Record<string, Entry[] | "fail">): PaseoApi {
   return {
     agents: {
@@ -100,7 +106,7 @@ test("a host's facts come from its ledgers and its live ticket agents", async (t
     ],
     "a-2": "fail",
   });
-  const facts = await collectBoardFacts({ host: "server087", home: directory, paseo: () => paseo, maxRunning: async () => 50, now: () => NOW });
+  const facts = await collectBoardFacts({ host: "server087", home: directory, paseo: () => paseo, agentDirectory: factsDirectory(paseo), maxRunning: async () => 50, now: () => NOW });
 
   assert.equal(BoardHostFacts.safeParse(facts).success, true);
   assert.equal(facts.host, "server087");
@@ -141,7 +147,8 @@ test("a host's facts come from its ledgers and its live ticket agents", async (t
 
 test("a host without ledgers still answers with its agents", async (t) => {
   const directory = await home(t, {});
-  const facts = await collectBoardFacts({ host: "mbp", home: directory, paseo: () => fakePaseo([liveAgent("a", "error", ticket("T-1"))], { a: [] }), maxRunning: async () => null, now: () => NOW });
+  const paseo = fakePaseo([liveAgent("a", "error", ticket("T-1"))], { a: [] });
+  const facts = await collectBoardFacts({ host: "mbp", home: directory, paseo: () => paseo, agentDirectory: factsDirectory(paseo), maxRunning: async () => null, now: () => NOW });
   assert.equal(facts.steward, null);
   assert.equal(facts.ownership, null);
   assert.deepEqual(facts.watchdog, []);
@@ -153,5 +160,5 @@ test("a host without ledgers still answers with its agents", async (t) => {
 
 test("facts fail loudly without the Paseo daemon", async (t) => {
   const directory = await home(t, {});
-  await assert.rejects(collectBoardFacts({ host: "mbp", home: directory, paseo: () => null, maxRunning: async () => null, now: () => NOW }));
+  await assert.rejects(collectBoardFacts({ host: "mbp", home: directory, paseo: () => null, agentDirectory: new AgentDirectory(), maxRunning: async () => null, now: () => NOW }));
 });

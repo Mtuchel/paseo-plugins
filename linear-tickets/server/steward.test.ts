@@ -16,6 +16,7 @@ import type { Launcher } from "./launch";
 import { detailSchema } from "../shared/contracts";
 import type { WatchdogFile } from "./watchdog";
 import { SessionRouter, SessionStore, type HostOwnership, type Succession } from "./sessions";
+import { AgentDirectory } from "./agent-directory";
 import { hostname } from "node:os";
 import { stageEvidence } from "./recovery-diagnostic";
 import { NeedsYouIssues } from "./needs-you";
@@ -2140,6 +2141,7 @@ test("diagnostic replacement enters the real router turn but still refuses a que
     // This isolated successor fixture supplies only the endpoints used by dispatch and its
     // best-effort thread cleanup; unrelated router webhook endpoints are never exercised.
     const routerDependencies = {
+      agentDirectory: new AgentDirectory(),
       store,
       api: { createSessionOnIssue: async () => "new-session", activity: async () => {}, updateSession: async () => {}, openSessions: async () => [], sessionStatuses: async () => new Map() },
       linear: { issueStatus: async () => ({ status: "In Progress", statusType: "started" }), addLabel: async () => {}, removeLabel: async () => {} },

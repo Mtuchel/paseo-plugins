@@ -1,5 +1,6 @@
 import type { PaseoApi } from "@getpaseo/client";
 import type { MergeBlocker, MergeStatusSnapshot } from "../shared/merge-status";
+import type { AgentDirectory } from "./agent-directory";
 import type { Handover } from "./handover";
 import { QUEUE_BLOCKER_TITLE_PREFIX, type LinearService } from "./linear";
 import type { ParkedPlans } from "./parked";
@@ -10,6 +11,8 @@ export type MergeStatusDeps = {
   linear: Pick<LinearService, "focusQueueBlockers">;
   teamKeys: () => Promise<string[]>;
   paseo: () => PaseoApi | null;
+  // The shared read-only agent listing (TUC-3006).
+  agentDirectory: Pick<AgentDirectory, "live">;
   handover: Pick<Handover, "all">;
   parked: Pick<ParkedPlans, "all">;
   sessions: Pick<SessionStore, "all">;
@@ -52,20 +55,15 @@ export class MergeStatus {
   }
 
   private async agents(): Promise<Agent[]> {
-    const paseo = this.deps.paseo();
-    if (!paseo) throw new Error("Paseo is disconnected; repair agents cannot be checked.");
-    const agents = new Map<string, Agent>();
-    const seen = new Set<string>();
-    let cursor: string | undefined;
-    do {
-      const page = await paseo.agents.list({ filter: { includeArchived: false }, page: { limit: 200, ...(cursor ? { cursor } : {}) } });
-      if (typeof page.pageInfo.hasMore !== "boolean") throw new Error("Paseo returned incomplete repair-agent pagination metadata.");
-      for (const { agent } of page.entries) if (!agent.archivedAt) agents.set(agent.id, agent);
-      cursor = page.pageInfo.hasMore ? page.pageInfo.nextCursor ?? undefined : undefined;
-      if (page.pageInfo.hasMore && (!cursor || seen.has(cursor))) throw new Error("Paseo returned an incomplete or repeated repair-agent cursor.");
-      if (cursor) seen.add(cursor);
-    } while (cursor);
-    return [...agents.values()];
+    if (!this.deps.paseo()) throw new Error("Paseo is disconnected; repair agents cannot be checked.");
+    try {
+      return (await this.deps.agentDirectory.live()).filter((agent) => !agent.archivedAt);
+    } catch (error) {
+      // The snapshot keeps prior evidence and reports why; the listing's refusal keeps the wording
+      // repair readers already know.
+      if (error instanceof Error && error.message.startsWith("Agent listing")) throw new Error(`Paseo returned an incomplete or repeated repair-agent cursor: ${error.message}`);
+      throw error;
+    }
   }
 
   private async collect(): Promise<MergeBlocker[]> {

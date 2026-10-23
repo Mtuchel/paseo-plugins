@@ -9,6 +9,7 @@ import type { SessionLink } from "./sessions";
 import type { ParkedPlan } from "./parked";
 import type { HandoverRecord } from "./handover";
 import { ADVISOR_MODEL } from "../shared/plan-advisor";
+import { AgentDirectory } from "./agent-directory";
 import { PlanPipeline, type PipelineReview } from "./plan-pipeline";
 import { NativeReader, pipelineOwnerEvidence } from "./plan-pipeline-source";
 import { limitTime } from "./limit-resume";
@@ -78,8 +79,10 @@ async function harness(run: (h: Harness) => Promise<void>, entries = planning())
   await writeFile(native, JSON.stringify({ type: "session", version: 3, id: "native-session", timestamp: START, cwd: home }) + "\n");
   await append(entries);
   const agents = [{ id: "root", provider: "omp", cwd: home, model: "openai-codex/gpt-6.1-sol", createdAt: START, updatedAt: START, status: "running", labels: { "linear.issueId": "issue", "linear.identifier": "TUC-99", "linear.plan": "required" }, pendingPermissions: [], runtimeInfo: { provider: "omp", sessionId: "native-session" }, persistence: { provider: "omp", sessionId: "native-session", nativeHandle: native } }] as unknown as PaseoAgent[];
+  const agentDirectory = new AgentDirectory({ liveTtlMs: 0, archivedTtlMs: 0 });
   const make = (): PlanPipeline => new PlanPipeline({ host: "test-host", home, file, now: () => h.clock, sessions: async () => h.sessions, parked: async () => h.parked,
     owners: (issueIds) => pipelineOwnerEvidence(home, issueIds, h.ownerFiles ? undefined : async (issueId) => h.owners.get(issueId) ?? null),
+    agentDirectory,
     processInspector: {
     processes: async () => h.absent ? "" : `123 omp --mode rpc-ui --session ${native}\n`,
     cwd: async () => home, canonicalPath: async (path) => path,
@@ -97,6 +100,7 @@ async function harness(run: (h: Harness) => Promise<void>, entries = planning())
       ref: (agent: PaseoAgent) => ({ timeline: { refetch: async () => ({ entries: h.timelines[agent.id] ?? [], error: null }) } }),
     },
   } as unknown as PaseoApi;
+  agentDirectory.attach(paseo);
   h.pipeline.attach(paseo);
   try { await h.refresh(); await run(h); }
   finally { h.pipeline.stop(); await h.pipeline.refresh(); await rm(home, { recursive: true, force: true }); }
@@ -368,8 +372,11 @@ test("inbox snapshot never waits for a blocked source refresh; refresh is single
   const held = new Promise<void>((resolve) => { release = resolve; });
   const entered = new Promise<void>((resolve) => { started = resolve; });
   let lists = 0;
-  const pipeline = new PlanPipeline({ home, host: "host", sessions: async () => [], parked: async () => [] });
-  pipeline.attach({ agents: { list: async () => { lists++; started(); await held; return { entries: [], pageInfo: { hasMore: false } }; } } } as unknown as PaseoApi);
+  const agentDirectory = new AgentDirectory({ liveTtlMs: 0, archivedTtlMs: 0 });
+  const paseo = { agents: { list: async () => { lists++; started(); await held; return { entries: [], pageInfo: { hasMore: false } }; } } } as unknown as PaseoApi;
+  agentDirectory.attach(paseo);
+  const pipeline = new PlanPipeline({ home, host: "host", sessions: async () => [], parked: async () => [], agentDirectory });
+  pipeline.attach(paseo);
   try {
     await entered;
     const snapshots = await Promise.all(Array.from({ length: 10 }, () => pipeline.snapshot([], [])));

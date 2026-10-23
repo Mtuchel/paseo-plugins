@@ -18,6 +18,7 @@ import { ProjectFlow, ProjectStore } from "./project-flow";
 import { PullRequestWatch } from "./pr-watch";
 import { RateBudget, RateLimitedError, withPriority, type Pool } from "./rate-budget";
 import { CommentRelay } from "./relay";
+import { AgentDirectory } from "./agent-directory";
 import { SessionRouter, SessionStore } from "./sessions";
 import { DEFAULT_ACTIVATION, DEFAULT_BACKSTOP, DEFAULT_DISPATCH, DEFAULT_WRITEBACK, type PluginSettings } from "./settings";
 import { StateLabels } from "./state-labels";
@@ -260,16 +261,18 @@ test("a key-first read refused at the key's reserve is answered by the app; a Li
 test("the comment relay pauses at 9% of the points budget and sends at 11%", async (t) => {
   const dir = await directory(t, "paseo-relay-");
   const paseo = { agents: { list: async () => ({ entries: [{ agent: { id: "agent-1", createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-02T00:00:00Z", labels: AGENT.labels } }], pageInfo: { hasMore: false, nextCursor: null } }) } } as unknown as PaseoApi;
+  const agentDirectory = new AgentDirectory({ liveTtlMs: 0 });
+  agentDirectory.attach(paseo);
 
   // The relay's first Linear read is the viewer, which the key answers.
   const low = fixture(t);
   low.sample("key", PLENTY_REQUESTS, LOW_POINTS);
-  await assert.rejects(new CommentRelay(low.linear, join(dir, "low.json")).poll(paseo), RateLimitedError);
+  await assert.rejects(new CommentRelay(low.linear, join(dir, "low.json"), undefined, undefined, undefined, { agentDirectory }).poll(paseo), RateLimitedError);
   assertPaused(low, "comment-relay", "key");
 
   const high = fixture(t, (call) => call.operation === "viewerCheck" ? { viewer: { id: "me" } } : call.operation === "appViewer" ? { viewer: { id: "paseo-app", name: "Paseo" } } : {});
   high.sample("key", PLENTY_REQUESTS, HIGH_POINTS);
-  await new CommentRelay(high.linear, join(dir, "high.json")).poll(paseo);
+  await new CommentRelay(high.linear, join(dir, "high.json"), undefined, undefined, undefined, { agentDirectory }).poll(paseo);
   assertSent(high, "key");
 });
 
@@ -353,7 +356,9 @@ test("the plan request poll pauses at 9% of the points budget and sends at 11%",
   const dir = await directory(t, "paseo-plans-");
   t.mock.method(console, "error", () => {});
   const paseo = { agents: { list: async () => ({ entries: [{ agent: { id: "agent-1", labels: AGENT.labels } }], pageInfo: { hasMore: false, nextCursor: null } }) } } as unknown as PaseoApi;
-  const poller = (f: Fixture) => new PlanRequests({ linear: f.linear, apps: { ids: async () => [] }, prompt: async () => "sent", directory: join(dir, "requests") } as never);
+  const agentDirectory = new AgentDirectory({ liveTtlMs: 0 });
+  agentDirectory.attach(paseo);
+  const poller = (f: Fixture) => new PlanRequests({ linear: f.linear, apps: { ids: async () => [] }, prompt: async () => "sent", directory: join(dir, "requests"), agentDirectory } as never);
 
   const low = fixture(t);
   bothAt(low, LOW_POINTS);
@@ -465,7 +470,7 @@ test("AC-4: at 4% of either dimension a write-back comment, a session reply and 
     f.sample("app", dimension === "requests" ? 200 : PLENTY_REQUESTS, dimension === "points" ? 80_000 : HIGH_POINTS);
     f.sample("key", dimension === "requests" ? 200 : PLENTY_REQUESTS, dimension === "points" ? 80_000 : HIGH_POINTS);
     const writeback = new Writeback(f.linear, { read: async () => summaryWriteback }, undefined, 0, join(dir, "outbox.json"));
-    const router = new SessionRouter({ api: new AgentApi({ accessToken: async () => APP_TOKEN }, f.post), store: new SessionStore(join(dir, "sessions.json")) } as never);
+    const router = new SessionRouter({ api: new AgentApi({ accessToken: async () => APP_TOKEN }, f.post), store: new SessionStore(join(dir, "sessions.json")), agentDirectory: new AgentDirectory() } as never);
     const turn = { agent: AGENT, outcome: { kind: "failed", error: new Error("boom") }, timeline: [] } as never;
 
     // Interactive work is refused on both pools, before any request goes out.
