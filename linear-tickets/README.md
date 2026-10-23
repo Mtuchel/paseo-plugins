@@ -5280,6 +5280,27 @@ Browser live-question deferrals persist privately on the question's host and do 
 restart an agent; they are separate from the native app's local live-question snoozes. Linear
 triage and actual answers are shared with the menu bar, which remains available in parallel.
 
+## Factory board
+
+Open `https://<host>:8444/board` on the same tailnet-only service as the inbox. It is read-only and
+shows every ticket the plugin works on, on both hosts, as one belt per stage (Labelled, Planning,
+Waiting on you, Approved, Working, Pull request, Ready / queue, Merged (24 h)). Each card carries its
+health (broken, stale, you, slow, blocked, ok) with the reasons behind it, the agents working on it
+and what they are doing (their latest checklist, tool mix, recent steps and last message), its
+open pull request (CI, conflicts, queue drops) and its repair history (watchdog cycles, steward
+restarts, refusals, escalation). A Needs-attention list and a causes list sit above the belts.
+
+**Sources.** Each host answers `GET /api/board/local` with its own facts: its live ticket agents
+(with their public timeline tails), and the steward, ownership check, watchdog, plan-pipeline and
+pr-watch ledgers it keeps (a host without a ledger reports it as absent). `GET /api/board` on the
+host you open joins its own facts with every `reviewPeers` peer's (8 s deadline; a peer that does
+not answer valid facts is listed as unreachable), the open and last-24-hour Linear tickets carrying
+the dispatch label, and the open GitHub pull requests of the repositories pr-watch follows. Facts
+are cached for 30 seconds, Linear and GitHub for two minutes, each collected by one flight; nothing
+is read until the board is opened. When Linear or GitHub cannot be read the board stays up from
+the hosts' facts and marks that source unavailable. The page refreshes every minute and shows
+when each source was last read.
+
 ## Owner asks
 
 The browser and Paseo Agents menu bar present a decision inbox, not an undifferentiated list of every ticket in

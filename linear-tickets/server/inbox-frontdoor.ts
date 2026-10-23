@@ -4,6 +4,7 @@ import { dirname, join } from "node:path";
 import { z } from "zod";
 import { isActivationPath, MAX_ACTIVATION_BODY_BYTES } from "./activation";
 import { decisionPage } from "./decision-page";
+import { boardPage } from "./board-page";
 import { backendSecretPath, headerValue, INBOX_AUTH_HEADER, INBOX_BACKEND_PORT, INBOX_FRONTDOOR_PORT, INBOX_INSTANCE_HEADER, INBOX_DISPLAYED_HEADER, INBOX_PROTOCOL_VERSION, readBackendSecret, type InboxAvailability, type InboxBackendState, type InboxSnapshot } from "./inbox-transport";
 import { closedPage, inboxPage, MANIFEST, SERVICE_WORKER, type InboxView } from "./review-page";
 import { REVIEW_ICON_PNG } from "./review-icon";
@@ -354,6 +355,9 @@ class Frontdoor implements InboxFrontdoor {
     }
     if (method !== "GET" && method !== "HEAD") return { status: 405, headers: { allow: "GET" } };
     if (path === "/" || path === "/decisions") return this.page(path);
+    // The board shell is static: served here, outside the snapshot, so it survives a backend outage
+    // and its own client can report the outage instead of the frontdoor blocking the page.
+    if (path === "/board") return { status: 200, headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" }, body: boardPage() };
     if (path === "/api/inbox/availability") {
       await this.freshen();
       return json(200, this.availability());
@@ -375,7 +379,8 @@ class Frontdoor implements InboxFrontdoor {
     // Source review pages and recovery evidence are read live from the backend with their query,
     // never from the snapshot: only the owning host can answer them (decision-inbox.ts).
     if (path === "/api/inbox" || path === "/api/decisions/local" || path === "/api/decisions/reviews" || path === "/api/decisions/reviews/local"
-      || path === "/api/decisions/flow" || path === "/api/decisions/flow/local" || path === "/api/push/key") return this.forward("read", method, originForm, headers, null);
+      || path === "/api/decisions/flow" || path === "/api/decisions/flow/local" || path === "/api/push/key"
+      || path === "/api/board" || path === "/api/board/local") return this.forward("read", method, originForm, headers, null);
     if (path === "/manifest.webmanifest") return { status: 200, headers: { "content-type": "application/manifest+json" }, body: MANIFEST };
     if (path === "/sw.js") return { status: 200, headers: { "content-type": "text/javascript; charset=utf-8", "service-worker-allowed": "/" }, body: SERVICE_WORKER };
     if (path === "/icon.png") return { status: 200, headers: { "content-type": "image/png" }, body: REVIEW_ICON_PNG };
