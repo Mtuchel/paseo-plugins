@@ -307,13 +307,16 @@ export function labeledIssueFilter(label: string, teamKeys: string[], options: {
   };
 }
 
-// The labels of the tickets running agents work on, for mid-run plan requests (plan-requests.ts).
-export const ISSUE_LABELS_QUERY = `query issueLabels($first: Int!, $ids: [ID!]) {
+// What the plan request poll (plan-requests.ts) checks every minute for all running tickets at
+// once: each ticket's `updatedAt` (a label change moves it) and its newest replan comments created
+// since the poll before; only a ticket where one of them moved has its own history read.
+export const PLAN_REQUEST_STAMPS_QUERY = `query planRequestStamps($first: Int!, $ids: [ID!], $since: DateTimeOrDuration!) {
   issues(first: $first, includeArchived: true, filter: { id: { in: $ids } }) {
-    nodes { id labels(first: 50) { nodes { id name } } }
+    nodes { id updatedAt comments(first: 10, filter: { body: { contains: "<!-- replan-op:" }, createdAt: { gte: $since } }) { nodes { createdAt } } }
   }
 }`;
-const ISSUE_LABELS_BATCH = 50;
+const PLAN_REQUEST_STAMPS_BATCH = 50;
+export type PlanRequestStamp = { updatedAt: string; replanAt: string | null };
 
 // `priority`: Linear's 1 (urgent) … 4 (low); 0 means none and sorts last.
 // `openChildren`: the ticket has at least one sub-issue that is not completed or canceled.
@@ -1636,20 +1639,22 @@ export class LinearService {
     }
   }
 
-  // Label names by ticket id, lower-cased. The Paseo app's pool first; the key when the app cannot
+  // Per ticket id: its `updatedAt` and its newest replan comment created at or after `since` (null
+  // without one). One read per 50 tickets, the Paseo app's pool first; the key when the app cannot
   // see every ticket asked for. Ids Linear does not return are missing from the map.
-  async issueLabels(ids: string[]): Promise<Map<string, string[]>> {
-    const labels = new Map<string, string[]>();
+  async planRequestStamps(ids: string[], since: string): Promise<Map<string, PlanRequestStamp>> {
+    const stamps = new Map<string, PlanRequestStamp>();
     const valid = [...new Set(ids)].filter((id) => UUID.test(id));
-    for (let start = 0; start < valid.length; start += ISSUE_LABELS_BATCH) {
-      const batch = valid.slice(start, start + ISSUE_LABELS_BATCH);
-      const data = record(await this.read(ISSUE_LABELS_QUERY, { first: batch.length, ids: batch }, (found) => connection(record(found.issues)).nodes.length === batch.length));
+    for (let start = 0; start < valid.length; start += PLAN_REQUEST_STAMPS_BATCH) {
+      const batch = valid.slice(start, start + PLAN_REQUEST_STAMPS_BATCH);
+      const data = record(await this.read(PLAN_REQUEST_STAMPS_QUERY, { first: batch.length, ids: batch, since }, (found) => connection(record(found.issues)).nodes.length === batch.length));
       for (const node of connection(record(data.issues)).nodes.map((item) => record(item))) {
         const id = label(node.id);
-        if (id) labels.set(id, labelNodes(node.labels).map((item) => item.name.trim().toLowerCase()));
+        const replanAt = connection(node.comments ?? { nodes: [] }).nodes.map((item) => label(record(item).createdAt)).filter(Boolean).sort().at(-1) ?? null;
+        if (id && label(node.updatedAt)) stamps.set(id, { updatedAt: label(node.updatedAt), replanAt });
       }
     }
-    return labels;
+    return stamps;
   }
 
   async issueState(id: string): Promise<IssueState> {

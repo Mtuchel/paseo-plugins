@@ -44,6 +44,12 @@ async function harness(run: (h: {
   const delivery = { outcome: "sent" as "sent" | "busy" | "waiting" | "unavailable" };
   const build = () => new PlanRequests({
     linear: {
+      // As Linear's: a label change moves the ticket's `updatedAt`, a replan comment is its newest.
+      // The fixture's dates are older than the clock, so the read's `since` window is not modelled.
+      planRequestStamps: async (ids: string[]) => new Map(ids.map((id) => [id, {
+        updatedAt: [CREATED_AT, ...events.map((event) => event.at)].sort().at(-1)!,
+        replanAt: comments.map((item) => item.at).sort().at(-1) ?? null,
+      }])),
       issueDocument: async () => plan,
       replanComments: async (_issueId: string, since: string) => comments.filter((item) => item.at > since),
       existingLabelId: async (name: string) => labels.find((label) => label.name.trim().toLowerCase() === name)?.id ?? null,
@@ -330,4 +336,46 @@ test("AC-13: a request for a provider without the extension stays pending until 
     await requests.poll();
     assert.equal(prompts.length, 2, "a delivered request is never sent twice");
   }, { provider: "claude-code" });
+});
+
+test("a poll reads every ticket's own history only when the ticket changed since the poll before", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "paseo-plan-requests-"));
+  const calls: string[] = [];
+  const updated: Record<string, string> = { "issue-1": CREATED_AT, "issue-2": CREATED_AT, "issue-3": CREATED_AT };
+  const events: LabelEvent[] = [];
+  const agent = (n: number) => ({ agent: { id: `agent-${n}`, createdAt: CREATED_AT, provider: "omp", labels: { "linear.issueId": `issue-${n}`, "linear.identifier": `TUC-${n}` } } });
+  const paseo = { agents: { list: async () => ({ entries: [agent(1), agent(2), agent(3)], pageInfo: { hasMore: false } }) } } as unknown as PaseoApi;
+  const requests = new PlanRequests({
+    linear: {
+      planRequestStamps: async (ids: string[]) => { calls.push(`stamps ${ids.length}`); return new Map(ids.map((id) => [id, { updatedAt: updated[id], replanAt: null }])); },
+      issueDocument: async (issueId: string) => { calls.push(`document ${issueId}`); return { content: PLAN }; },
+      replanComments: async (issueId: string) => { calls.push(`comments ${issueId}`); return []; },
+      existingLabelId: async () => "label-plan",
+      labelHistory: async (issueId: string) => { calls.push(`history ${issueId}`); return issueId === "issue-2" ? events : []; },
+      viewerId: async () => "owner-1",
+    } as never,
+    apps: { ids: async () => ["app-1"] },
+    prompt: async () => "sent",
+    directory,
+  });
+  requests.attach(paseo);
+  try {
+    await requests.poll();
+    assert.deepEqual(calls.filter((call) => call.startsWith("history")).length, 3, "an agent seen the first time has its ticket read");
+    calls.length = 0;
+    await requests.poll();
+    assert.deepEqual(calls, ["stamps 3"], "nothing changed: one read for all tickets");
+    calls.length = 0;
+    events.push({ at: "2026-10-03T09:00:00.000Z", actorId: "owner-1", added: ["label-plan"], removed: [] });
+    updated["issue-2"] = "2026-10-03T09:00:00.000Z";
+    await requests.poll();
+    assert.deepEqual(calls, ["stamps 3", "history issue-2"], "only the changed ticket's history is read");
+    assert.equal(await requests.roundStartedAt("agent-2"), "2026-10-03T09:00:00.000Z");
+    calls.length = 0;
+    await requests.poll();
+    assert.deepEqual(calls, ["stamps 3"], "a change already read is not read again");
+  } finally {
+    requests.stop();
+    await rm(directory, { recursive: true, force: true });
+  }
 });

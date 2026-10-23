@@ -1162,6 +1162,15 @@ label is being removed puts the label back and is delivered at the next poll. A 
 records while its agent restarts, or one whose label was lost in a crash, is still delivered: the
 label is only the indicator, the request itself is the comment or the label add as recorded.
 
+The poll runs every minute and costs one Linear read per 50 running tickets: each ticket's
+`updatedAt` and its replan comments since the poll before (less five minutes for clock
+difference). A ticket's own reads follow only where they can find something new: its replan
+comments (and its plan document, when there is a comment to judge) when a newer one appeared, its
+label history when the ticket changed. An agent seen the first time, a change of the trusted apps
+and a request still waiting for its delivery read everything for that agent. What each poll saw
+is kept per agent in `$PASEO_HOME/linear-tickets/plan-requests/state.json`; a poll that fails
+saves nothing, so the next one looks back to the last poll that went through.
+
 **Plan advisor.** Every plan a ticket agent writes gets a second opinion before it reaches you.
 The planner (the model you launch tickets with; the model guard keeps it there) creates a GPT-6
 Astra advisor (`omp/openai-codex/gpt-6-astra`, thinking `medium`) with Paseo's `create_agent`, in
