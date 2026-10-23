@@ -5,7 +5,7 @@ import { join } from "node:path";
 import test, { type TestContext } from "node:test";
 import { setImmediate } from "node:timers/promises";
 import type { PaseoApi } from "@getpaseo/client";
-import { LinearApiError, LinearRefusedError, type ProjectIssue, type TeamIssue, type TicketRef } from "./linear";
+import { LinearApiError, LinearRefusedError, type ProjectIssue, type TicketRef } from "./linear";
 import { Capacity } from "./capacity";
 import { SetupError, type PlannerStart } from "./launch";
 import { REPAIR_BUSY_MESSAGE, RepairBusyError } from "./repair-exclusion";
@@ -66,7 +66,6 @@ async function room(t: TestContext, issues: ProjectIssue[], running: string[] = 
   let starting = false;
   const outage = () => new LinearApiError("The Linear API request failed (HTTP 503). Try again.", 503);
   const descriptions = new Map<string, string>();
-  const team: TeamIssue[] = [];
   const elsewhere = new Map<string, TicketRef>();
   // Blocking relations written by the flow: a full read shows them on the blocked ticket; a
   // changed-only read (the host's cache) may not yet.
@@ -87,7 +86,6 @@ async function room(t: TestContext, issues: ProjectIssue[], running: string[] = 
     labeledProjects: async () => { reads.push("labeledProjects"); if (fail.read) throw outage(); return labelled ? [{ id: "erp", name: "ERP" }] : []; },
     projectIssues: async () => { reads.push("projectIssues"); if (fail.read) throw outage(); return issues; },
     issueDescriptions: async () => { reads.push("issueDescriptions"); if (fail.read) throw outage(); return descriptions; },
-    openTeamIssues: async (_teams: string[], limit: number) => { reads.push("openTeamIssues"); if (fail.read) throw outage(); return team.slice(0, limit); },
     issueRef: async (identifier: string) => { reads.push("issueRef"); if (fail.read) throw outage(); return elsewhere.get(identifier) ?? null; },
     relate: async (id: string, other: string, type: string) => { calls.push(`${id} ${type} ${other}`); },
     addLabel: async (id: string, name: string) => { calls.push(`label ${id} +${name}`); },
@@ -147,7 +145,7 @@ async function room(t: TestContext, issues: ProjectIssue[], running: string[] = 
   const makeFlow = () => new ProjectFlow({ ...deps, store: new ProjectStore(path, () => now) });
   const flow = makeFlow();
   return {
-    flow, makeFlow, calls, reads, path, store, tiers, issues, fail, comments, updates, starts, descriptions, team, elsewhere, held, usage, launchedSelectors,
+    flow, makeFlow, calls, reads, path, store, tiers, issues, fail, comments, updates, starts, descriptions, elsewhere, held, usage, launchedSelectors,
     now: () => now,
     notificationAttempts,
     setLabelled: (value: boolean) => { labelled = value; },
@@ -1055,23 +1053,19 @@ test("the work-order block accepts list markers and case, and ignores other line
   ]);
 });
 
-test("the planner's brief gives every NEW ticket in full and lists the team's open tickets outside the project", async (t) => {
+test("the planner's brief gives every NEW ticket in full and leaves the team's other tickets to the candidate list", async (t) => {
   const long = `Export the ledger. ${"Every column is listed here. ".repeat(20)}The CSV uses semicolons.`;
   const r = await room(t, [issue(1, { createdAt: "2025-12-31T00:00:00Z" }), issue(2)]);
   r.descriptions.set("i1", long);
   r.descriptions.set("i2", long);
   await r.seed({ plannedThrough: "2026-01-01T00:00:00Z", planner: null, waiting: { i2: "2026-01-01T23:00:00Z" } });
-  r.team.push(
-    { id: "i1", identifier: "TUC-1", title: "Ticket 1", status: "Todo", projectId: "erp", projectName: "ERP" },
-    { id: "o1", identifier: "TUC-50", title: "Ledger export for accounting", status: "In Review", projectId: "fin", projectName: "Finance" },
-    { id: "o2", identifier: "TUC-51", title: "Loose idea", status: "Backlog", projectId: null, projectName: "" },
-  );
   await r.flow.planNow("erp", settings, paseoWith(() => []));
   const brief = r.starts[0].brief;
   assert.equal(brief.split("The CSV uses semicolons.").length - 1, 1, "only the NEW ticket's description is given in full");
-  assert.match(brief, /\*\*TUC-50\*\* Ledger export for accounting \(In Review · Finance\)/);
-  assert.match(brief, /\*\*TUC-51\*\* Loose idea \(Backlog · no project\)/);
-  assert.ok(!/outside ERP[\s\S]*\*\*TUC-1\*\*/.test(brief), "the project's own tickets are not listed again as outside it");
+  assert.match(brief, /\*\*TUC-1\*\* Ticket 1/);
+  assert.ok(!/outside ERP/.test(brief), "no title list of the tickets outside the project");
+  assert.match(brief, /`# Candidate list` at the end of the file the LINEAR_TICKETS_CONTEXT environment variable names/);
+  assert.ok(!r.reads.some((read) => /team/i.test(read)), "the team's other tickets are not read for the brief");
 });
 
 test("a large project's brief stays within the prompt limit and lists every NEW ticket", () => {
@@ -1081,13 +1075,11 @@ test("a large project's brief stays within the prompt limit and lists every NEW 
   const work = Array.from({ length: 2_000 }, (_, n) => issue(n + 1, { title: `${title} ${n + 1}`, labels: ["Platform", "Warehouse"] }));
   const fresh = work.filter((_, n) => n % 10 === 9);
   const descriptions = new Map(work.map((item) => [item.id, "x".repeat(5_000)]));
-  const others: TeamIssue[] = Array.from({ length: 300 }, (_, n) => ({ id: `o${n}`, identifier: `TUC-${5_000 + n}`, title, status: "Todo", projectId: "fin", projectName: "Finance" }));
-  const brief = plannerBrief("ERP", work, fresh, descriptions, others, true, { hold: "paseo-hold", attended: "paseo-attended" });
+  const brief = plannerBrief("ERP", work, fresh, descriptions, { hold: "paseo-hold", attended: "paseo-attended" });
   assert.ok(brief.length <= 120_000, `brief has ${brief.length} characters`);
   const list = brief.split("## NEW tickets in full")[0];
   for (const item of fresh) assert.match(list, new RegExp(`\\*\\*${item.identifier}\\*\\* .*NEW\\)`), `${item.identifier} is listed`);
   assert.match(list, /\d+ more open tickets are not listed for length; search Linear for them\./);
-  assert.match(brief, /Only the \d+ most recently updated are listed; search Linear for older ones\./);
 });
 
 

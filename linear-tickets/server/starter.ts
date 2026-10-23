@@ -18,6 +18,7 @@ import { findProject, readBranches } from "./projects";
 import { advisorNote, hasLabel, PLAN_POLICY_ENV, PLAN_POLICY_LABEL, PLAN_READY_LABEL, PLAN_REQUIRED_NOTE, PLAN_SECTIONS_NOTE, PLAN_SLICING_NOTE, planPolicy, SAFE_MODES, type PlanPolicy } from "./plan-policy";
 import { needsOwner, type Presence } from "./presence";
 import { ghostAgents, LIVE_AGENT, type ProcessInspector } from "./process-liveness";
+import { PRECEDENCE_RULE } from "./related-work";
 import { nightInput, Scheduler, type Admission } from "./scheduler";
 import type { PluginSettings } from "./settings";
 import { launchTier, recordStart, TIER_AGENT_LABEL, tierModel, tierNote, type TierStore } from "./model-tiers";
@@ -70,9 +71,9 @@ export const UNTRUSTED_NOTE = [
   UNTRUSTED_TEXT,
   "Investigate and write a plan only. Do not change code, run installs or make network calls until the owner approves the plan.",
 ].join(" ");
-// Every ticket plan starts with a search for overlapping work (README, "Plan-first"): new tickets,
-// by people or agents, are filed without one.
-export const OVERLAP_NOTE = "Before you plan, look for overlapping work. Search Linear's open tickets (with the linear_ticket tool search_issues, or another Linear read tool such as list_issues with a query; every team and project, including tickets In Progress or In Review whose pull requests are not merged yet) for tickets that change the same feature, files or data as this one, or already ask for what it does, and read the full description of each candidate. Your plan gets an `## Overlapping tickets` section: each overlapping ticket, how it overlaps and what this plan does about it (waits for it, builds on it, leaves a part to it), or \"None found\" with the search terms you used. When you have the linear_ticket tool add_relation, link every real overlap with it as related while you plan. When another ticket already covers all of this one, the plan says so and proposes closing this ticket as its duplicate instead of doing the work.";
+// Every ticket plan starts with a look for overlapping work (README, "Overlap check"): new tickets,
+// by people or agents, are filed without one. The candidate list is in the launch's context file.
+export const OVERLAP_NOTE = `Before you plan, look for overlapping work. Start from the \`# Candidate list\` at the end of the file the LINEAR_TICKETS_CONTEXT environment variable names: this team's open tickets, the approved plans of open tickets with their reach and files, the tickets in Planning, the files of their open and merged pull requests, and the tickets done in the last 60 days. The list is long: search it for this ticket's files, words and places rather than reading it whole. Search Linear (with the linear_ticket tool search_issues, or another Linear read tool such as list_issues with a query) only for other teams' tickets and for what the list marks incomplete. Look for tickets that change the same feature, files or data as this one, or already ask for what it does, and read the full description of each candidate. ${PRECEDENCE_RULE} Your plan gets an \`## Overlapping tickets\` section: each overlapping ticket, how it overlaps and what this plan does about it (waits for it, builds on it, leaves a part to it), or "None found" with what you checked. When you have the linear_ticket tool add_relation, link every real overlap with it as related while you plan. When another ticket already covers all of this one, the plan says so and proposes closing this ticket as its duplicate instead of doing the work.`;
 // Every ticket plan picks the model tier its implementation runs on (README, "Model tiers").
 export const MODEL_NOTE = modelSteps();
 // Every implementer corrects necessary missed reach within scope; small extensions remain optional.

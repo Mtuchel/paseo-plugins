@@ -84,6 +84,8 @@ export class Launcher {
   private readonly gates = new Set<string>();
   private deletions: Pick<ReviewDeletions, "blocked"> | null = null;
   private exclusion: Pick<RepairExclusion, "enterEffect"> | null = null;
+  // The team's candidate list of related work (related-work.ts), for planning launches.
+  private candidates: ((teamId: string) => Promise<string>) | null = null;
   private readonly pending = new Map<string, Set<Promise<Result>>>();
   private readonly canonicalIds = new Map<string, string>();
 
@@ -115,6 +117,12 @@ export class Launcher {
   // sidebar's included, holds an effect token from its first admission read through creation.
   useExclusion(exclusion: Pick<RepairExclusion, "enterEffect">): void {
     this.exclusion = exclusion;
+  }
+
+  // Planning launches (ticket planners and planner runs) get the team's candidate list appended to
+  // their context file (README, "Overlap check").
+  useCandidates(candidates: (teamId: string) => Promise<string>): void {
+    this.candidates = candidates;
   }
 
   async settledFor(issueId: string): Promise<void> {
@@ -375,6 +383,7 @@ export class Launcher {
       ].filter(Boolean).join("\n\n"),
       labels: { "linear.issueId": detail.issue.id, "linear.identifier": detail.issue.identifier, "linear.url": detail.issue.url, ...options.labels },
       env: { ...options.env, [PLAN_TICKET_ENV]: detail.issue.identifier, ...(diagnostic ? { LINEAR_TICKETS_DIAGNOSTIC: "1" } : {}) },
+      teamId: detail.teamId || null,
       mcpServers,
       warnings,
       ...(options.verifier ? { verifier: true } : {}),
@@ -420,6 +429,7 @@ export class Launcher {
       thinkingOptionId: preference.thinkingOptionId,
       prompt: () => prompt,
       labels: { "linear.plannerRun": input.runId, "linear.projectId": input.linearProjectId, "linear.plannerRequest": input.requestId },
+      teamId: input.teamId,
       // The ticket env is a flag for the plugin's omp extension (its plan gate, record_plan_advice
       // and ticket tools); no Linear ticket is behind it.
       env: { [PLAN_POLICY_ENV]: "required", [PLAN_TICKET_ENV]: `project-planner:${input.runId}` },
@@ -438,18 +448,20 @@ export class Launcher {
   private async createAgent(workspace: PaseoWorkspaceHandle, contextRequestId: string, spec: {
     title: string; provider: string; modeId: string | undefined; thinkingOptionId: string | undefined;
     prompt: (linearAccess: boolean) => string; labels: Record<string, string>; env: Record<string, string>;
-    mcpServers: Record<string, TicketMcpServer> | undefined; warnings: string[];
+    mcpServers: Record<string, TicketMcpServer> | undefined; warnings: string[]; teamId: string | null;
     retry: string; blocked?: () => Promise<string | null>;
     // The steward's verifier: it reports through its ticket tool, so a provider that cannot load
     // MCP servers is refused instead of started without the tool it needs.
     verifier?: boolean;
   }): Promise<PaseoAgentHandle> {
+    // Built once per launch, not per attempt: a retry without tools plans the same ticket.
+    const candidates = spec.env[PLAN_POLICY_ENV] ? await this.candidateList(spec.teamId, spec.warnings) : "";
     const create = async (linearAccess: boolean, requestId: string, attach: boolean) => {
       const prompt = spec.prompt(linearAccess);
       let env: Record<string, string> = { ...spec.env };
       if (linearAccess && spec.mcpServers) env[TICKET_MCP_ENV] = JSON.stringify(spec.mcpServers[TICKET_MCP_NAME]);
       try {
-        env = { ...env, [PLAN_CONTEXT_ENV]: await this.planContext(contextRequestId, prompt) };
+        env = { ...env, [PLAN_CONTEXT_ENV]: await this.planContext(contextRequestId, prompt + candidates) };
       } catch (error) {
         spec.warnings.push(`Could not save the context for the plan advisor: ${error instanceof Error ? error.message : "unknown error"}`);
       }
@@ -494,5 +506,19 @@ export class Launcher {
       spec.warnings.push("This provider does not load MCP servers, so the agent has no Linear tools. It was still told about them; choose another provider to let it update Linear.");
     }
     return agent;
+  }
+
+  // The `# Candidate list` part of a planning launch's context file; on failure the launch warns and
+  // the file says to search Linear instead. Empty without a candidate source.
+  private async candidateList(teamId: string | null, warnings: string[]): Promise<string> {
+    if (!this.candidates) return "";
+    try {
+      if (!teamId) throw new Error("the launch names no team");
+      return `\n\n# Candidate list\n\n${await this.candidates(teamId)}`;
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : "unknown error";
+      warnings.push(`Could not build the candidate list of related work: ${reason}`);
+      return `\n\n# Candidate list\n\nThe candidate list could not be built (${reason}). Search Linear's open tickets and those done in the last 60 days for related work instead.`;
+    }
   }
 }

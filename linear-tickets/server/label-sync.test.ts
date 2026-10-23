@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -331,11 +331,12 @@ test("pull request files: merged ones are kept on disk, open ones read again whe
     const path = join(home, "pr-files.json");
     const reads: string[] = [];
     const answers: Record<string, () => PullRequestRead> = {
-      merged: () => ({ state: "MERGED", files: ["o/r/a.ts"] }),
-      open: () => ({ state: "OPEN", files: ["o/r/b.ts"] }),
+      merged: () => ({ state: "MERGED", files: ["o/r/a.ts"], mergedAt: "2026-10-01T10:00:00Z" }),
+      open: () => ({ state: "OPEN", files: ["o/r/b.ts"], mergedAt: null }),
       missing: () => { throw new PullRequestNotFoundError("no pull request"); },
       broken: () => { throw new Error("gh: HTTP 502"); },
       throttled: () => { throw new GitHubRateLimitedError("HTTP 429"); },
+      old: () => ({ state: "CLOSED", files: ["o/r/c.ts"], mergedAt: null }),
     };
     let now = NOW;
     const read = async (url: string) => { reads.push(url); return answers[url](); };
@@ -343,13 +344,21 @@ test("pull request files: merged ones are kept on disk, open ones read again whe
     await files.refresh(["merged", "open", "missing", "broken", "throttled", "after"], 10);
     assert.deepEqual(reads, ["merged", "open", "missing", "broken", "throttled"], "throttling ends the reads");
     assert.deepEqual([files.filesOf("merged"), files.filesOf("open"), files.filesOf("missing"), files.filesOf("broken"), files.filesOf("after")], [["o/r/a.ts"], ["o/r/b.ts"], [], [], null]);
-    assert.deepEqual(JSON.parse(await readFile(path, "utf8")), { pullRequests: { merged: ["o/r/a.ts"], missing: [] } });
+    assert.deepEqual([files.stateOf("merged"), files.stateOf("open"), files.stateOf("broken"), files.stateOf("after")], [{ state: "MERGED", mergedAt: "2026-10-01T10:00:00Z" }, { state: "OPEN", mergedAt: null }, null, null]);
+    const saved = JSON.parse(await readFile(path, "utf8"));
+    assert.deepEqual(saved, { pullRequests: { merged: { files: ["o/r/a.ts"], state: "MERGED", mergedAt: "2026-10-01T10:00:00Z" }, missing: { files: [], state: "MISSING", mergedAt: null } } });
+    // An entry saved before the state was kept: its files are used, its state is read again once.
+    await writeFile(path, JSON.stringify({ pullRequests: { ...saved.pullRequests, old: ["o/r/c.ts"] } }));
     reads.length = 0;
     now += 31 * 60 * 1000;
     const restarted = new PullRequestFiles(path, read, () => now);
     await restarted.refresh(["merged", "missing", "open"], 1);
     assert.deepEqual(reads, ["open"], "the limit counts reads, not known pull requests");
-    assert.deepEqual(restarted.filesOf("merged"), ["o/r/a.ts"]);
+    assert.deepEqual([restarted.filesOf("merged"), restarted.filesOf("old"), restarted.stateOf("merged"), restarted.stateOf("old")], [["o/r/a.ts"], ["o/r/c.ts"], { state: "MERGED", mergedAt: "2026-10-01T10:00:00Z" }, null]);
+    await restarted.refresh(["old"], 10);
+    await restarted.refresh(["old"], 10);
+    assert.deepEqual(reads, ["open", "old"], "a legacy entry is read again once");
+    assert.deepEqual(restarted.stateOf("old"), { state: "CLOSED", mergedAt: null });
   } finally { await rm(home, { recursive: true, force: true }); }
 });
 
