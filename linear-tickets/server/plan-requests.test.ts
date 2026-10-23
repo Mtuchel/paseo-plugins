@@ -30,7 +30,8 @@ async function harness(run: (h: {
   files: () => Promise<string[]>;
   file: (agentId: string) => Promise<{ identifier: string; at: string; message: string }>;
   directory: string;
-}) => Promise<void>, options: { comments?: Comment[]; events?: LabelEvent[]; plan?: string | null; labels?: { id: string; name: string }[]; apps?: string[] } = {}) {
+  delivery: { outcome: "sent" | "busy" | "waiting" | "unavailable" };
+}) => Promise<void>, options: { comments?: Comment[]; events?: LabelEvent[]; plan?: string | null; labels?: { id: string; name: string }[]; apps?: string[]; provider?: string } = {}) {
   const directory = await mkdtemp(join(tmpdir(), "paseo-plan-requests-"));
   const prompts: string[] = [];
   const comments = options.comments ?? [];
@@ -38,18 +39,19 @@ async function harness(run: (h: {
   const plan = options.plan === undefined ? { content: PLAN } : options.plan === null ? null : { content: options.plan };
   const labels = options.labels ?? [{ id: "label-plan", name: "plan" }];
   const paseo = {
-    agents: { list: async () => ({ entries: [{ agent: { id: "agent-1", createdAt: CREATED_AT, labels: { "linear.issueId": "issue-1", "linear.identifier": "TUC-7" } } }], pageInfo: { hasMore: false } }) },
+    agents: { list: async () => ({ entries: [{ agent: { id: "agent-1", createdAt: CREATED_AT, provider: options.provider ?? "omp", labels: { "linear.issueId": "issue-1", "linear.identifier": "TUC-7" } } }], pageInfo: { hasMore: false } }) },
   } as unknown as PaseoApi;
+  const delivery = { outcome: "sent" as "sent" | "busy" | "waiting" | "unavailable" };
   const build = () => new PlanRequests({
     linear: {
-      issueCore: async (issueId: string) => ({ id: issueId, identifier: "TUC-7", labels }),
       issueDocument: async () => plan,
       replanComments: async (_issueId: string, since: string) => comments.filter((item) => item.at > since),
+      existingLabelId: async (name: string) => labels.find((label) => label.name.trim().toLowerCase() === name)?.id ?? null,
       labelHistory: async (_issueId: string, relevant: (event: LabelEvent) => boolean) => events.filter(relevant),
       viewerId: async () => "owner-1",
     } as never,
     apps: { ids: async () => options.apps ?? ["app-1"] },
-    prompt: async (agentId: string, text: string) => { prompts.push(`${agentId}: ${text}`); return "sent" as const; },
+    prompt: async (agentId: string, text: string) => { prompts.push(`${agentId}: ${text}`); return delivery.outcome; },
     directory,
   });
   let requests = build();
@@ -66,7 +68,7 @@ async function harness(run: (h: {
         await requests.poll();
         return requests;
       },
-      prompts, comments, events, files, directory, file: async (agentId) => JSON.parse(await readFile(join(directory, agentId), "utf8")),
+      prompts, comments, events, files, directory, delivery, file: async (agentId) => JSON.parse(await readFile(join(directory, agentId), "utf8")),
     });
   } finally {
     requests.stop();
@@ -273,4 +275,35 @@ test("AC-13: planSetup plans again for an unhandled request, and a `plan` label 
   const owner = await setup(["plan-ready", "plan"], [{ id: "label:l-1", at: "2026-10-03T10:00:00.000Z", kind: "label", authorId: "owner-1" }]);
   assert.equal(owner.policy, "required");
   assert.match(owner.notes.join("\n"), /the owner added the `plan` label/);
+});
+
+test("AC-13: an owner's label add counts after an app removed the label before the poll", async () => {
+  await harness(async ({ requests, events, prompts }) => {
+    events.push(
+      { at: "2026-10-03T09:00:00.000Z", actorId: "owner-1", added: ["label-plan"], removed: [] },
+      // The approval's cleanup removes the label again before this poll reads the ticket.
+      { at: "2026-10-03T09:05:00.000Z", actorId: "app-1", added: [], removed: ["label-plan"] },
+    );
+    await requests.poll();
+    assert.equal(prompts.length, 1, "the add counts even though the ticket no longer carries the label");
+    assert.equal(await requests.roundStartedAt("agent-1"), "2026-10-03T09:00:00.000Z");
+  });
+});
+
+test("AC-13: a request for a provider without the extension stays pending until a prompt is delivered", async () => {
+  await harness(async ({ requests, comments, prompts, files, directory, delivery }) => {
+    comments.push(comment("c-1", "2026-10-03T10:00:00.000Z", "app-1"));
+    delivery.outcome = "busy";
+    await requests.poll();
+    assert.equal(prompts.length, 1, "the prompt was attempted");
+    assert.deepEqual(await files(), [], "no request file is written for a provider that cannot read it");
+    assert.equal(await requests.roundStartedAt("agent-1"), null, "an undelivered request starts no round");
+    assert.deepEqual(JSON.parse(await readFile(join(directory, "state.json"), "utf8"))["agent-1"].handled, [], "it stays pending");
+    delivery.outcome = "sent";
+    await requests.poll();
+    assert.equal(prompts.length, 2, "the next poll sends it again");
+    assert.equal(await requests.roundStartedAt("agent-1"), "2026-10-03T10:00:00.000Z");
+    await requests.poll();
+    assert.equal(prompts.length, 2, "a delivered request is never sent twice");
+  }, { provider: "claude-code" });
 });

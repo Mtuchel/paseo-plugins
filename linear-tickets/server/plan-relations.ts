@@ -35,9 +35,11 @@ export type RelationStep = {
   // (`replan` only). `pending` steps stopped by `stopped` are listed as not applied instead.
   skipped?: string;
   // `duplicates`: the hold and the comment are written one at a time, so a restart repeats only
-  // the missing step; the link is `done`.
+  // the missing step; the link is `done`. The comment's id is reserved before it is posted, so a
+  // lost answer is looked up instead of posting it again.
   held?: boolean;
   told?: boolean;
+  tellId?: string;
   // `replan`: the plan hash the request is about, and the operation id the comment carries.
   targetId?: string;
   replanFor?: string;
@@ -94,9 +96,11 @@ export type RelationsRequest = {
 // comment on this ticket. One private record per ticket under
 // `$PASEO_HOME/linear-tickets/plan-relations`, written after every Linear write, so a repeated
 // approval writes nothing twice and a failed round only repeats what is missing. Work for one
-// ticket runs one call at a time (the plugin is one process). `file()` runs one round and rejects
-// until every line is applied or skipped and the summary is posted; the bridge's sweep calls it
-// again on its retry schedule.
+// ticket runs one call at a time (the plugin is one process). `file()` runs one round and resolves
+// once the work is done, a retry is scheduled, or the record stopped: the decision journal calls it
+// again while it rejects, so an unavailable app must not hold the approval back. Only a rate limit
+// rejects, which pauses the journal with it. The bridge's sweep (`retryPending`) does the later
+// rounds ten minutes apart.
 export class PlanRelations {
   private readonly chains = new Map<string, Promise<void>>();
   private lastScan = Number.NEGATIVE_INFINITY;
@@ -127,11 +131,14 @@ export class PlanRelations {
       record.documentUrl = request.documentUrl ?? record.documentUrl;
       if (request.roundStartedAt !== undefined) record.roundStartedAt = request.roundStartedAt;
       const hash = planHash(request.plan);
+      // A revised plan is a fresh attempt: its lines re-ask and its rounds start over. A filing of
+      // the same plan (a retried decision step) keeps the rounds and the schedule it reached.
+      const revised = record.planHash !== hash;
       const parsed = blockLines(block ?? "").map((line) => ({ line, step: stepOf(line) }));
       // A revised plan: the same line keeps its done state, a line it no longer lists is dropped
       // (never written halfway), and `replan` lines are keyed by the plan's hash, so they ask again.
       const keys = parsed.flatMap(({ line, step }) => step ? [step.kind === "replan" ? `${line} @ ${hash}` : line] : []);
-      if (record.planHash && record.planHash !== hash) {
+      if (record.planHash && revised) {
         const current = new Set(keys);
         for (const [key, step] of Object.entries(record.steps)) {
           if (current.has(key)) continue;
@@ -141,6 +148,11 @@ export class PlanRelations {
         }
         record.dropped = [...new Set(record.dropped)];
         record.doneElsewhere = [...new Set(record.doneElsewhere)];
+        record.attempts = 0;
+        record.retryAt = null;
+        delete record.stopped;
+        delete record.removalKept;
+        delete record.removalRestored;
       }
       record.planHash = hash;
       record.lines = keys;
@@ -148,15 +160,14 @@ export class PlanRelations {
       for (const [index, key] of keys.entries()) {
         if (!record.steps[key]) record.steps[key] = this.freshStep(parsed[index].step!);
       }
-      // An approval is a fresh attempt: retry what stopped, and look at the label again.
-      record.attempts = 0;
-      record.retryAt = null;
-      delete record.stopped;
-      delete record.removalKept;
-      delete record.removalRestored;
-      // A links-only pass (the catch-up) leaves the label to the approval that applied it.
-      record.removal = removal ? "pending" : "done";
+      // A links-only pass (the catch-up) leaves the label to the approval that applied it; the same
+      // plan keeps where its removal got to, so a crash before or after the remove repeats it.
+      if (!removal) record.removal = "done";
+      else if (revised) record.removal = "pending";
       await this.save(record);
+      // A stopped record and a retry that is not due yet are left to the sweep: the decision step
+      // completes and the approval moves on while the relations retry on their own schedule.
+      if (record.stopped || (record.retryAt !== null && record.retryAt > this.now())) return;
       await this.process(record);
     });
   }
@@ -204,18 +215,29 @@ export class PlanRelations {
     return run;
   }
 
+  // One round under the owner's budget. A rate limit is the journal's own pause (it keeps the
+  // attempt); every other failure is counted here, on the record's ten-minute schedule, so the
+  // decision step always resolves and the sweep carries the work out later.
   private process(record: RelationsRecord): Promise<void> {
     return withPriority("owner", "plan relations", async () => {
-      const attempts = record.attempts;
       try {
         await this.processRound(record);
       } catch (error) {
         if (error instanceof RateLimitedError) {
-          record.attempts = attempts;
           record.retryAt = error.resumeAt;
           await this.save(record);
+          throw error;
         }
-        throw error;
+        if (!record.stopped && record.retryAt === null) this.failedRound(record);
+        await this.save(record);
+        console.error(`[linear-tickets] ${record.identifier}: the related-work round failed: ${message(error)}`);
+        return;
+      }
+      // A round that leaves work outstanding without scheduling a retry would wait forever.
+      if (!this.settled(record) && !record.stopped && record.retryAt === null) {
+        console.error(`[linear-tickets] ${record.identifier}: the related work is outstanding with no retry scheduled; the record retries.`);
+        this.failedRound(record);
+        await this.save(record);
       }
     });
   }
@@ -264,19 +286,17 @@ export class PlanRelations {
     if (failed && !record.stopped) this.failedRound(record);
     await this.save(record);
     await this.announce(record, steps);
-    if (!this.settled(record, steps)) throw new Error(`The related work of ${record.identifier} is not applied yet.`);
   }
 
   // One line, as the Paseo app. True when done; false when the app could not be used (retried).
   private async apply(record: RelationsRecord, step: RelationStep): Promise<boolean> {
     if (step.kind === "replan") return this.replan(record, step);
-    // A ticket plan may only change its own ticket's links (D2); every other line is unreadable.
+    // A ticket plan may only change its own ticket's links (D2), in either position of the line;
+    // every other line is unreadable.
     if (![step.ticket, step.other].includes(record.identifier)) {
       step.skipped = `it names no link of ${record.identifier}`;
       return false;
     }
-    const own = await this.linear.issueRef(record.identifier);
-    if (!own) { step.skipped = `${record.identifier} was not found`; return false; }
     if (step.kind === "blocks") {
       const blocker = await this.linear.issueRef(step.ticket);
       const blocked = await this.linear.issueRef(step.other!);
@@ -286,31 +306,42 @@ export class PlanRelations {
       const linked = (await this.linear.issueRelations(blocked.id)).some((relation) => relation.type === "blocks" && relation.direction === "in" && relation.id === blocker.id);
       return linked || (await this.linear.addBlockerAsApp(blocker.id, blocked.id)) !== null;
     }
+    // `relates` and `duplicates` name two tickets, and the plan's own may be either. Both are
+    // resolved, and the line keeps its direction: the first ticket is the one a duplicate closes.
+    const link = await this.linear.issueRef(step.ticket);
     const other = await this.linear.issueRef(step.other!);
+    if (!link) { step.skipped = `${step.ticket} does not exist`; return false; }
     if (!other) { step.skipped = `${step.other} does not exist`; return false; }
-    if (other.id === own.id) { step.skipped = "a ticket cannot be linked to itself"; return false; }
-    const relations = await this.linear.issueRelations(own.id);
-    // Any relation counts for `relates`; only this ticket's own duplicate link for `duplicates`.
+    if (link.id === other.id) { step.skipped = "a ticket cannot be linked to itself"; return false; }
+    const relations = await this.linear.issueRelations(link.id);
+    // Any relation counts for `relates`; only the duplicate ticket's own link for `duplicates`.
     const linked = relations.some((relation) => relation.id === other.id && (step.kind === "relates" || (relation.type === "duplicate" && relation.direction === "out")));
     if (linked) return true;
-    if (step.kind === "relates") return (await this.linear.relateAsApp(own.id, other.id, "related")) !== null;
-    const info = (await this.linear.blockerStates([own.id]))[0];
+    if (step.kind === "relates") return (await this.linear.relateAsApp(link.id, other.id, "related")) !== null;
+    const info = (await this.linear.blockerStates([link.id]))[0];
     if (!info || !UNSTARTED[info.statusType] || info.delegateId) {
       step.skipped = "started or with an agent; only a ticket nobody works on is closed as a duplicate";
       return false;
     }
     if (!step.held) {
-      if (await this.linear.addLabelAsApp(own.id, "paseo-hold") === null) return false;
+      if (await this.linear.addLabelAsApp(link.id, "paseo-hold") === null) return false;
       step.held = true;
       await this.save(record);
     }
     if (!step.told) {
+      // The id is reserved and saved first: a comment Linear created whose answer was lost is
+      // found on the retry instead of posted twice (as the summary path does).
+      if (!step.tellId) {
+        step.tellId = randomUUID();
+        await this.save(record);
+      }
       const body = `Closed as a duplicate of ${other.identifier} by ${record.identifier}'s approved plan${step.reason ? `: ${step.reason}` : "."}`;
-      if (await this.linear.commentAsApp(own.id, body) === null) return false;
+      const posted = (await this.linear.commentById(step.tellId)) !== null;
+      if (!posted && (await this.linear.commentAsApp(link.id, body, step.tellId)) === null) return false;
       step.told = true;
       await this.save(record);
     }
-    return (await this.linear.relateAsApp(own.id, other.id, "duplicate")) !== null;
+    return (await this.linear.relateAsApp(link.id, other.id, "duplicate")) !== null;
   }
 
   // A replan request on another ticket (README, "Related work"): only an open ticket whose plan is
@@ -387,27 +418,32 @@ export class PlanRelations {
     return true;
   }
 
-  private settled(record: RelationsRecord, steps: RelationStep[]): boolean {
+  private settled(record: RelationsRecord): boolean {
     if (record.stopped) return true;
+    const steps = record.lines.flatMap((key) => record.steps[key] ?? []);
     if (!steps.every((step) => step.done || step.skipped)) return false;
-    if (record.removal === "pending" && !record.stopped) return false;
+    if (record.removal === "pending") return false;
     const body = summaryText(record, steps);
     return body === null || createHash("sha256").update(body).digest("hex") === record.summary;
   }
 
   private failedRound(record: RelationsRecord): void {
     record.attempts += 1;
-    if (record.attempts >= MAX_ROUNDS) {
-      record.stopped = "gave-up";
-      record.retryAt = null;
-      console.error(`[linear-tickets] ${record.identifier}: the plan's related work was not applied after ${MAX_ROUNDS} rounds; the record stops. Approve the plan again to retry.`);
+    if (record.attempts < MAX_ROUNDS) {
+      record.retryAt = this.now() + RETRY_MS;
       return;
     }
-    record.retryAt = this.now() + RETRY_MS;
+    record.retryAt = null;
+    // A record stopped for another reason (an untrusted ticket) keeps that reason and stops
+    // retrying its comment it cannot write.
+    if (record.stopped) return;
+    record.stopped = "gave-up";
+    console.error(`[linear-tickets] ${record.identifier}: the plan's related work was not applied after ${MAX_ROUNDS} rounds; the record stops. Approve a revised plan to retry.`);
   }
 
   // One comment per distinct outcome, none while a write still waits for its retry. The id is
-  // reserved and saved before the post, so a lost answer never posts it twice.
+  // reserved and saved before the post, so a lost answer never posts it twice; a null answer (the
+  // app cannot write) keeps the reservation and the summary unannounced, and retries.
   private async announce(record: RelationsRecord, steps: RelationStep[]): Promise<void> {
     const body = summaryText(record, steps);
     if (!body) return;
@@ -422,14 +458,19 @@ export class PlanRelations {
         record.summaryPending = hash;
         await this.save(record);
       }
-      if (!posted) await this.linear.commentAsApp(record.issueId, body, id);
-      record.summary = hash;
-      delete record.summaryId;
-      delete record.summaryPending;
+      if (posted || (await this.linear.commentAsApp(record.issueId, body, id)) !== null) {
+        record.summary = hash;
+        delete record.summaryId;
+        delete record.summaryPending;
+      } else if (record.retryAt === null && record.stopped !== "gave-up") {
+        // The comment could not be written: the reservation stays and the sweep retries, also for
+        // an untrusted ticket's information-only comment.
+        this.failedRound(record);
+      }
     } catch (error) {
       if (error instanceof RateLimitedError) throw error;
       console.error(`[linear-tickets] ${record.identifier}: the related-work comment failed: ${message(error)}`);
-      if (record.retryAt === null && !record.stopped) this.failedRound(record);
+      if (record.retryAt === null && record.stopped !== "gave-up") this.failedRound(record);
     }
     await this.save(record);
   }
@@ -474,7 +515,7 @@ export function summaryText(record: Pick<RelationsRecord, "identifier" | "docume
   } else {
     if (applied.length) sections.push(`Related work applied from the approved plan${plan}:\n${applied.map((step) => `- ${step.line}${step.kind === "replan" ? ` (asked ${step.ticket} to plan again)` : ""}`).join("\n")}`);
     if (refused.length) sections.push(`Not applied:\n${refused.map((step) => `- ${step.line} (${step.skipped})`).join("\n")}`);
-    if (waiting.length) sections.push(`Not applied yet — Paseo could not write to Linear as itself. Approve the plan again later to retry:\n${waiting.map((step) => `- ${step.line}`).join("\n")}`);
+    if (waiting.length) sections.push(`Not applied yet — Paseo could not write to Linear as itself; it retries every ten minutes. Approve a revised plan to try again:\n${waiting.map((step) => `- ${step.line}`).join("\n")}`);
     if (record.doneElsewhere.length) sections.push(`Applied from an earlier approved plan, no longer listed:\n${record.doneElsewhere.map((line) => `- ${line}`).join("\n")}`);
     if (record.dropped.length) sections.push(`Dropped with this plan (never applied):\n${record.dropped.map((line) => `- ${line}`).join("\n")}`);
     if (record.unreadable.length) sections.push(`Not one related-work line, left alone:\n${record.unreadable.map((line) => `- ${line}`).join("\n")}`);

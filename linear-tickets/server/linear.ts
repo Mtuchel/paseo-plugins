@@ -2050,8 +2050,9 @@ export class LinearService {
   }
 
   // A label by name, read only: an app write never creates one (that would need the key). A cached
-  // id is reused, like `labelId`.
-  private async existingLabelId(name: string): Promise<string | null> {
+  // id is reused, like `labelId`. Also the label's id for reading its add history, whatever labels
+  // the ticket carries now.
+  async existingLabelId(name: string): Promise<string | null> {
     const wanted = name.trim().toLowerCase();
     const cached = this.labelIds.get(wanted);
     if (cached) return cached;

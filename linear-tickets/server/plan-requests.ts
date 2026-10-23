@@ -42,7 +42,7 @@ export type PlanRequest = {
 
 type Prompt = (agentId: string, text: string) => Promise<PromptOutcome>;
 type Deps = {
-  linear: Pick<LinearService, "issueCore" | "issueDocument" | "replanComments" | "labelHistory" | "viewerId">;
+  linear: Pick<LinearService, "issueDocument" | "replanComments" | "existingLabelId" | "labelHistory" | "viewerId">;
   apps: Pick<TrustedApps, "ids">;
   prompt: Prompt;
   directory?: string;
@@ -52,7 +52,7 @@ type Deps = {
 // Per agent: the request ids delivered to it, and when the planning round it answers started (the
 // newest request delivered; null until one was).
 type Entry = { handled: string[]; roundStartedAt: string | null };
-type TicketAgent = { id: string; issueId: string; identifier: string; createdAt: string };
+type TicketAgent = { id: string; issueId: string; identifier: string; createdAt: string; provider: string };
 
 export function planRequestText(identifier: string, request?: PlanRequest): string {
   const why = request?.kind === "comment"
@@ -100,7 +100,8 @@ export class TrustedApps {
 // The owner adds `plan` to a ticket while its agent works, or another ticket's approved plan asks
 // for a replan. A request is delivered once per agent as a file the omp extension turns into
 // Plannotator's planning phase at the agent's next tool call or prompt, plus a message telling the
-// agent why; there is no second attempt for a busy agent (the file waits).
+// agent why. The file waits for an omp agent's next tool call; a provider without the extension has
+// only the message, so its request stays pending until a poll sends it.
 export class PlanRequests {
   private paseo: PaseoApi | null = null;
   private timer: NodeJS.Timeout | null = null;
@@ -161,15 +162,18 @@ export class PlanRequests {
       requests.push({ id: `op:${opId}`, at: comment.at, kind: "comment", authorId: comment.authorId, commentId: comment.id, body: comment.body, ...(reason ? { reason } : {}) });
     }
     // A label add needs a reference time to be newer than (the plan's approval): without one, it
-    // cannot be told from the label the ticket already carried.
-    const planLabel = since ? (await this.deps.linear.issueCore(issueId)).labels.find((label) => label.name.trim().toLowerCase() === PLAN_LABEL)?.id ?? null : null;
-    if (planLabel && since) {
-      const owner = await this.deps.linear.viewerId();
-      const events = await this.deps.linear.labelHistory(issueId, (event) => event.added.includes(planLabel) && event.at > since);
-      for (const event of events) {
-        if (!event.added.includes(planLabel) || event.at <= since) continue;
-        if (event.actorId !== owner) continue;
-        requests.push({ id: `label:${event.at}`, at: event.at, kind: "label", authorId: event.actorId });
+    // cannot be told from the label the ticket already carried. The label's id is resolved by name,
+    // not from the ticket's current labels: an owner add that an app removal (or the owner) undid
+    // before this read still counts, and the approval's cleanup puts the label back.
+    if (since) {
+      const planLabel = await this.deps.linear.existingLabelId(PLAN_LABEL);
+      if (planLabel) {
+        const owner = await this.deps.linear.viewerId();
+        const events = await this.deps.linear.labelHistory(issueId, (event) => event.added.includes(planLabel) && event.at > since);
+        for (const event of events) {
+          if (event.actorId !== owner) continue;
+          requests.push({ id: `label:${event.at}`, at: event.at, kind: "label", authorId: event.actorId });
+        }
       }
     }
     return requests.sort((a, b) => a.at.localeCompare(b.at));
@@ -198,13 +202,18 @@ export class PlanRequests {
       const plan = await this.deps.linear.issueDocument(agent.issueId, `Plan: ${agent.identifier}`).catch(() => null);
       for (const request of await this.requests(agent.issueId, agent.identifier, agent.createdAt, plan ? documentPlanHash(plan.content) : null, trusted)) {
         if (entry.handled.includes(request.id)) continue;
-        // The request file first: it alone reaches the running agent, and the route's fence reads it
-        // too. A failure before the owner record leaves the request unhandled, so the next poll
-        // retries it.
+        // A failure before the owner record leaves the request unhandled, so the next poll retries
+        // it.
         const text = planRequestText(agent.identifier, request);
-        await this.writeRequest(agent, text);
+        // Only omp loads the plugin's extension, which consumes the request file at the agent's
+        // next tool call: there the file is the delivery, whenever the prompt lands. Any other
+        // provider has only the prompt, so its request stays pending until a poll sends it, and no
+        // file is written for nobody to read.
+        const consumesFile = agent.provider === "omp" || agent.provider.startsWith("omp/");
+        if (consumesFile) await this.writeRequest(agent, text);
         const outcome = await this.deps.prompt(agent.id, text);
         if (outcome === "sent") console.log(`[linear-tickets] ${agent.identifier}: plan requested from agent ${agent.id.slice(0, 8)}`);
+        if (!consumesFile && outcome !== "sent") continue;
         if (request.kind === "label") await this.deps.routes?.ownerRequested(agent.issueId);
         entry.handled.push(request.id);
         entry.roundStartedAt = request.at;
@@ -287,7 +296,7 @@ async function ticketAgents(paseo: PaseoApi): Promise<TicketAgent[]> {
     for (const { agent } of page.entries) {
       const labels = agent.labels ?? {};
       const issueId = labels["linear.issueId"];
-      if (issueId && !labels["paseo.parent-agent-id"]) agents.push({ id: agent.id, issueId, identifier: labels["linear.identifier"] || issueId, createdAt: agent.createdAt });
+      if (issueId && !labels["paseo.parent-agent-id"]) agents.push({ id: agent.id, issueId, identifier: labels["linear.identifier"] || issueId, createdAt: agent.createdAt, provider: agent.provider });
     }
     cursor = page.pageInfo.hasMore ? page.pageInfo.nextCursor ?? undefined : undefined;
   } while (cursor);

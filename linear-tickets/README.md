@@ -893,9 +893,10 @@ replan TUC-40: its plan is out of date
 ````
 
 `related` and `related to` mean `relates to`; a reason may follow `:`, `(`, `#` or a dash, and a
-line may end in a period. Every line names this ticket except `replan`, which names the other
-ticket's approved plan (D2). So `TUC-1 blocks TUC-2` in a TUC-7 plan, `hold`/`release`/
-`attended`/`unattended`, and a line with two changes (`TUC-7 relates to TUC-8 and TUC-9`) are
+line may end in a period. Every link line names this ticket, in either position, except `replan`,
+which names the other ticket's approved plan (D2). A line naming only other tickets,
+`hold`/`release`/`attended`/`unattended`, and a line with two changes
+(`TUC-7 relates to TUC-8 and TUC-9`) are
 unreadable: the plan has a `## Related work` section but no block is a problem too, and such a plan
 is sent back to its planner before it reaches you, like a plan that fails the section layout. An
 empty block is a valid plan with nothing related; an old plan with neither the section nor the
@@ -905,11 +906,13 @@ Linear only through an approved plan.
 Approving the plan applies the block as the [Paseo app](#who-linear-shows-as-the-author) (never
 the owner's key), on every approval path — your decision, an automatic approval, an approve-later
 or a split, and a parked plan approved on the central host: it adds the blocking relations,
-the related and duplicate links (a duplicate link also puts `paseo-hold` on this ticket, comments
-why, and only closes a ticket nobody has started and no agent works on; a started ticket is listed
-as skipped instead), and asks another ticket to plan again. Each line is recorded as it goes
+the related and duplicate links (a duplicate line's first ticket is the one it closes: that ticket
+gets `paseo-hold`, a comment saying why, and the duplicate link, and only a ticket nobody has
+started and no agent works on is closed; a started ticket is listed as skipped instead), and asks
+another ticket to plan again. Each line is recorded as it goes
 through, so a restart repeats nothing and a re-approval of the same plan writes nothing new; a
-write the app cannot make leaves the record retrying, up to five rounds. If this ticket was not
+write the app cannot make leaves the record retrying every ten minutes, up to five rounds, and
+then stopped until a revised plan is approved — the approval itself moves on. If this ticket was not
 written by you or Paseo, or a line is refused, nothing is written through it: you get one comment
 saying what needs a hand review. Otherwise the ticket gets one summary comment naming the approved
 plan, the lines applied and the lines skipped with their reason. A `replan TUC-9` line asks
@@ -1134,13 +1137,18 @@ writing. Other profiles and instructions are preserved. Apply after plugin rollo
 **Plan on a running agent.** Add `plan` to the ticket while its agent implements an approved plan:
 within a minute the plugin asks the agent for a new plan. An omp agent enters the planning phase at
 its next tool call (that call is stopped and the reason follows as a message) or prompt; other
-providers only get the message. The request is delivered once, as a file under
+providers only get the message. The request is delivered once: for an omp agent as a file under
 `$PASEO_HOME/linear-tickets/plan-requests/<agent>` that the omp extension turns into planning, and
-`revisePlanNote` tells the agent to start from the approved plan and answer every request.
+`revisePlanNote` tells the agent to start from the approved plan and answer every request. A
+provider without that extension has only the message, so a request the agent cannot take yet
+(busy, waiting or unavailable) stays pending and the next poll sends it again; no request file is
+written for it.
 
 The owner's `plan` label add is a request once its agent exists; a label that was already on the
 ticket when the agent started is not a new request. Remove and add it again to ask once more, also
-between two polls. Another ticket's approved plan asks the same way, with a
+between two polls: the plugin reads the label's add history, so an add an app removed again before
+the poll still counts, and the approval's cleanup puts the label back. Another ticket's approved
+plan asks the same way, with a
 `🔁 **Replan requested**` comment instead of a label add: it carries an operation id, and counts
 only for the exact plan hash it names ([`server/plan-requests.ts`](server/plan-requests.ts)). The
 app-written comment counts only when its author is this host's Paseo app or a peer's app: the

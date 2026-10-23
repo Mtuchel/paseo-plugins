@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { documentPlanHash } from "./review-outcome";
-import { PlanRelations, summaryText } from "./plan-relations";
+import { PlanRelations, RETRY_MS, summaryText } from "./plan-relations";
 import { Credentials } from "./credentials";
 import { LABEL_BY_NAME_QUERY, LinearService, type App } from "./linear";
 
@@ -16,10 +16,10 @@ const plan = (lines: string[]) => `## Related work\n\nText.\n\n\`\`\`related-wor
 
 type Fake = ReturnType<typeof fake>;
 
-function fake(options: { open?: boolean; unstarted?: boolean; ownLabels?: string[]; targetPlan?: string | null; targetReady?: boolean; commentNull?: boolean; failCommentOnce?: boolean; removeNullOnce?: boolean } = {}) {
+function fake(options: { open?: boolean; unstarted?: boolean; ownLabels?: string[]; targetPlan?: string | null; targetReady?: boolean; commentNull?: boolean; failCommentOnce?: boolean; loseCommentOnce?: boolean; removeNullOnce?: boolean } = {}) {
   const calls: string[] = [];
   const stated = new Set<string>();
-  const state = { targetPlan: options.targetPlan === undefined ? THEIR_PLAN : options.targetPlan, commentNull: options.commentNull === true, failed: false, failCommentOnce: options.failCommentOnce === true, removeNull: options.removeNullOnce === true, removeFailed: false };
+  const state = { targetPlan: options.targetPlan === undefined ? THEIR_PLAN : options.targetPlan, commentNull: options.commentNull === true, failed: false, failCommentOnce: options.failCommentOnce === true, loseCommentOnce: options.loseCommentOnce === true, lost: false, removeNull: options.removeNullOnce === true, removeFailed: false };
   const comments: { issueId: string; body: string; id?: string }[] = [];
   const labels = new Map<string, Set<string>>([["own-id", new Set(options.ownLabels ?? [])], ["other-id", new Set(options.targetReady === false ? [] : ["plan-ready"])]]);
   const status = options.unstarted === false ? "started" : "unstarted";
@@ -43,7 +43,7 @@ function fake(options: { open?: boolean; unstarted?: boolean; ownLabels?: string
     async relateAsApp(issueId: string, relatedId: string, type: string) { calls.push(`relate ${issueId} ${relatedId} ${type}`); return true as const; },
     async addLabelAsApp(issueId: string, name: string) { calls.push(`+${name} ${issueId}`); labels.get(issueId)?.add(name); return true as const; },
     async removeLabelAsApp(issueId: string, name: string) { calls.push(`-${name} ${issueId}`); if (state.removeNull && !state.removeFailed) { state.removeFailed = true; return null; } labels.get(issueId)?.delete(name); return true as const; },
-    async commentAsApp(issueId: string, body: string, id?: string) { calls.push(`commentAsApp ${issueId}`); if (state.commentNull) return null; if (state.failCommentOnce && !state.failed) { state.failed = true; return null; } comments.push({ issueId, body, id }); return true as const; },
+    async commentAsApp(issueId: string, body: string, id?: string) { calls.push(`commentAsApp ${issueId}`); if (state.commentNull) return null; if (state.loseCommentOnce && !state.lost) { state.lost = true; comments.push({ issueId, body, id }); return null; } if (state.failCommentOnce && !state.failed) { state.failed = true; return null; } comments.push({ issueId, body, id }); return true as const; },
     async commentById(id: string) { return comments.some((comment) => comment.id === id) ? { id } : null; },
     async issueDocument(_id: string, _title: string) {
       return state.targetPlan ? { url: "https://linear.app/doc/their", content: state.targetPlan } : null;
@@ -53,13 +53,19 @@ function fake(options: { open?: boolean; unstarted?: boolean; ownLabels?: string
   return { calls, comments, linear, labels, stated, state };
 }
 
-async function harness(options: Parameters<typeof fake>[0], run: (h: { relations: PlanRelations; fake: Fake; directory: string; requests: () => Promise<number> }) => Promise<void>, requestCount = 0) {
+async function harness(options: Parameters<typeof fake>[0], run: (h: { relations: PlanRelations; fake: Fake; directory: string; requests: () => Promise<number>; retry: () => Promise<void> }) => Promise<void>, requestCount = 0) {
   const directory = await mkdtemp(join(tmpdir(), "paseo-plan-relations-"));
   const f = fake(options);
   let asked = 0;
-  const relations = new PlanRelations(f.linear as never, async () => { asked += 1; return Array.from({ length: requestCount }, (_, index) => ({ id: `op:${index}`, at: "2026-10-05T10:00:00.000Z", kind: "comment" as const, authorId: "paseo-app" })); }, () => "server087", directory);
+  let now = Date.parse("2026-10-05T10:00:00Z");
+  const relations = new PlanRelations(f.linear as never, async () => { asked += 1; return Array.from({ length: requestCount }, (_, index) => ({ id: `op:${index}`, at: "2026-10-05T10:00:00.000Z", kind: "comment" as const, authorId: "paseo-app" })); }, () => "server087", directory, () => now);
+  // The bridge's sweep, once a retry is due: the later rounds run on the record's own schedule.
+  const retry = async () => {
+    now += RETRY_MS + 1_000;
+    await relations.retryPending();
+  };
   try {
-    await run({ relations, fake: f, directory, requests: async () => asked });
+    await run({ relations, fake: f, directory, requests: async () => asked, retry });
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -103,15 +109,17 @@ test("AC-7: a replan line asks the other ticket to plan again, and only about th
 test("AC-13: a replan request is not moved to a plan that replaced the one it was written for", async () => {
   const f = fake({ commentNull: true });
   const directory = await mkdtemp(join(tmpdir(), "paseo-plan-relations-"));
+  let now = Date.parse("2026-10-05T10:00:00Z");
   try {
-    const relations = new PlanRelations(f.linear as never, async () => [], () => "server087", directory);
+    const relations = new PlanRelations(f.linear as never, async () => [], () => "server087", directory, () => now);
     // The first round saves the target hash, then the comment cannot be written.
-    await assert.rejects(relations.file({ issueId: OWN.id, identifier: OWN.identifier, plan: plan(["replan TUC-9: reason"]), documentUrl: null, roundStartedAt: null }));
+    await relations.file({ issueId: OWN.id, identifier: OWN.identifier, plan: plan(["replan TUC-9: reason"]), documentUrl: null, roundStartedAt: null });
     assert.equal(f.comments.length, 0);
     // The target's plan is replaced before the retry: the request does not move to it.
     f.state.targetPlan = "# A new their plan\n\nOther work.\n## Risk and impact\n\n- Impact: 2\n";
     f.state.commentNull = false;
-    await relations.file({ issueId: OWN.id, identifier: OWN.identifier, plan: plan(["replan TUC-9: reason"]), documentUrl: null, roundStartedAt: null });
+    now += RETRY_MS + 1_000;
+    await relations.retryPending();
     assert.equal(f.comments.filter((comment) => comment.issueId === OTHER.id).length, 0);
     assert.match(f.comments.at(-1)!.body, /replaced since this request/);
   } finally { await rm(directory, { recursive: true, force: true }); }
@@ -168,13 +176,13 @@ test("AC-7: a replan of a ticket without an approved plan, or of a done ticket, 
 
 test("AC-7: a duplicate of an unstarted ticket gets the hold label, one comment and the link; a crash after the label repeats neither", async () => {
   const request = { issueId: OWN.id, identifier: OWN.identifier, plan: plan(["TUC-7 duplicates TUC-9: the same work"]), documentUrl: null, roundStartedAt: null };
-  await harness({ failCommentOnce: true }, async ({ relations, fake }) => {
-    await assert.rejects(relations.file(request));
+  await harness({ failCommentOnce: true }, async ({ relations, fake, retry }) => {
+    await relations.file(request);
     assert.deepEqual(fake.calls.filter((call) => call.startsWith("+")), ["+paseo-hold own-id"], "the hold is written before the comment");
     assert.equal(fake.comments.filter((comment) => /Closed as a duplicate/.test(comment.body)).length, 0, "the duplicate comment could not be written");
     fake.calls.length = 0;
-    await relations.file(request);
-    assert.deepEqual(fake.calls.filter((call) => call.startsWith("+")), [], "the restart does not add the hold again");
+    await retry();
+    assert.deepEqual(fake.calls.filter((call) => call.startsWith("+")), [], "the retry does not add the hold again");
     assert.deepEqual(fake.calls.filter((call) => call.startsWith("relate")), ["relate own-id other-id duplicate"]);
     assert.match(fake.comments.find((comment) => comment.issueId === OWN.id && /Closed as a duplicate/.test(comment.body))!.body, /Closed as a duplicate of TUC-9 by TUC-7's approved plan/);
   });
@@ -183,18 +191,20 @@ test("AC-7: a duplicate of an unstarted ticket gets the hold label, one comment 
 test("AC-13: a replan comment written before the record was saved is found on the restart and not posted twice", async () => {
   const directory = await mkdtemp(join(tmpdir(), "paseo-plan-relations-"));
   const f = fake({ commentNull: true });
+  let now = Date.parse("2026-10-05T10:00:00Z");
   try {
-    const relations = new PlanRelations(f.linear as never, async () => [], () => "server087", directory);
+    const relations = new PlanRelations(f.linear as never, async () => [], () => "server087", directory, () => now);
     const request = { issueId: OWN.id, identifier: OWN.identifier, plan: plan(["replan TUC-9: this plan changes what it builds"]), documentUrl: null, roundStartedAt: null };
-    await assert.rejects(relations.file(request));
+    await relations.file(request);
     const record = JSON.parse(await readFile(join(directory, "own-id.json"), "utf8"));
     const step = record.steps[record.lines[0]];
     assert.equal(typeof step.opId, "string");
     // Linear created the comment; the process died before the record said so.
     f.comments.push({ issueId: OTHER.id, body: `🔁 **Replan requested**\n\nReason.\n\n<!-- replan-op: ${step.opId} -->\n<!-- replan-for: ${step.replanFor} -->` });
     f.state.commentNull = false;
-    await relations.file(request);
-    assert.equal(f.comments.filter((comment) => comment.issueId === OTHER.id).length, 1, "the restart posts no second comment");
+    now += RETRY_MS + 1_000;
+    await relations.retryPending();
+    assert.equal(f.comments.filter((comment) => comment.issueId === OTHER.id).length, 1, "the retry posts no second comment");
     assert.ok(f.labels.get("other-id")!.has("plan"));
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
@@ -241,27 +251,29 @@ test("AC-13: a failed label removal is retried on the restart, or kept when a re
   const directory = await mkdtemp(join(tmpdir(), "paseo-plan-relations-"));
   const f = fake({ ownLabels: ["plan"], removeNullOnce: true });
   let late = false;
+  let now = Date.parse("2026-10-05T10:00:00Z");
   try {
     // The removal's attempt fails; on the restart the ticket has a newer request.
-    const relations = new PlanRelations(f.linear as never, async () => (late ? [{ id: "op:late", at: "2026-10-05T09:00:00.000Z", kind: "comment" as const, authorId: "paseo-app" }] : []), () => "server087", directory);
+    const relations = new PlanRelations(f.linear as never, async () => (late ? [{ id: "op:late", at: "2026-10-05T09:00:00.000Z", kind: "comment" as const, authorId: "paseo-app" }] : []), () => "server087", directory, () => now);
     const request = { issueId: OWN.id, identifier: OWN.identifier, plan: plan(["TUC-7 relates to TUC-9: same files"]), documentUrl: null, roundStartedAt: "2026-10-05T08:00:00.000Z" };
-    await assert.rejects(relations.file(request));
+    await relations.file(request);
     late = true;
     assert.deepEqual(f.calls.filter((call) => call === "-plan own-id"), ["-plan own-id"], "the failed removal is the only attempt");
     assert.ok(f.labels.get("own-id")!.has("plan"), "the label is still there");
-    await relations.file(request);
-    assert.deepEqual(f.calls.filter((call) => call === "-plan own-id"), ["-plan own-id"], "the restart sees the request and removes nothing");
+    now += RETRY_MS + 1_000;
+    await relations.retryPending();
+    assert.deepEqual(f.calls.filter((call) => call === "-plan own-id"), ["-plan own-id"], "the retry sees the request and removes nothing");
     assert.ok(f.labels.get("own-id")!.has("plan"));
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
 
 test("AC-13: a failed label removal with no newer request ends with the label removed on the restart", async () => {
-  await harness({ ownLabels: ["plan"], removeNullOnce: true }, async ({ relations, fake }) => {
+  await harness({ ownLabels: ["plan"], removeNullOnce: true }, async ({ relations, fake, retry }) => {
     const request = { issueId: OWN.id, identifier: OWN.identifier, plan: plan(["TUC-7 relates to TUC-9: same files"]), documentUrl: null, roundStartedAt: "2026-10-05T08:00:00.000Z" };
-    await assert.rejects(relations.file(request));
-    assert.ok(fake.labels.get("own-id")!.has("plan"));
     await relations.file(request);
-    assert.ok(!fake.labels.get("own-id")!.has("plan"), "the restart removes it");
+    assert.ok(fake.labels.get("own-id")!.has("plan"));
+    await retry();
+    assert.ok(!fake.labels.get("own-id")!.has("plan"), "the retry removes it");
   });
 });
 
@@ -287,7 +299,8 @@ test("AC-14: every write through an unusable app leaves the record retrying, sto
       commentAsApp: (issueId: string, body: string, id?: string) => direct.commentAsApp(issueId, body, id),
     } as never, async () => [], () => "server087", directory, () => now);
     const blocked = plan(["TUC-9 blocks TUC-7: it lands first", "TUC-9 duplicates TUC-7: the same work", "TUC-7 relates to TUC-10: same files", "replan TUC-9: this changes it"]);
-    await assert.rejects(relations.file({ issueId: OWN.id, identifier: OWN.identifier, plan: blocked, documentUrl: null, roundStartedAt: null }));
+    const request = { issueId: OWN.id, identifier: OWN.identifier, plan: blocked, documentUrl: null, roundStartedAt: null };
+    await relations.file(request);
     for (let round = 0; round < 4; round++) {
       now += 11 * 60_000;
       await relations.retryPending();
@@ -296,9 +309,12 @@ test("AC-14: every write through an unusable app leaves the record retrying, sto
     assert.equal(record.attempts, 5);
     assert.equal(record.stopped, "gave-up");
     assert.ok(keyed.every((query) => query === LABEL_BY_NAME_QUERY), "only the label id lookup used the key");
+    // A journal retry of the same decision resolves without a round and without reviving the record.
+    await relations.file(request);
+    assert.equal(JSON.parse(await readFile(join(directory, "own-id.json"), "utf8")).attempts, 5, "a stopped record is not retried");
     now += 11 * 60_000;
     await relations.retryPending();
-    assert.equal(JSON.parse(await readFile(join(directory, "own-id.json"), "utf8")).attempts, 5, "a stopped record is not retried");
+    assert.equal(JSON.parse(await readFile(join(directory, "own-id.json"), "utf8")).attempts, 5, "the sweep leaves it alone");
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
 
@@ -310,5 +326,107 @@ test("AC-14: an untrusted ticket gets exactly one comment and no link, label or 
     await relations.file({ issueId: OWN.id, identifier: OWN.identifier, plan: plan(["TUC-9 blocks TUC-7: it lands first", "TUC-7 relates to TUC-10: same files", "replan TUC-9: this changes it"]), documentUrl: null, roundStartedAt: null });
     assert.deepEqual(f.calls.filter((call) => /^(block|relate|[+-]|commentAsApp)/.test(call) && call !== "commentAsApp own-id"), []);
     assert.equal(f.calls.filter((call) => call === "commentAsApp own-id").length, 1);
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("AC-14: a retried decision step keeps the record's rounds and schedule, and only a revised plan resets them", async () => {
+  await harness({ commentNull: true }, async ({ relations, fake, directory, retry }) => {
+    const request = { issueId: OWN.id, identifier: OWN.identifier, plan: plan(["TUC-7 relates to TUC-10: same files"]), documentUrl: null, roundStartedAt: null };
+    // The summary cannot be written: the round fails, schedules its retry, and the step resolves.
+    await relations.file(request);
+    const first = JSON.parse(await readFile(join(directory, "own-id.json"), "utf8"));
+    assert.equal(first.attempts, 1);
+    assert.equal(first.stopped, undefined);
+    const calls = fake.calls.length;
+    // The decision journal retries the step meanwhile: nothing is due, so nothing runs.
+    await relations.file(request);
+    const second = JSON.parse(await readFile(join(directory, "own-id.json"), "utf8"));
+    assert.equal(second.attempts, 1, "a retried step does not reset the rounds");
+    assert.equal(second.retryAt, first.retryAt, "its retry schedule is kept");
+    assert.equal(fake.calls.length, calls, "no write runs before the retry is due");
+    // Due: the sweep runs the next round and counts it.
+    await retry();
+    assert.equal(JSON.parse(await readFile(join(directory, "own-id.json"), "utf8")).attempts, 2);
+    // A revised plan is a fresh attempt, from round zero.
+    fake.state.commentNull = false;
+    await relations.file({ ...request, plan: plan(["TUC-7 relates to TUC-10: the same files, revised"]) });
+    const revised = JSON.parse(await readFile(join(directory, "own-id.json"), "utf8"));
+    assert.equal(revised.attempts, 0);
+    assert.equal(revised.retryAt, null);
+    assert.equal(revised.stopped, undefined);
+    assert.match(fake.comments.at(-1)!.body, /revised/);
+  });
+});
+
+test("AC-7: a line may name the plan's own ticket second, and its first ticket is the one a duplicate changes", async () => {
+  await harness({}, async ({ relations, fake }) => {
+    await relations.file({ issueId: OWN.id, identifier: OWN.identifier, plan: plan(["TUC-10 duplicates TUC-7: the same work", "TUC-9 relates to TUC-7: same files"]), documentUrl: null, roundStartedAt: null });
+    assert.deepEqual(fake.calls.filter((call) => call.startsWith("+")), ["+paseo-hold third-id"], "the hold goes on the duplicated ticket");
+    const explanation = fake.comments.find((comment) => comment.issueId === THIRD.id && /Closed as a duplicate/.test(comment.body))!;
+    assert.match(explanation.body, /Closed as a duplicate of TUC-7 by TUC-7's approved plan/);
+    assert.deepEqual(fake.calls.filter((call) => call.startsWith("relate")), ["relate third-id own-id duplicate", "relate other-id own-id related"]);
+  });
+});
+
+test("AC-7: a duplicate explanation whose answer was lost is found again instead of posted twice", async () => {
+  await harness({ loseCommentOnce: true }, async ({ relations, fake, directory, retry }) => {
+    await relations.file({ issueId: OWN.id, identifier: OWN.identifier, plan: plan(["TUC-7 duplicates TUC-9: the same work"]), documentUrl: null, roundStartedAt: null });
+    const record = JSON.parse(await readFile(join(directory, "own-id.json"), "utf8"));
+    const step = record.steps[record.lines[0]];
+    assert.equal(typeof step.tellId, "string", "the comment id is reserved before it is posted");
+    assert.equal(step.told, undefined, "the lost answer leaves the step open");
+    assert.equal(fake.comments.filter((comment) => /Closed as a duplicate/.test(comment.body)).length, 1, "Linear created it");
+    await retry();
+    const explained = fake.comments.filter((comment) => /Closed as a duplicate/.test(comment.body));
+    assert.equal(explained.length, 1, "the retry finds the comment instead of posting it again");
+    assert.equal(explained[0].id, step.tellId, "it was posted under the reserved id");
+    assert.deepEqual(fake.calls.filter((call) => call.startsWith("relate")), ["relate own-id other-id duplicate"]);
+  });
+});
+
+test("AC-14: an unavailable summary write keeps its reservation, announces nothing and retries within bounds", async () => {
+  const request = { issueId: OWN.id, identifier: OWN.identifier, plan: plan(["TUC-7 relates to TUC-10: same files"]), documentUrl: null, roundStartedAt: null };
+  await harness({ commentNull: true }, async ({ relations, fake, directory, retry }) => {
+    await relations.file(request);
+    const first = JSON.parse(await readFile(join(directory, "own-id.json"), "utf8"));
+    assert.equal(first.summary, null, "the summary is not marked announced");
+    assert.equal(typeof first.summaryId, "string");
+    assert.equal(typeof first.summaryPending, "string");
+    assert.equal(fake.comments.length, 0);
+    fake.state.commentNull = false;
+    await retry();
+    const second = JSON.parse(await readFile(join(directory, "own-id.json"), "utf8"));
+    assert.equal(typeof second.summary, "string");
+    assert.equal(second.summaryId, undefined);
+    assert.equal(second.summaryPending, undefined);
+    assert.equal(fake.comments.at(-1)!.id, first.summaryId, "the retry posts under the reserved id");
+  });
+  await harness({ commentNull: true }, async ({ relations, fake, directory, retry }) => {
+    await relations.file(request);
+    for (let round = 0; round < 4; round++) await retry();
+    const record = JSON.parse(await readFile(join(directory, "own-id.json"), "utf8"));
+    assert.equal(record.attempts, 5);
+    assert.equal(record.stopped, "gave-up");
+    assert.equal(record.summary, null);
+    assert.equal(typeof record.summaryPending, "string", "the reservation is kept");
+    assert.equal(fake.comments.length, 0);
+  });
+  // An untrusted ticket's information-only comment follows the same rule.
+  const directory = await mkdtemp(join(tmpdir(), "paseo-plan-relations-"));
+  const untrusted = fake({ commentNull: true });
+  let now = Date.parse("2026-10-05T10:00:00Z");
+  try {
+    const relations = new PlanRelations({ ...untrusted.linear, async issueCore(id: string) { return { id, identifier: "TUC-7", creatorId: "stranger", status: "Todo", statusType: "unstarted", labels: [] } as never; } } as never, async () => [], () => "server087", directory, () => now);
+    await relations.file(request);
+    const first = JSON.parse(await readFile(join(directory, "own-id.json"), "utf8"));
+    assert.equal(first.stopped, "untrusted");
+    assert.equal(typeof first.summaryId, "string", "the information comment is reserved");
+    untrusted.state.commentNull = false;
+    now += RETRY_MS + 1_000;
+    await relations.retryPending();
+    const second = JSON.parse(await readFile(join(directory, "own-id.json"), "utf8"));
+    assert.equal(typeof second.summary, "string");
+    assert.equal(untrusted.comments.length, 1);
+    assert.equal(untrusted.comments[0].id, first.summaryId);
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
