@@ -65,6 +65,9 @@ function referenceOf(agents: Iterable<ProcessAgent>, now: number): number {
 
 export type ProcessAgent = Partial<Pick<PaseoAgent, "id" | "provider" | "cwd" | "status" | "lastError" | "archivedAt" | "labels" | "runtimeInfo" | "persistence" | "updatedAt">>;
 export type ProcessLiveness = "absent" | "alive" | "unknown";
+// A start waits because an earlier OMP worker of the ticket has not exited yet: nothing was tried,
+// and the start goes ahead once the process is gone (the steward queues it, never refuses it).
+export const WORKER_ALIVE_REASON = "an OMP worker for this ticket is still alive";
 
 // No daemon status, JSONL timestamp or missing open file can prove a provider process exited.
 // Throws mean unobservable, including a process that disappeared during inspection: retry later.
