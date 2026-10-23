@@ -1,7 +1,7 @@
 import { mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import type { PaseoApi } from "@getpaseo/client";
-import type { LinearService } from "./linear";
+import type { LinearService, PlanRequestStamp } from "./linear";
 import type { LabelEvent } from "./label-rules";
 import { documentPlanHash } from "./review-outcome";
 import { loadProbe } from "./load-probe";
@@ -12,6 +12,9 @@ import type { PromptOutcome } from "./sessions";
 import type { SmallRoutes } from "./small-route";
 
 const POLL_MS = 60_000;
+// How far before the previous poll the next one looks for new replan comments, for the clock
+// difference between this host and Linear.
+const SKEW_MS = 5 * 60_000;
 const STATE_FILE = "state.json";
 const APPS_FILE = "trusted-apps.json";
 // How long a verified peer app stays usable without asking the peer again (one inbox poll is
@@ -43,7 +46,7 @@ export type PlanRequest = {
 
 type Prompt = (agentId: string, text: string) => Promise<PromptOutcome>;
 type Deps = {
-  linear: Pick<LinearService, "issueDocument" | "replanComments" | "existingLabelId" | "labelHistory" | "viewerId">;
+  linear: Pick<LinearService, "planRequestStamps" | "issueDocument" | "replanComments" | "existingLabelId" | "labelHistory" | "viewerId">;
   apps: Pick<TrustedApps, "ids">;
   prompt: Prompt;
   directory?: string;
@@ -51,8 +54,18 @@ type Deps = {
   routes?: Pick<SmallRoutes, "ownerRequested">;
 };
 // Per agent: the request ids delivered to it, and when the planning round it answers started (the
-// newest request delivered; null until one was).
-type Entry = { handled: string[]; roundStartedAt: string | null };
+// newest request delivered; null until one was). `checkedAt` (this host's clock), `updatedAt` and
+// `replanAt` (Linear's) are what the last poll saw of the ticket, `apps` the trusted app ids it
+// judged comments by, and `pending` a request found but not delivered yet.
+type Entry = {
+  handled: string[];
+  roundStartedAt: string | null;
+  checkedAt?: string;
+  updatedAt?: string | null;
+  replanAt?: string | null;
+  apps?: string;
+  pending?: boolean;
+};
 type TicketAgent = { id: string; issueId: string; identifier: string; createdAt: string; provider: string };
 
 export function planRequestText(identifier: string, request?: PlanRequest): string {
@@ -144,14 +157,26 @@ export class PlanRequests {
   // ignored and logged; a peer app not known here yet leaves its comment in Linear until it is.
   async requests(issueId: string, identifier: string, since: string | null, planHash: string | null, asked?: Set<string>): Promise<PlanRequest[]> {
     const trusted = asked ?? new Set(await this.deps.apps.ids());
+    const requests = [
+      ...await this.commentRequests(issueId, identifier, since, async () => planHash, trusted),
+      ...await this.labelRequests(issueId, since),
+    ];
+    return requests.sort((a, b) => a.at.localeCompare(b.at));
+  }
+
+  // The trusted replan comments about the ticket's current plan. `planHash` is only asked when
+  // there is a comment to judge.
+  private async commentRequests(issueId: string, identifier: string, since: string | null, planHash: () => Promise<string | null>, trusted: Set<string>): Promise<PlanRequest[]> {
     const requests: PlanRequest[] = [];
+    let current: string | null | undefined;
     for (const comment of await this.deps.linear.replanComments(issueId, since ?? "1970-01-01T00:00:00.000Z")) {
       const opId = OP_MARKER.exec(comment.body)?.[1];
       if (!opId || !comment.body.includes(FIRST_LINE)) continue;
       const about = FOR_MARKER.exec(comment.body)?.[1] ?? null;
+      if (current === undefined) current = await planHash();
       // The request names the plan it is about: a comment written against a replaced plan is stale
       // (and one on a ticket with no approved plan has nothing to revise).
-      if (about !== planHash) {
+      if (about !== current) {
         console.error(`[linear-tickets] ${identifier}: ignoring the replan request ${opId} written for another plan (${about?.slice(0, 8) ?? "none"})`);
         continue;
       }
@@ -162,23 +187,28 @@ export class PlanRequests {
       const reason = comment.body.split("\n").map((line) => line.trim()).find((line) => line && !line.startsWith(FIRST_LINE) && !line.startsWith("<!--") && !line.startsWith("["));
       requests.push({ id: `op:${opId}`, at: comment.at, kind: "comment", authorId: comment.authorId, commentId: comment.id, body: comment.body, ...(reason ? { reason } : {}) });
     }
-    // A label add needs a reference time to be newer than (the plan's approval): without one, it
-    // cannot be told from the label the ticket already carried. The label's id is resolved by name,
-    // not from the ticket's current labels: an owner add that an app removal (or the owner) undid
-    // before this read still counts, and the approval's cleanup puts the label back.
-    if (since) {
-      const planLabel = await this.deps.linear.existingLabelId(PLAN_LABEL);
-      if (planLabel) {
-        const owner = await this.deps.linear.viewerId();
-        // The predicate only ends the paging; the pages read hold every label change.
-        const added = (event: LabelEvent) => event.added.includes(planLabel) && event.at > since;
-        for (const event of await this.deps.linear.labelHistory(issueId, added)) {
-          if (!added(event) || event.actorId !== owner) continue;
-          requests.push({ id: `label:${event.at}`, at: event.at, kind: "label", authorId: event.actorId });
-        }
-      }
+    return requests;
+  }
+
+  // The owner's `plan` label adds after `since`. A label add needs a reference time to be newer
+  // than (the plan's approval): without one, it cannot be told from the label the ticket already
+  // carried. The label's id is resolved by name, not from the ticket's current labels: an owner add
+  // that an app removal (or the owner) undid before this read still counts, and the approval's
+  // cleanup puts the label back.
+  private async labelRequests(issueId: string, since: string | null): Promise<PlanRequest[]> {
+    if (!since) return [];
+    const planLabel = await this.deps.linear.existingLabelId(PLAN_LABEL);
+    if (!planLabel) return [];
+    const owner = await this.deps.linear.viewerId();
+    const added = (event: LabelEvent) => event.added.includes(planLabel) && event.at > since;
+    const requests: PlanRequest[] = [];
+    // The predicate only ends the paging (newest first: an event from before `since` means no older
+    // page can hold a request); the pages read hold every label change.
+    for (const event of await this.deps.linear.labelHistory(issueId, (event) => added(event) || event.at <= since)) {
+      if (!added(event) || event.actorId !== owner) continue;
+      requests.push({ id: `label:${event.at}`, at: event.at, kind: "label", authorId: event.actorId });
     }
-    return requests.sort((a, b) => a.at.localeCompare(b.at));
+    return requests;
   }
 
   // When the planning round of an agent's ticket started: the newest request delivered to it, or
@@ -187,22 +217,49 @@ export class PlanRequests {
     return (await this.entry(agentId))?.roundStartedAt ?? null;
   }
 
+  // One read for every ticket's stamps per poll (README, "Related work"), then a ticket's own reads
+  // only where they can find something new: its replan comments when a newer one appeared, its
+  // label history when the ticket changed. Everything is read for an agent seen the first time,
+  // after the trusted apps changed, and while a request found waits for its delivery.
   private async run(): Promise<void> {
     const paseo = this.paseo;
     if (!paseo || this.stopped) return;
+    const startedAt = new Date().toISOString();
     const agents = await ticketAgents(paseo);
     const trusted = new Set(await this.deps.apps.ids());
+    const apps = [...trusted].sort().join(",");
     const previous = await this.load();
+    const checked = agents.map((agent) => previous[agent.id]?.checkedAt).filter((at): at is string => typeof at === "string").sort()[0] ?? startedAt;
+    const since = new Date(Date.parse(checked) - SKEW_MS).toISOString();
+    const stamps = agents.length ? await this.deps.linear.planRequestStamps(agents.map((agent) => agent.issueId), since) : new Map<string, PlanRequestStamp>();
     const next: Record<string, Entry> = {};
     for (const agent of agents) {
       const before = previous[agent.id];
+      const stamp = stamps.get(agent.issueId);
+      const seenUpdated = typeof before?.updatedAt === "string" ? before.updatedAt : null;
+      const seenReplan = typeof before?.replanAt === "string" ? before.replanAt : null;
       const entry: Entry = {
         handled: Array.isArray(before?.handled) ? [...before.handled] : [],
         roundStartedAt: typeof before?.roundStartedAt === "string" ? before.roundStartedAt : null,
+        checkedAt: startedAt,
+        updatedAt: stamp?.updatedAt ?? seenUpdated,
+        replanAt: [stamp?.replanAt ?? null, seenReplan].filter((at): at is string => Boolean(at)).sort().at(-1) ?? null,
+        apps,
+        pending: false,
       };
+      const all = typeof before?.checkedAt !== "string" || before.apps !== apps || before.pending === true;
+      const readComments = all || Boolean(stamp?.replanAt && (!seenReplan || stamp.replanAt > seenReplan));
+      const readLabels = all || Boolean(stamp && (!seenUpdated || stamp.updatedAt > seenUpdated));
       // A replan comment is about the plan the ticket has now; a replaced one is ignored and logged.
-      const plan = await this.deps.linear.issueDocument(agent.issueId, `Plan: ${agent.identifier}`).catch(() => null);
-      for (const request of await this.requests(agent.issueId, agent.identifier, agent.createdAt, plan ? documentPlanHash(plan.content) : null, trusted)) {
+      const planHash = async () => {
+        const plan = await this.deps.linear.issueDocument(agent.issueId, `Plan: ${agent.identifier}`).catch(() => null);
+        return plan ? documentPlanHash(plan.content) : null;
+      };
+      const found = [
+        ...readComments ? await this.commentRequests(agent.issueId, agent.identifier, agent.createdAt, planHash, trusted) : [],
+        ...readLabels ? await this.labelRequests(agent.issueId, agent.createdAt) : [],
+      ].sort((a, b) => a.at.localeCompare(b.at));
+      for (const request of found) {
         if (entry.handled.includes(request.id)) continue;
         // A failure before the owner record leaves the request unhandled, so the next poll retries
         // it.
@@ -221,6 +278,7 @@ export class PlanRequests {
         // A peer's older comment can become trusted after a newer request was delivered.
         if (!entry.roundStartedAt || request.at > entry.roundStartedAt) entry.roundStartedAt = request.at;
       }
+      entry.pending = found.some((request) => !entry.handled.includes(request.id));
       next[agent.id] = entry;
     }
     await this.save(next);
