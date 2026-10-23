@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { test, type TestContext } from "node:test";
 import {
   calendarDate, classifyTicket, DEFECT_GRACE_MS, DoneTickets, isDefect, parseVerdict, Steward, StewardStateError, StewardStore, STEWARD_ACTION, STEWARD_SITUATIONS, STEWARD_STATES, STEWARD_VERIFIER_LABEL,
-  RESTART_CAP, type StewardDeps, type StewardFacts, type StewardSituation,
+  RESTART_CAP, STEWARD_WINDOW_MS, type StewardDeps, type StewardFacts, type StewardSituation,
 } from "./steward";
 import type { ParentProgress } from "./parents";
 import { ManualTasks, type ManualTask } from "./manual-tasks";
@@ -15,7 +15,7 @@ import { TicketStarter } from "./starter";
 import type { Launcher } from "./launch";
 import { detailSchema } from "../shared/contracts";
 import type { WatchdogFile } from "./watchdog";
-import { SessionRouter, SessionStore, type HostOwnership } from "./sessions";
+import { SessionRouter, SessionStore, type HostOwnership, type Succession } from "./sessions";
 import { hostname } from "node:os";
 import { stageEvidence } from "./recovery-diagnostic";
 import { NeedsYouIssues } from "./needs-you";
@@ -954,6 +954,39 @@ test("a successor continues the pull request that is still open, not a stale one
   assert.equal(leads.length, 1);
   assert.match(leads[0], /open pull request https:\/\/github\.com\/o\/r\/pull\/3869/);
   assert.doesNotMatch(leads[0], /3868/, "the closed pull request is not the successor's work");
+});
+
+// TUC-945/204/941 on server087: a successor refused once for "no branch is recorded" escalated
+// with the situation as its key, and that key froze the ticket for days after the agent recorded
+// its branch. A failed action's escalation lapses after the steward window; its one retry renews
+// the hold, so the retry is once per window and the owner is not asked twice.
+test("an escalated failed successor is retried once per steward window, not frozen and not re-asked", async (t) => {
+  const url = "https://github.com/o/r/pull/3869";
+  let outcome: Succession = { kind: "impossible", reason: "no branch is recorded for the ticket" };
+  const f = await passFixture(t, {
+    issues: [ticketIssue()],
+    records: [recordFor("i1", "ENG-1", [url])],
+    pullStates: new Map([[url, pull(url)]]),
+    succeed: async () => outcome,
+    clockNow: T0,
+  });
+  await f.seed("i1", "ENG-1", { situation: "open-pr", since: at(60), escalated: { key: "open-pr", signature: "open-pr:No branch recorded", at: at(30) } });
+  await f.pass();
+  assert.deepEqual(f.calls.successions, [], "inside the window the owner's question holds");
+
+  f.clock.now += STEWARD_WINDOW_MS;
+  await f.pass();
+  assert.deepEqual(f.calls.successions, ["i1"], "a lapsed escalation lets the successor be tried again");
+  assert.deepEqual(f.calls.escalates, [], "the same refusal does not ask the owner again");
+  assert.equal((await f.ticket("i1"))?.escalated?.at, new Date(f.clock.now).toISOString(), "it renews the hold instead");
+  f.clock.now += 30 * 60_000;
+  await f.pass();
+  assert.deepEqual(f.calls.successions, ["i1"], "the renewed hold stops a retry every pass");
+
+  outcome = { kind: "started", agent: { id: "a10", title: null, cwd: "" } };
+  f.clock.now += STEWARD_WINDOW_MS;
+  await f.pass();
+  assert.deepEqual(f.calls.successions, ["i1", "i1"], "once the branch is recorded the next window's retry starts the successor");
 });
 
 test("a steward successor is labelled a CI repair only while the open pull request's recorded checks fail", async (t) => {

@@ -3267,7 +3267,11 @@ through the same waiting path an agent's question takes — so it appears in Lin
 decision inbox and in the Paseo Agents menu bar, and you can answer it like any other ask. The
 watchdog's spent recovery cycle ends the same way. The escalation is remembered per ticket and per
 reason, so a pass that keeps finding the same defect does not comment again; adding the trigger
-label or starting the agent yourself clears it and begins a fresh round.
+label or starting the agent yourself clears it and begins a fresh round. An escalation about a
+failed action (a successor refused because no branch was recorded yet, a branch that could not be
+reopened) names facts that change without you, so it holds for 24 hours; then the steward tries the
+action once more and holds again for 24 hours, without a second comment. An escalation that is
+itself the situation's action (a spent budget, a closed pull request) holds until you answer.
 
 **State and safety.** `steward.json` (next to the other state files under
 `~/.paseo/linear-tickets/`) holds per ticket the last situation and its since-time, the claimed

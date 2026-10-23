@@ -1353,9 +1353,15 @@ export class Steward {
       return;
     }
     // A ticket already escalated for this reason waits for the owner, whatever its situation now is.
+    // An escalation about a failed action (a successor with no branch record yet, a checkout that
+    // timed out) names facts that change without the owner, so it holds for one steward window;
+    // then the action is tried once more and the hold renewed (below); the same question is not
+    // asked again (escalate). A situation whose own action is to escalate holds until answered.
     const key = situation === "escalated" ? (stored?.escalated?.key ?? "escalated") : situation;
     const ownerNewer = Boolean(stored?.ownerAt && stored.escalated && Date.parse(stored.ownerAt) > Date.parse(stored.escalated.at));
-    const escalated = Boolean(stored?.escalated && stored.escalated.key === key && !ownerNewer);
+    const ownAction = situation === "escalated" ? "escalate" : STEWARD_ACTION[situation];
+    const lapsed = Boolean(stored?.escalated && ownAction && ownAction !== "escalate" && now - Date.parse(stored.escalated.at) >= STEWARD_WINDOW_MS);
+    const escalated = Boolean(stored?.escalated && stored.escalated.key === key && !ownerNewer && !lapsed);
     const action = situation === "escalated" || escalated ? "escalate" : STEWARD_ACTION[situation];
     if (!action) {
       await this.verdict(paseo, settings, names, candidate, pass, now);
@@ -1370,6 +1376,13 @@ export class Steward {
       return;
     }
     if (!this.cap(pass, candidate, action)) return;
+    // The lapsed hold's one retry renews it: whatever the retry's outcome, the next is a window away.
+    if (lapsed && stored?.escalated?.key === key && !ownerNewer) {
+      await this.deps.store.update((file) => {
+        const ticket = file.tickets[issue.id];
+        if (ticket?.escalated?.key === key) ticket.escalated = { ...ticket.escalated, at: this.iso(now) };
+      });
+    }
     await this.act(paseo, settings, names, candidate, situation, action, now);
   }
 
