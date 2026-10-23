@@ -64,8 +64,9 @@
 // - LINEAR_TICKETS_MCP=<server command as JSON> (set by the plugin when Agent access to Linear is
 //   on): omp cannot load MCP servers, so this extension mounts the plugin's `linear_ticket` server
 //   tools as `linear_ticket_<tool>` and runs each call through one server process. The read tools
-//   are direct ("essential") tools, so they also work in Plannotator's planning phase, which
-//   refuses every xd:// write.
+//   and a verifier's `steward_verdict` are direct ("essential") tools, so they also work in
+//   Plannotator's planning phase and under the recovery-diagnostic gate, which both refuse every
+//   xd:// write.
 import { execFileSync, execFile, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { closeSync, existsSync, fsyncSync, linkSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeFileSync, writeSync } from "node:fs";
@@ -754,7 +755,9 @@ export default function linearTicketsPlanFirst(pi: ExtensionApi): void {
       label: `Linear: ${tool.name.replace(/_/g, " ")}`,
       description: tool.description,
       parameters: toolParameters(pi.zod, tool.inputSchema),
-      ...(tool.annotations?.readOnlyHint ? { loadMode: "essential" as const } : {}),
+      // Read tools and the verifier's steward_verdict are direct: Plannotator's planning phase and
+      // a recovery diagnostic's gate both refuse `write`, which an xd:// device call needs.
+      ...(tool.annotations?.readOnlyHint || tool.name === "steward_verdict" ? { loadMode: "essential" as const } : {}),
       async execute(_id, params, signal) {
         return text(await callTicketTool(server, tool.name, params, signal));
       },

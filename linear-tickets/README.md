@@ -407,8 +407,9 @@ agent's PATH. omp cannot load MCP servers, so an omp agent gets the server's com
 `LINEAR_TICKETS_MCP` instead, and the plugin's omp extension (`omp/linear-tickets-plan-first.ts`,
 installed as described under **The omp extension** in [Native Linear agent](#native-linear-agent))
 mounts the same tools as `linear_ticket_<tool>`, running each call
-through the script. The read tools are direct tools, so they also work while Plannotator's
-planning phase refuses every `xd://` call. Without the extension, and for any other provider that
+through the script. The read tools, and a verifier's `steward_verdict`, are direct tools, so they
+also work while Plannotator's planning phase or the recovery-diagnostic gate refuses every
+`xd://` call (`write` is blocked there). Without the extension, and for any other provider that
 cannot load MCP servers, the agent starts once more without the server and with the no-write note
 instead of `{{linear_access}}`, and the launch returns a warning, since that agent has no Linear
 tools. The agent configuration and environment carry only that path and the issue ID; no
