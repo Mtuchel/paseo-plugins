@@ -787,7 +787,7 @@ export class PlannotatorBridge {
 
   // A claim withdrawn with its review still waiting: judged again, which claims under a new id.
   async rejudgeClaim(record: ClaimIntent): Promise<void> {
-    if (record.parked) return;
+    if (record.parked || this.stopped) return;
     const review = this.journal.review(record.reviewId);
     if (!review) return;
     const plan = await this.fetchPlan(record.localUrl).catch(() => "");

@@ -953,6 +953,10 @@ export default function contribute(server: PluginServerContext) {
     // bounded) before anything it uses closes; only then does the journal's lease move on.
     await exclusion.drain();
     await plannotator.stop();
+    // The requester, then the coordinator it may call in process: each finishes the claim in
+    // progress before the replacement plugin reads the same files.
+    await claimRequests?.stop();
+    await approvalClaims.stop();
     await replies.stop();
     clearTimeout(startSoon);
     clearInterval(usageTimer);
@@ -964,7 +968,7 @@ export default function contribute(server: PluginServerContext) {
     webhook.stop(); reviewLinks.stop(); pipeline.stop(); health.stop();
     const stoppedPullRequests = pullRequests.stop();
     pullBoard.stop(); manualTasks.stop(); modelGuard.stop(); planRequests.stop();
-    stateLabels.stop(); labelSync.stop(); drain.stop(); intake.stop(); deputy.stop(); approvalClaims.stop();
+    stateLabels.stop(); labelSync.stop(); drain.stop(); intake.stop(); deputy.stop();
     ownerAsks.stop(); queuedLabels.stop();
     void closeInternalDaemon();
     await stoppedPullRequests;

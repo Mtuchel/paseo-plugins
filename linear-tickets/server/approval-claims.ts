@@ -201,6 +201,7 @@ export class ApprovalClaims {
   private queue: Promise<unknown> = Promise.resolve();
   private timer: NodeJS.Timeout | null = null;
   private sweeping: Promise<void> | null = null;
+  private stopped = false;
 
   constructor(private readonly deps: {
     linear: Pick<LinearService, "issueDocument" | "issueState" | "comment" | "issueCommentHistory" | "viewerId">;
@@ -254,9 +255,13 @@ export class ApprovalClaims {
     void this.sweep();
   }
 
-  stop(): void {
+  // Admission closes and the claim, settle or sweep in progress finishes, so a replacement plugin
+  // never works on these files at the same time.
+  async stop(): Promise<void> {
     clearInterval(this.timer ?? undefined);
     this.timer = null;
+    this.stopped = true;
+    await this.queue;
   }
 
   // The coordinator's own settle sweep: a granted claim whose ticket's Approved `Plan:` document
@@ -319,7 +324,7 @@ export class ApprovalClaims {
   settle(claimId: string, state: "committed" | "withdrawn"): Promise<{ state: ClaimState | "unknown" }> {
     return this.serial(async () => {
       const grant = (await this.granted.load())[claimId];
-      if (!grant) return { state: await this.answerState(claimId) };
+      if (!grant || (await this.answers.load())[claimId]) return { state: await this.answerState(claimId) };
       if (state === "committed") await this.commit(grant);
       else await this.remove(grant.claimId, "withdrawn");
       return { state };
@@ -340,6 +345,8 @@ export class ApprovalClaims {
 
   status(claimId: string): Promise<ClaimState | "unknown"> {
     return this.serial(async () => {
+      // The answer first: a crash between storing it and removing the grant leaves both.
+      if ((await this.answers.load())[claimId]) return this.answerState(claimId);
       if ((await this.granted.load())[claimId]) return "granted";
       return this.answerState(claimId);
     });
@@ -352,34 +359,42 @@ export class ApprovalClaims {
     return created !== null && (this.deps.now?.() ?? Date.now()) - created > EXPIRED_DAYS * DAY_MS ? "expired" : "unknown";
   }
 
-  // Committed: the ledger entry is written (and flushed) before the claim leaves the table, so a
-  // crash in between leaves it in both; the next sweep writes the one that is missing and never
-  // grants anything in between.
-  private async commit(grant: ClaimGrant, approvedAt = grant.grantedAt): Promise<void> {
+  // Committed: the ledger entry and the answer are written before the claim leaves the table, so a
+  // crash in between leaves it in both; a repeated id is answered from the stored answer, the grant
+  // keeps blocking overlaps until the next sweep removes it, and nothing is granted in between.
+  // `approvedAt` is when the approval was seen: its document's, or this settlement's.
+  private async commit(grant: ClaimGrant, approvedAt?: string): Promise<void> {
     const now = this.deps.now?.() ?? Date.now();
     const key = `${grant.issueId}:${grant.planHash}`;
     await this.ledger.update((entries) => {
       if (entries[key]) return;
-      entries[key] = { issueId: grant.issueId, identifier: grant.identifier, planHash: grant.planHash, footprint: grant.footprint, approvedAt, recordedAt: new Date(now).toISOString() };
+      entries[key] = { issueId: grant.issueId, identifier: grant.identifier, planHash: grant.planHash, footprint: grant.footprint, approvedAt: approvedAt ?? new Date(now).toISOString(), recordedAt: new Date(now).toISOString() };
     });
+    await this.answers.update((answers) => { answers[grant.claimId] ??= { state: "committed", at: new Date(now).toISOString() }; });
     await this.granted.update((grants) => { delete grants[grant.claimId]; });
-    await this.answers.update((answers) => { answers[grant.claimId] = { state: "committed", at: new Date(now).toISOString() }; });
     await this.items.update((items) => { delete items[grant.claimId]; });
   }
 
   private async remove(claimId: string, state: "withdrawn"): Promise<void> {
+    await this.answers.update((answers) => { answers[claimId] ??= { state, at: new Date(this.deps.now?.() ?? Date.now()).toISOString() }; });
     await this.granted.update((grants) => { delete grants[claimId]; });
-    await this.answers.update((answers) => { answers[claimId] = { state, at: new Date(this.deps.now?.() ?? Date.now()).toISOString() }; });
     await this.items.update((items) => { delete items[claimId]; });
   }
 
   private async sweepOnce(): Promise<void> {
     const now = this.deps.now?.() ?? Date.now();
+    const answers = await this.answers.load();
     for (const grant of Object.values(await this.granted.load())) {
+      // Answered already: a crash stopped its removal.
+      if (answers[grant.claimId]) {
+        await this.granted.update((grants) => { delete grants[grant.claimId]; });
+        await this.items.update((items) => { delete items[grant.claimId]; });
+        continue;
+      }
       try {
         const document = await this.deps.linear.issueDocument(grant.issueId, `Plan: ${grant.identifier}`);
         if (document && approvedDocument(document.content) && documentPlanHash(document.content) === grant.planHash) {
-          await this.commit(grant, new Date(approvalInterval(document.content, "")?.at(0) ?? Date.parse(grant.grantedAt)).toISOString());
+          await this.commit(grant, new Date(approvalInterval(document.content, "")?.at(0) ?? now).toISOString());
           continue;
         }
         await this.confirm(grant, now);
@@ -457,6 +472,7 @@ export class ApprovalClaims {
   }
 
   private serial<T>(work: () => Promise<T>): Promise<T> {
+    if (this.stopped) return Promise.reject(new Error("The approval coordinator stopped."));
     const next = this.queue.then(work, work);
     this.queue = next.catch(() => undefined);
     return next;
@@ -475,6 +491,7 @@ export class ClaimRequests {
   private coordinatorCache: { at: number; value: { kind: "local"; claims: ApprovalClaims } | { kind: "peer"; origin: string } | null } | null = null;
   private reconciling: Promise<void> | null = null;
   private lastReconcile = Number.NEGATIVE_INFINITY;
+  private stopped = false;
 
   constructor(private readonly deps: {
     linear: Pick<LinearService, "comment">;
@@ -509,12 +526,20 @@ export class ClaimRequests {
       if (!FootprintBody.safeParse(input.footprint).success) return { state: "denied", reason: "the plan names more files, places or tickets than an automatic approval may", other: input.identifier };
       const now = this.deps.now?.() ?? Date.now();
       const existing = await this.read(input.issueId);
+      // The same plan in a later review of the ticket (a reload, a resubmission) keeps its claim id,
+      // and the record follows that review, which is what reconciliation then asks about.
+      const rebound = (current: ClaimIntent): ClaimIntent => {
+        const { parked: _parked, ...rest } = current;
+        return { ...rest, agentId: input.agentId, localUrl: input.localUrl, reviewId: input.reviewId, ...(input.parked ? { parked: true } : {}) };
+      };
       let record: ClaimIntent;
       if (existing && existing.state === "claiming" && existing.planHash === input.planHash) {
         // A crash between the record and the answer: the same id is sent again, so a grant made
         // already is returned instead of a second one.
-        record = existing;
+        record = rebound(existing);
+        await this.write(record);
       } else if (existing && existing.state === "granted" && existing.planHash === input.planHash) {
+        await this.write(rebound(existing));
         return { state: "granted" };
       } else if (existing && existing.state === "unclear") {
         return { state: "denied", reason: "an earlier automatic approval of this ticket could not be confirmed", other: input.identifier };
@@ -575,7 +600,7 @@ export class ClaimRequests {
   // the review still waits, and becomes `unclear` (with one owner item) when neither can be told.
   reconcile(): Promise<void> {
     const now = this.deps.now?.() ?? Date.now();
-    if (this.reconciling || now - this.lastReconcile < RECONCILE_MS) return this.reconciling ?? Promise.resolve();
+    if (this.stopped || this.reconciling || now - this.lastReconcile < RECONCILE_MS) return this.reconciling ?? Promise.resolve();
     this.lastReconcile = now;
     // A withdrawn claim is judged again only once the queue is released: that judgement claims
     // through this same queue.
@@ -591,13 +616,21 @@ export class ClaimRequests {
       await this.flushOnce();
       return again;
     }).then(async (again) => {
-      for (const record of again) await this.deps.rejudge(record).catch((error: unknown) => {
+      for (const record of again) if (!this.stopped) await this.deps.rejudge(record).catch((error: unknown) => {
         console.error(`[linear-tickets] judging ${record.identifier}'s plan again failed: ${error instanceof Error ? error.message : error}`);
       });
     }).catch((error: unknown) => {
       console.error(`[linear-tickets] reconciling automatic approvals failed: ${error instanceof Error ? error.message : error}`);
     }).finally(() => { this.reconciling = null; });
     return this.reconciling;
+  }
+
+  // Admission closes and the reconciliation or claim in progress finishes before a replacement
+  // plugin's requester starts on the same records.
+  async stop(): Promise<void> {
+    this.stopped = true;
+    await this.reconciling;
+    await this.queue;
   }
 
   // Every host answers for its own records (the coordinator's holder route).
@@ -749,8 +782,12 @@ export class ClaimRequests {
     return value;
   }
 
+  // Absent is no record; a record this host cannot read is an error, never `none`.
   private async read(issueId: string): Promise<ClaimIntent | null> {
-    return parseIntent(await readFile(this.pathOf(issueId), "utf8").catch(() => null));
+    return parseIntent(await readFile(this.pathOf(issueId), "utf8").catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return null;
+      throw error;
+    }));
   }
 
   private pathOf(issueId: string): string {
@@ -774,17 +811,25 @@ export class ClaimRequests {
   }
 
   private async all(): Promise<ClaimIntent[]> {
-    const names = await readdir(this.directory).catch(() => [] as string[]);
+    const names = await readdir(this.directory).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return [] as string[];
+      throw error;
+    });
     const records: ClaimIntent[] = [];
     for (const name of names) {
       if (!name.endsWith(".json") || ["granted.json", "answers.json", "ledger.json", "unconfirmed.json", "outbox.json"].includes(name)) continue;
-      const record = parseIntent(await readFile(join(this.directory, name), "utf8").catch(() => null));
+      // A record removed since the listing is gone; any other failure is not.
+      const record = parseIntent(await readFile(join(this.directory, name), "utf8").catch((error: NodeJS.ErrnoException) => {
+        if (error.code === "ENOENT") return null;
+        throw error;
+      }));
       if (record) records.push(record);
     }
     return records;
   }
 
   private serial<T>(work: () => Promise<T>): Promise<T> {
+    if (this.stopped) return Promise.reject(new Error("The approval claims of this host stopped."));
     const next = this.queue.then(work, work);
     this.queue = next.catch(() => undefined);
     return next;

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -83,7 +83,7 @@ function makeWorld(root: string): World {
     new ApprovalClaims({ linear: linear as never, related, holder: options.holder, directory: options.directory ?? join(root, "coordinator"), now: clock.now });
   const requester = (options: {
     directory: string; peers?: string[]; origin?: string | null; local?: () => Promise<ApprovalClaims | null>;
-    state?: () => Promise<ClaimReviewState>; rejudge?: () => Promise<void>;
+    state?: (record: ClaimIntent) => Promise<ClaimReviewState>; rejudge?: () => Promise<void>;
   }) => new ClaimRequests({
     linear: linear as never,
     local: options.local ?? (async () => local),
@@ -125,7 +125,7 @@ type World = {
   rows: PlanDocument[];
   reads: string[];
   claims(options?: { directory?: string; holder?: (claimId: string) => Promise<HolderAnswer | null> }): ApprovalClaims;
-  requester(options: { directory: string; peers?: string[]; origin?: string | null; local?: () => Promise<ApprovalClaims | null>; state?: () => Promise<ClaimReviewState>; rejudge?: () => Promise<void> }): ClaimRequests;
+  requester(options: { directory: string; peers?: string[]; origin?: string | null; local?: () => Promise<ApprovalClaims | null>; state?: (record: ClaimIntent) => Promise<ClaimReviewState>; rejudge?: () => Promise<void> }): ClaimRequests;
   request(entry: Ticket, plan: string, claimId?: string): ClaimRequest;
   claim(requests: ClaimRequests, entry: Ticket, plan: string, extra?: Partial<Omit<ClaimIntent, "claimId" | "state" | "at">>): Promise<ClaimAnswer>;
   file(directory: string, name: string): Promise<Record<string, unknown> | null>;
@@ -588,5 +588,117 @@ test("AC-18: an owner approval naming more than a claim may is recorded whole th
       const second = world.requester({ directory: join(world.root, "second"), local: async () => null, peers, origin: "http://127.0.0.1:49999" });
       assert.equal((await world.claim(second, five, last)).state, "denied", "the approval's last file still blocks an overlapping plan");
     } finally { links.stop(); }
+  });
+});
+
+test("AC-18: stopping finishes the claim in progress, then admits no claim and reconciles nothing", async () => {
+  await withWorld(async (world) => {
+    const one = world.ticket("TUC-1"), two = world.ticket("TUC-2");
+    const claims = world.claims();
+    world.setLocal(claims);
+    const coordinator = join(world.root, "coordinator"), first = join(world.root, "first");
+    // The coordinator's own claim in progress is written before its stop returns.
+    const direct = world.request(two, Y);
+    const pending = claims.claim(direct);
+    await claims.stop();
+    assert.deepEqual(Object.keys((await world.file(coordinator, "granted.json")) ?? {}), [direct.claimId]);
+    assert.equal((await pending).state, "granted");
+    await assert.rejects(claims.claim(world.request(one, X)), "a stopped coordinator admits no claim");
+    // The requester's likewise, against a coordinator still running.
+    const running = world.claims({ directory: join(world.root, "running") });
+    const requests = world.requester({ directory: first, local: async () => running });
+    const claimed = world.claim(requests, one, X);
+    await requests.stop();
+    assert.equal((await world.file(first, "issue-TUC-1.json"))?.state, "granted");
+    assert.equal((await claimed).state, "granted");
+    await assert.rejects(world.claim(requests, two, Y), "a stopped requester admits no claim");
+    // A record a stopped requester finds is left for the replacement plugin.
+    const second = join(world.root, "second");
+    await world.intent(second, two, Y, {});
+    const later = world.requester({ directory: second, local: async () => running });
+    await later.stop();
+    await later.reconcile();
+    assert.equal((await world.file(second, "issue-TUC-2.json"))?.state, "claiming");
+  });
+});
+
+test("AC-18: a crash after an answer is stored and before its grant is removed answers the stored state, and the next sweep removes the grant", async () => {
+  await withWorld(async (world) => {
+    const one = world.ticket("TUC-1"), two = world.ticket("TUC-2");
+    const coordinator = join(world.root, "coordinator");
+    const claimId = newClaimId(world.clock.now());
+    assert.equal((await world.claims().claim(world.request(one, X, claimId))).state, "granted");
+    // The crash: the withdrawal's answer is stored, the grant not removed yet.
+    await world.write(coordinator, "answers.json", { [claimId]: { state: "withdrawn", at: new Date(world.clock.now()).toISOString() } });
+    const restarted = world.claims();
+    assert.equal(await restarted.status(claimId), "withdrawn");
+    assert.deepEqual(await restarted.settle(claimId, "committed"), { state: "withdrawn" }, "a late commit does not turn a withdrawal into an approval");
+    assert.equal((await restarted.claim(world.request(two, X))).state, "denied", "the grant still blocks until the sweep");
+    await restarted.sweep();
+    assert.deepEqual(await world.file(coordinator, "granted.json"), {});
+    assert.equal((await restarted.claim(world.request(two, X))).state, "granted");
+  });
+});
+
+test("AC-18: an automatic approval settled after a later round began still blocks that round's overlapping plan", async () => {
+  await withWorld(async (world) => {
+    const one = world.ticket("TUC-1"), two = world.ticket("TUC-2");
+    world.setLocal(world.claims());
+    const first = world.requester({ directory: join(world.root, "first") });
+    assert.equal((await world.claim(first, one, X)).state, "granted");
+    world.clock.tick(10 * 60_000);
+    const round = new Date(world.clock.now()).toISOString();
+    world.clock.tick(60_000);
+    await first.committed(one.issueId, X);
+    const entries = Object.values((await world.file(join(world.root, "coordinator"), "ledger.json")) ?? {}) as { approvedAt: string }[];
+    assert.deepEqual(entries.map((entry) => entry.approvedAt), [new Date(world.clock.now()).toISOString()], "approved when it was settled");
+    const second = world.requester({ directory: join(world.root, "second") });
+    assert.equal((await world.claim(second, two, X, { roundStartedAt: round })).state, "denied");
+  });
+});
+
+test("AC-18: the same plan claimed again from a later review keeps its grant and follows that review", async () => {
+  await withWorld(async (world) => {
+    const one = world.ticket("TUC-1");
+    const claims = world.claims();
+    world.setLocal(claims);
+    const directory = join(world.root, "first");
+    // The first review is still open; the second one's judgement is the one using the grant.
+    const states: Record<string, ClaimReviewState> = { "review-first": "open", "review-second": "pending" };
+    const requests = world.requester({ directory, state: async (record) => states[record.reviewId] ?? "gone" });
+    assert.equal((await world.claim(requests, one, X, { reviewId: "review-first" })).state, "granted");
+    const claimId = (await world.file(directory, "issue-TUC-1.json"))?.claimId;
+    assert.equal((await world.claim(requests, one, X, { reviewId: "review-second", localUrl: "http://localhost:4000/second" })).state, "granted");
+    const record = await world.file(directory, "issue-TUC-1.json");
+    assert.deepEqual([record?.claimId, record?.reviewId, record?.localUrl], [claimId, "review-second", "http://localhost:4000/second"]);
+    world.clock.tick(61_000);
+    await requests.reconcile();
+    assert.equal(await claims.status(String(claimId)), "granted", "the first review still waiting does not withdraw the second one's grant");
+  });
+});
+
+test("AC-18: a host that cannot read its claim records, or keeps none yet, gives no holder answer", async () => {
+  await withWorld(async (world) => {
+    const one = world.ticket("TUC-1");
+    const directory = join(world.root, "first");
+    const claimId = await world.intent(directory, one, X, { state: "granted" });
+    const requests = world.requester({ directory });
+    const path = join(directory, "issue-TUC-1.json");
+    await chmod(path, 0o000);
+    const links = new ReviewLinks({
+      port: 0, proxyPort: 0, file: join(world.root, "reviews.json"), sweepMs: 3_600_000, alive: async () => false, origin: async () => null,
+      claims: async () => null, dispatch: async () => false, holder: (id) => requests.holder(id),
+    });
+    const starting = new ReviewLinks({
+      port: 0, proxyPort: 0, file: join(world.root, "reviews-starting.json"), sweepMs: 3_600_000, alive: async () => false, origin: async () => null,
+      claims: async () => null, dispatch: async () => false, holder: async () => null,
+    });
+    await links.start();
+    await starting.start();
+    try {
+      await assert.rejects(requests.holder(claimId), "an unreadable record is not `none`");
+      assert.equal((await fetch(`http://127.0.0.1:${links.listeningPort}/api/approval-claims/${claimId}/holder`)).ok, false);
+      assert.equal((await fetch(`http://127.0.0.1:${starting.listeningPort}/api/approval-claims/${claimId}/holder`)).ok, false, "no requester yet is no answer");
+    } finally { links.stop(); starting.stop(); await chmod(path, 0o600); }
   });
 });

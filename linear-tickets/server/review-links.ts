@@ -788,8 +788,10 @@ export class ReviewLinks {
     if (!claimId || claimId === "settle" || claimId === "record") return { status: 405, headers: { allow: "POST" }, body: "" };
     try {
       if (match[2]) {
-        if (!this.holder) return json(503, { error: "This host does not keep approval claims." });
-        return json(200, await this.holder(claimId) ?? { claim: "none" });
+        // No requester on this host yet: no answer, which keeps the claim blocking.
+        const answer = this.holder ? await this.holder(claimId) : null;
+        if (!answer) return json(503, { error: "This host does not keep approval claims." });
+        return json(200, answer);
       }
       const claims = this.claims ? await this.claims() : null;
       if (!claims) return json(503, { error: "This host is not the approval coordinator." });
