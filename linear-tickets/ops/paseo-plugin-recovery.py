@@ -28,6 +28,13 @@ COOLDOWN = 3600
 DAILY_ATTEMPTS = 2
 DAY = 86400
 GOVERNOR_MAX_AGE = 90
+# The governor samples local RPC about every 15 s. Under load (2026-10-21: load ~67 on 64
+# cores) a reloaded plugin needs minutes to answer; 30 s of checks restarted a daemon whose
+# plugin would have recovered, killing every agent on the host.
+RELOAD_ATTEMPTS = 2
+RELOAD_WINDOW = 180
+RESTART_WINDOW = 300
+POLL_INTERVAL = 15
 
 
 def command(args, timeout):
@@ -96,17 +103,31 @@ def next_state(previous, condition, now):
     return state, eligible
 
 
-def reload_verified(entry):
-    """A running status alone is insufficient: the outage also broke local plugin RPC."""
-    if not entry or not entry.get("enabled") or entry.get("status") != "running":
-        return "failing"
-    for attempt in range(4):
-        condition, _ = liveness(time.time(), True, entry, read_json(GOVERNOR))
-        if condition == "healthy":
+def observed_after(governor, since):
+    """The governor observation, only if it was taken after `since`: an older one predates the
+    reload or restart and says nothing about it."""
+    try:
+        at = datetime.fromisoformat(governor["at"].replace("Z", "+00:00")).timestamp()
+    except (TypeError, KeyError, AttributeError, ValueError):
+        return None
+    return governor if at >= since else None
+
+
+def verified_since(since, window):
+    """Poll until the plugin runs and local RPC answers in an observation newer than `since`.
+
+    A running status alone is insufficient: the outage also broke local plugin RPC. A plugin
+    that failed to load (not running or loading) is a definite failure; anything else is polled
+    until the window ends and returns its last condition (unknown never justifies a restart)."""
+    deadline = since + window
+    while True:
+        entry = plugin_status()
+        if entry is not None and (not entry.get("enabled") or entry.get("status") not in ("running", "loading")):
+            return "failing"
+        condition, _ = liveness(time.time(), True, entry, observed_after(read_json(GOVERNOR), since))
+        if condition == "healthy" or time.time() + POLL_INTERVAL > deadline:
             return condition
-        if attempt < 3:
-            time.sleep(10)
-    return condition
+        time.sleep(POLL_INTERVAL)
 
 
 def main():
@@ -142,8 +163,13 @@ def check_and_recover():
         state["lastAction"] = "attempting plugin reload"
         save(state)
         print(f"plugin recovery: {reason} for {state['failures']} checks; reloading plugin", flush=True)
-        reloaded, _ = command([PASEO, "plugin", "reload", "linear-tickets", "--json"], 75)
-        verified = reload_verified(plugin_status()) if reloaded else "failing"
+        verified = "failing"
+        for attempt in range(1, RELOAD_ATTEMPTS + 1):
+            reloaded, _ = command([PASEO, "plugin", "reload", "linear-tickets", "--json"], 75)
+            verified = verified_since(time.time(), RELOAD_WINDOW) if reloaded else "failing"
+            if verified != "failing":
+                break
+            print(f"plugin recovery: reload {attempt} of {RELOAD_ATTEMPTS} did not restore local RPC", flush=True)
         if verified == "healthy":
             state["lastAction"] = "plugin reloaded"
         elif verified == "unknown":
@@ -151,10 +177,11 @@ def check_and_recover():
             state["lastAction"] = "plugin running; local RPC unverified"
         else:
             # A stuck worker can block reload; this recovered the 2026-10-15 outage.
-            print("plugin recovery: reload did not restore local RPC; restarting Paseo daemon", flush=True)
+            print("plugin recovery: reloads did not restore local RPC; restarting Paseo daemon", flush=True)
             restarted, _ = command(["systemctl", "--user", "restart", "paseo.service"], 200)
-            entry = plugin_status() if restarted else None
-            state["lastAction"] = "daemon restarted" if entry and entry.get("status") == "running" else "recovery failed"
+            after = verified_since(time.time(), RESTART_WINDOW) if restarted else "failing"
+            state["lastAction"] = ("daemon restarted" if after == "healthy" else
+                                   "daemon restarted; local RPC unverified" if after == "unknown" else "recovery failed")
         save(state)
         print(f"plugin recovery: {state['lastAction']}", flush=True)
         return 0 if state["lastAction"] in ("plugin reloaded", "daemon restarted") else 1

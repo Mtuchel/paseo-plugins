@@ -3871,8 +3871,11 @@ The independently supervised `ops/paseo-plugin-recovery.py` runs from the user-l
 `paseo-plugin-recovery.timer` every two minutes. It checks the local plugin status and the
 governor's recent `linear.capacity` RPC observation, **without calling Linear**. A budget pause,
 an intentionally disabled plugin, a stopped Paseo daemon or a stale/unknown observation cannot
-trigger a restart. After three consecutive definite failures it attempts one plugin reload,
-checks local RPC again, and restarts Paseo only if the reload fails. Attempts are limited to
+trigger a restart. After three consecutive definite failures it reloads the plugin and checks
+local RPC for up to three minutes, counting only governor observations taken after the reload
+(an older failing one predates it). A second reload follows if that fails; Paseo restarts only
+if both fail, and the restarted plugin is checked for up to five minutes before the attempt
+counts as `daemon restarted`. Attempts are limited to
 two per rolling day, at least an hour apart. It holds the rollout lock, so an intentional
 rollout cannot be mistaken for a failed load. State and the reason for its last action are in
 `~/.paseo/linear-tickets/plugin-recovery.json`; inspect with
