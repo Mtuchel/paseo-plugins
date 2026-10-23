@@ -25,9 +25,11 @@ export function documentPlanText(content: string): string {
 
 // A `Plan:` document's own text below its headers, hashed like `planHash`, so a replan request can
 // name the plan it is about and be recognised as written against the current one
-// (server/plan-relations.ts, plan-requests.ts).
+// (server/plan-relations.ts, plan-requests.ts). A document whose plan was truncated names the whole
+// plan's hash in a header line; older documents and untruncated ones are hashed from their text.
 export function documentPlanHash(content: string): string {
-  return planHash(documentPlanText(content));
+  const named = /^>\s*\*\*Plan hash:\*\*\s*([0-9a-f]{64})\s*$/m.exec(leadingLines(content));
+  return named ? named[1] : planHash(documentPlanText(content));
 }
 
 // A `Plan:` document's Approved header names when the plan was approved, to the precision the

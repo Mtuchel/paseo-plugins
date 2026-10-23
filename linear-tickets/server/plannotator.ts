@@ -182,13 +182,17 @@ export function planDocument(event: DecidedEvent, identifier: string, model?: st
   const at = new Date(event.at);
   const date = Number.isFinite(at.getTime()) ? at.toISOString().slice(0, 23).replace("T", " ") : event.at.slice(0, 16).replace("T", " ");
   const plan = (event.planContent ?? "").trim() || "_The plan text was not recorded._";
+  const truncated = plan.length > MAX_PLAN_CHARS;
   return [
     `> **${event.approved ? "Approved" : "Sent back with feedback"}** in Plannotator on ${date} UTC for ${identifier}. Replaced on every review round; the decision comments on the ticket keep the history.`,
     ...round ? [`> **Review round:** ${round}`] : [],
     model ? `> **Planned with:** \`${model}\`` : "",
+    // A truncated text no longer hashes to its plan: the hash of the whole plan is kept here
+    // (review-outcome.ts `documentPlanHash`).
+    ...truncated ? [`> **Plan hash:** ${planHash(plan)}`] : [],
     event.feedback ? `\n## Review feedback\n\n${event.feedback}` : "",
     "\n---\n",
-    plan.length > MAX_PLAN_CHARS ? `${plan.slice(0, MAX_PLAN_CHARS)}\n\n… (truncated)` : plan,
+    truncated ? `${plan.slice(0, MAX_PLAN_CHARS)}\n\n… (truncated)` : plan,
   ].join("\n");
 }
 

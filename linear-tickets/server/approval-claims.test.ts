@@ -702,3 +702,16 @@ test("AC-18: a host that cannot read its claim records, or keeps none yet, gives
     } finally { links.stop(); starting.stop(); await chmod(path, 0o600); }
   });
 });
+
+test("AC-18: an automatic approval of a plan longer than its document keeps is still seen as committed", async () => {
+  await withWorld(async (world) => {
+    const one = world.ticket("TUC-1");
+    const claims = world.claims();
+    const long = `# Plan\n\n1. Change \`server/x.ts\`.\n\n${"Detail. ".repeat(30_000)}\n`;
+    const claimId = newClaimId(world.clock.now());
+    assert.equal((await claims.claim(world.request(one, long, claimId))).state, "granted");
+    world.approve(one, long);
+    await claims.sweep();
+    assert.equal(await claims.status(claimId), "committed");
+  });
+});

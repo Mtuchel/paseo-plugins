@@ -649,8 +649,9 @@ host that asks its peers which one coordinates reads their `/api/inbox` `dispatc
 present). The host with `dispatch.enabled` grants them; the others ask it over the tailnet inbox
 channel and, when it cannot be found, times out, or more than one peer claims the role, keep the
 plan with the owner (`the approval coordinator could not be reached`) instead of approving alone.
-Every host answers `/api/approval-claims/<id>/holder` for its own claim records; the coordinator's
-other `/api/approval-claims` routes answer `503` where dispatch is off.
+Every host answers `/api/approval-claims/<id>/holder` for its own claim records, with `503` while it
+cannot read them or before its claim requester has started; the coordinator's other
+`/api/approval-claims` routes answer `503` where dispatch is off.
 
 Tickets either host's app wrote count as yours: a host with an `activation.peer` asks the peer's
 authenticated `/activation/health` for its app user (`appUserId`) and trusts it like its own app,
@@ -1311,6 +1312,15 @@ the ticket, **the automatic approval of TUC-N could not be confirmed**. Your ans
 coordinator ask the requester's `/api/approval-claims/<id>/holder`; only a holder that no longer
 holds it (`none`, `unclear`, a withdrawal) releases the claim, while one still holding it, one that
 does not answer, and a closed ticket keep it blocking.
+An automatic approval counts from when it was settled, not from its grant, so a round that began
+while the grant was being written still sees it. A settled claim's answer (`answers.json`) is
+stored before its grant is removed: after a crash between the two, the claim id gets the stored
+answer and the next sweep removes the leftover grant, which blocks overlapping plans until then.
+The same plan claimed again from a newer review keeps its claim id and follows that review, so the
+older review's state no longer withdraws it. A plan longer than the `Plan:` document keeps
+(180,000 characters) is written truncated with a `> **Plan hash:**` header naming the whole plan,
+which is what a grant and a replan request compare against. On a plugin reload both sides close to
+new claims and finish the one in progress before the new plugin starts.
 
 It also refuses a ticket plan that does not follow the owner's plan layout
 ([`shared/plan-layout.ts`](shared/plan-layout.ts)). The layout is read at every record from
