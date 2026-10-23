@@ -218,7 +218,8 @@ export class PlanRequests {
         if (!consumesFile && outcome !== "sent") continue;
         if (request.kind === "label") await this.deps.routes?.ownerRequested(agent.issueId);
         entry.handled.push(request.id);
-        entry.roundStartedAt = request.at;
+        // A peer's older comment can become trusted after a newer request was delivered.
+        if (!entry.roundStartedAt || request.at > entry.roundStartedAt) entry.roundStartedAt = request.at;
       }
       next[agent.id] = entry;
     }

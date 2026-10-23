@@ -404,6 +404,8 @@ export class PlanRelations {
     }
     const open = await this.requests(record.issueId, record.identifier, since, record.planHash);
     if (open.length) {
+      // Added, not assumed: a retry after a removal whose restore failed finds the label gone.
+      if (await this.linear.addLabelAsApp(record.issueId, PLAN_LABEL) === null) return false;
       record.removal = "done";
       record.removalKept = true;
       return true;

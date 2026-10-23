@@ -328,6 +328,14 @@ test("AC-14: a ticket read that keeps failing counts every round and stops after
   });
 });
 
+test("AC-13: a request open while the label is already gone puts the label back", async () => {
+  // The state a crash after the removal (or a failed restore) leaves: label gone, request open.
+  await harness({ ownLabels: [] }, async ({ relations, fake }) => {
+    await relations.file({ issueId: OWN.id, identifier: OWN.identifier, plan: plan(["TUC-7 relates to TUC-9: same files"]), documentUrl: null, roundStartedAt: "2026-10-05T09:00:00.000Z" });
+    assert.ok(fake.labels.get("own-id")!.has("plan"));
+  }, 1);
+});
+
 test("AC-14: an untrusted ticket gets exactly one comment and no link, label or replan write", async () => {
   const directory = await mkdtemp(join(tmpdir(), "paseo-plan-relations-"));
   const f = fake();

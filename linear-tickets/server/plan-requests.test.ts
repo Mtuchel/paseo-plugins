@@ -157,6 +157,18 @@ test("the round's start is the newest request delivered to the agent, and null b
   });
 });
 
+test("a peer's older comment trusted after a newer request does not move the round's start back", async () => {
+  const apps = ["app-1"];
+  await harness(async ({ requests, comments }) => {
+    comments.push(comment("c-old", "2026-10-03T10:00:00.000Z", "peer-app", "33333333-3333-4333-8333-333333333333"), comment("c-new", "2026-10-04T10:00:00.000Z", "app-1", "44444444-4444-4444-8444-444444444444"));
+    await requests.poll();
+    assert.equal(await requests.roundStartedAt("agent-1"), "2026-10-04T10:00:00.000Z");
+    apps.push("peer-app");
+    await requests.poll();
+    assert.equal(await requests.roundStartedAt("agent-1"), "2026-10-04T10:00:00.000Z");
+  }, { apps });
+});
+
 test("the plugin's own send writes a request file for the agent", async () => {
   await harness(async ({ requests, files, file, prompts }) => {
     await requests.send({ id: "agent-1", issueId: "issue-1", identifier: "TUC-7" }, "Plan again for the cheap tier.");
