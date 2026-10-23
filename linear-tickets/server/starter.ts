@@ -19,6 +19,8 @@ import { advisorNote, hasLabel, PLAN_POLICY_ENV, PLAN_POLICY_LABEL, PLAN_READY_L
 import { needsOwner, type Presence } from "./presence";
 import { ghostAgents, LIVE_AGENT, type ProcessInspector } from "./process-liveness";
 import { PRECEDENCE_RULE } from "./related-work";
+import { documentApprovedAt, documentPlanHash } from "./review-outcome";
+import type { PlanRequest } from "./plan-requests";
 import { nightInput, Scheduler, type Admission } from "./scheduler";
 import type { PluginSettings } from "./settings";
 import { launchTier, recordStart, TIER_AGENT_LABEL, tierModel, tierNote, type TierStore } from "./model-tiers";
@@ -44,6 +46,9 @@ type Deps = {
   acceptanceTests?: Pick<AcceptanceTestsStore, "save">;
   // The small-ticket route's records (README, "Small-ticket route").
   routes?: Pick<SmallRoutes, "get">;
+  // A ticket's unhandled replan requests (server/plan-requests.ts), read when its approved plan
+  // would be implemented: one newer than the plan sends it back to planning.
+  requests?: (issueId: string, identifier: string, since: string | null, planHash: string | null) => Promise<PlanRequest[]>;
   deletions?: Pick<ReviewDeletions, "blocked">;
   // Which of a repository's clones a ticket's work belongs to (README, "Worktree shards").
   shards?: ShardAssignor;
@@ -71,9 +76,24 @@ export const UNTRUSTED_NOTE = [
   UNTRUSTED_TEXT,
   "Investigate and write a plan only. Do not change code, run installs or make network calls until the owner approves the plan.",
 ].join(" ");
-// Every ticket plan starts with a look for overlapping work (README, "Overlap check"): new tickets,
-// by people or agents, are filed without one. The candidate list is in the launch's context file.
-export const OVERLAP_NOTE = `Before you plan, look for overlapping work. Start from the \`# Candidate list\` at the end of the file the LINEAR_TICKETS_CONTEXT environment variable names: this team's open tickets, the approved plans of open tickets with their reach and files, the tickets in Planning, the files of their open and merged pull requests, and the tickets done in the last 60 days. The list is long: search it for this ticket's files, words and places rather than reading it whole. Search Linear (with the linear_ticket tool search_issues, or another Linear read tool such as list_issues with a query) only for other teams' tickets and for what the list marks incomplete. Look for tickets that change the same feature, files or data as this one, or already ask for what it does, and read the full description of each candidate. ${PRECEDENCE_RULE} Your plan gets an \`## Overlapping tickets\` section: each overlapping ticket, how it overlaps and what this plan does about it (waits for it, builds on it, leaves a part to it), or "None found" with what you checked. When you have the linear_ticket tool add_relation, link every real overlap with it as related while you plan. When another ticket already covers all of this one, the plan says so and proposes closing this ticket as its duplicate instead of doing the work.`;
+// Every ticket plan starts with a look for related work (README, "Related work"): new tickets, by
+// people or agents, are filed without one. The candidate list is in the launch's context file, and
+// approving the plan writes the block's lines into Linear.
+export const RELATED_WORK_NOTE = `Before you plan, look for related work. Start from the \`# Candidate list\` at the end of the file the LINEAR_TICKETS_CONTEXT environment variable names: this team's open tickets, the approved plans of open tickets with their reach and files, the tickets in Planning, the files of their open and merged pull requests, and the tickets done in the last 60 days. The list is long: search it for this ticket's files, words and places rather than reading it whole. Search Linear (with the linear_ticket tool search_issues, or another Linear read tool such as list_issues with a query) only for other teams' tickets and for what the list marks incomplete. Look for tickets that change the same feature, files or data as this one, or already ask for what it does, and read the full description of each candidate. ${PRECEDENCE_RULE} Your plan gets a short \`## Related work\` section: the related tickets that matter and what this plan does about them, in prose, followed by one fenced \`\`\`related-work block with one line per ticket and a reason after a colon: \`TUC-9 blocks this ticket: reason\` (this plan waits for TUC-9), \`this ticket blocks TUC-9: reason\` (TUC-9 waits for this plan), \`this ticket relates to TUC-9: reason\` (the same feature, files or data), \`this ticket duplicates TUC-9: reason\` (only a ticket nobody has started: approving this plan closes it as this ticket's duplicate), or \`replan TUC-9: reason\` (TUC-9's approved plan is out of date because of this one). Write this ticket's own identifier in every line except \`replan\`; \`hold\`, \`release\`, \`attended\` and \`unattended\` do not belong in a ticket plan. Approving the plan writes these links into Linear as the Paseo app. When another ticket already covers all of this one, the plan says so and proposes closing this ticket as its duplicate instead of doing the work.`;
+
+// A ticket whose approved plan a request asks to revise (README, "Related work"): the agent plans
+// again from that plan and every request, instead of implementing it.
+export function revisePlanNote(identifier: string, plan: { url: string; content: string } | null, requests: PlanRequest[]): string {
+  const list = requests.map((request) => request.kind === "comment"
+    ? `- ${request.at.slice(0, 16).replace("T", " ")} UTC, replan request${request.commentId ? ` (comment ${request.commentId})` : ""}:\n${(request.body ?? request.reason ?? "").trim().split("\n").map((line) => `  ${line}`).join("\n")}`
+    : `- ${request.at.slice(0, 16).replace("T", " ")} UTC: the owner added the \`plan\` label.`).join("\n");
+  return [
+    `A request asks for ${identifier}'s approved plan to be revised, so plan again instead of implementing it: start from the approved plan below, keep everything the request does not object to, and address every request. Submit the revised plan for review as usual.`,
+    plan?.url ? `The approved plan (Linear document "Plan: ${identifier}": ${plan.url}):\n\n${approvedPlanText(plan)}` : approvedPlanText(plan),
+    `Requests:\n${list}`,
+  ].join("\n\n");
+}
+
 // Every ticket plan picks the model tier its implementation runs on (README, "Model tiers").
 export const MODEL_NOTE = modelSteps();
 // Every implementer corrects necessary missed reach within scope; small extensions remain optional.
@@ -142,7 +162,14 @@ export async function planSetup(
   issueId: string,
   provider: string,
   usualModeId: string | undefined,
-  context: { tiers?: Pick<TierStore, "get">; routes?: Pick<SmallRoutes, "get">; settings?: Pick<PluginSettings, "autoApprove" | "dispatch"> } = {},
+  context: {
+    tiers?: Pick<TierStore, "get">;
+    routes?: Pick<SmallRoutes, "get">;
+    settings?: Pick<PluginSettings, "autoApprove" | "dispatch">;
+    // The requests newer than a time on a ticket (server/plan-requests.ts): an unhandled one newer
+    // than the approved plan sends the ticket back to planning instead of implementing it.
+    requests?: (issueId: string, identifier: string, since: string | null, planHash: string | null) => Promise<PlanRequest[]>;
+  } = {},
 ): Promise<PlanSetup> {
   const { tiers, routes, settings } = context;
   const state = await linear.issueCore(issueId);
@@ -150,7 +177,13 @@ export async function planSetup(
   const plan = await linear.issueDocument(issueId, `Plan: ${state.identifier}`).catch(() => null);
   const providerKey = provider.split("/")[0];
   // Implementing an approved plan: the strongest of the ticket's label, its recorded tier and the plan's.
-  const approved = planPolicy(state.labels) === null;
+  const approvedPlan = planPolicy(state.labels) === null;
+  // A request asks for that plan to be revised (README, "Related work"): plan again, holding the
+  // plan and the requests. A replan comment counts only when it was written for this exact plan.
+  const replan = approvedPlan && plan && context.requests
+    ? await context.requests(issueId, state.identifier, documentApprovedAt(plan.content) === null ? null : new Date(documentApprovedAt(plan.content)!).toISOString(), documentPlanHash(plan.content)).catch(() => [])
+    : [];
+  const approved = approvedPlan && replan.length === 0;
   // The `plan` label wins over `no-plan`, `plan-ready` over both; a `no-plan` without the route's
   // record (added by hand, or left from before) plans, and so does one the owner's settings or the
   // ticket no longer allow.
@@ -174,7 +207,8 @@ export async function planSetup(
     notes: [
       tierMissing ? (untrusted ? UNTRUSTED_TEXT : "") : policy ? (untrusted ? UNTRUSTED_NOTE : PLAN_REQUIRED_NOTE) : untrusted ? UNTRUSTED_TEXT : "",
       tierMissing ? tierMissingNote(state.identifier, plan) : "",
-      policy && !tierMissing ? OVERLAP_NOTE : "",
+      policy && !tierMissing ? RELATED_WORK_NOTE : "",
+      policy && replan.length ? revisePlanNote(state.identifier, plan, replan) : "",
       policy ? PLAN_SECTIONS_NOTE : "",
       policy ? PLAN_SLICING_NOTE : "",
       offer ? smallRouteNote() : "",
@@ -439,7 +473,7 @@ export class TicketStarter {
       // read-only brief as its whole instructions, no plan policy. `SAFE_MODES` is the same mapping
       // the planner runs take; a provider without one keeps the owner's usual mode.
       ? { identifier: detail.issue.identifier, untrusted: true, policy: null, modeId: SAFE_MODES[preference.model.split("/")[0]] ?? undefined, notes: [options.verifier.brief], labels: {}, env: {}, tier: { tier: "cheap" as const, reason: "a steward verifier runs on the cheap tier" }, tests: [] }
-      : await planSetup(this.deps.linear, issueId, preference.model, preference.modeId, { tiers: this.deps.tiers, routes: this.deps.routes, settings });
+      : await planSetup(this.deps.linear, issueId, preference.model, preference.modeId, { tiers: this.deps.tiers, routes: this.deps.routes, settings, requests: this.deps.requests });
     const model = tierModel(settings, preference.model.split("/")[0], setup.tier?.tier ?? null, { provider: preference.model, ...(preference.thinkingOptionId ? { thinkingOptionId: preference.thinkingOptionId } : {}) });
     const diagnostic = options.verifier?.marker.startsWith("diagnostic-") ?? false;
     const diagnosticProvider = model.provider.split("/")[0];

@@ -353,7 +353,7 @@ test("the plan request poll pauses at 9% of the points budget and sends at 11%",
   const dir = await directory(t, "paseo-plans-");
   t.mock.method(console, "error", () => {});
   const paseo = { agents: { list: async () => ({ entries: [{ agent: { id: "agent-1", labels: AGENT.labels } }], pageInfo: { hasMore: false, nextCursor: null } }) } } as unknown as PaseoApi;
-  const poller = (f: Fixture) => new PlanRequests({ linear: f.linear, prompt: async () => "sent", directory: join(dir, "requests") } as never);
+  const poller = (f: Fixture) => new PlanRequests({ linear: f.linear, apps: { ids: async () => [] }, prompt: async () => "sent", directory: join(dir, "requests") } as never);
 
   const low = fixture(t);
   bothAt(low, LOW_POINTS);
@@ -361,7 +361,8 @@ test("the plan request poll pauses at 9% of the points budget and sends at 11%",
   paused.attach(paseo);
   await paused.poll();
   paused.stop();
-  assertPaused(low, "plan-requests");
+  assert.deepEqual(low.calls, [], "no request reaches Linear");
+  assert.ok(low.refusals.some(([, who, level]) => who === "plan-requests" && level === "background"), "the poll's own read is refused under its caller name");
 
   const high = fixture(t, () => ({ issues: { nodes: [{ id: ID_A, labels: { nodes: [] } }] } }));
   bothAt(high, HIGH_POINTS);

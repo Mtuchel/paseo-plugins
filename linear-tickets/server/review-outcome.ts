@@ -14,6 +14,24 @@ export function planHash(plan: string): string {
   return createHash("sha256").update(plan.trim()).digest("hex");
 }
 
+// A `Plan:` document's own text below the plugin's leading `>` header lines and the `---`
+// separator, hashed like `planHash`, so a replan request can name the plan it is about and be
+// recognised as written against the current one (server/plan-relations.ts, plan-requests.ts).
+export function documentPlanHash(content: string): string {
+  const lines = content.split("\n");
+  const separator = lines.findIndex((line) => line.trim() === "---");
+  const heading = lines.findIndex((line) => line.trim().startsWith("#"));
+  const start = separator >= 0 ? separator + 1 : heading >= 0 ? heading : 0;
+  return planHash(lines.slice(start).join("\n"));
+}
+
+// The date a `Plan:` document's Approved header names ("2026-10-06 11:01 UTC"), as an epoch time;
+// null when it has no Approved header or no readable date.
+export function documentApprovedAt(content: string): number | null {
+  const header = /^>\s*\*\*Approved\*\*.*?on (\d{4}-\d{2}-\d{2}) (\d{2}:\d{2})\b/m.exec(content);
+  return header ? Date.parse(`${header[1]}T${header[2]}:00Z`) : null;
+}
+
 // What became of a review the plugin is waiting on. Decisions taken on Plannotator's own page
 // reach nobody when omp's plan mode runs the review, but Plannotator saves every decided plan as
 // `<slug>-<date>-approved.md` / `-denied.md` (feedback in `<slug>-<date>.annotations.md`).

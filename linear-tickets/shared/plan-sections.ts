@@ -73,6 +73,14 @@ function sectionText(plan: string, name: string): { body: string; text: string }
   return { body: match[2], text: `${match[1].replace(/^\s*[:—–-]\s*/, "")}\n${match[2]}`.trim() };
 }
 
+// The ticket plan's list of related tickets and its fenced block (README, "Related work").
+export const RELATED_WORK_SECTION = "Related work";
+
+// Whether the plan has a section with this title (case-insensitive).
+export function hasSection(plan: string, name: string): boolean {
+  return sectionText(plan, name) !== null;
+}
+
 // The body of the plan's `## Reach` section, trimmed; null when it has none.
 export function reachBody(plan: string): string | null {
   const reach = sectionText(plan, REACH_SECTION);

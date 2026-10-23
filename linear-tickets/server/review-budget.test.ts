@@ -72,6 +72,9 @@ test("an inbox approval consumes the owner's reserve through the production deci
     issueDocuments: { issue: { id: "issue-1", documents: { nodes: [] } } },
     documentCreate: { documentCreate: { success: true, document: { id: "doc-1", url: "https://linear.app/doc/1" } } },
     comment: { commentCreate: { success: true, comment: { id: "comment-1" } } },
+    // The plan request poll reads the ticket's replan comments and this host's app user.
+    replanComments: { issue: { comments: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } },
+    viewerCheck: { viewer: { id: "owner-1" } },
   };
   const fetch = globalThis.fetch;
   t.mock.method(globalThis, "fetch", async (url: string | URL | Request, init?: RequestInit) => {

@@ -33,7 +33,7 @@ export type DecisionRoute = "parked" | "live" | "work-order" | "later" | "split"
 // pending: accepted, being carried out. applied: every step went through. void: never applied.
 export type AttemptState = "deciding" | "uncertain" | "pending" | "applied" | "void";
 
-export type ParkedSnapshot = { issueId: string; identifier: string; plan: string; model: string | null; parkedAt: string; reasons?: string[]; line?: string };
+export type ParkedSnapshot = { issueId: string; identifier: string; agentId?: string; plan: string; model: string | null; parkedAt: string; reasons?: string[]; line?: string; roundStartedAt?: string | null };
 
 // What the bridge knows locally about the agent when a decision is accepted.
 export type RouteSnapshot = {
