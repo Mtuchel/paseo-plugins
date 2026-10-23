@@ -4,11 +4,13 @@ Description=Recover failed linear-tickets plugin without a Linear API call
 #          journalctl --user -u paseo-plugin-recovery.service --since today
 # State and cooldown: ~/.paseo/linear-tickets/plugin-recovery.json
 # Stop automatic recovery: systemctl --user disable --now paseo-plugin-recovery.timer
-# The script waits for three failed checks, reloads the plugin first, then restarts
-# Paseo only if local RPC remains broken. At most two attempts per rolling day,
+# The script waits for three failed checks, reloads the plugin up to twice (each checked
+# for 3 minutes against fresh local RPC observations), then restarts Paseo only if local RPC
+# remains broken, and checks the restarted plugin for 5 minutes. At most two attempts per rolling day,
 # separated by an hour. Linear API budget pauses are NOT liveness failures.
 
 [Service]
 Type=oneshot
 ExecStart=/usr/bin/python3 %h/dev/paseo-plugins/linear-tickets/ops/paseo-plugin-recovery.py
-TimeoutStartSec=300
+# Two reloads (75 s + 180 s each), a restart (200 s) and its 300 s check fit in 1200 s.
+TimeoutStartSec=1200

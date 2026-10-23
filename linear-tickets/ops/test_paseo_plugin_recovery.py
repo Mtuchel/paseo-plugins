@@ -41,17 +41,41 @@ class RecoveryTests(unittest.TestCase):
         self.assertFalse(eligible)
         self.assertEqual(state["failures"], 0)
 
-    def test_reload_status_must_be_confirmed_by_local_rpc(self):
-        failed = {"at": datetime.fromtimestamp(NOW, timezone.utc).isoformat(), "leaseOk": False,
-                  "reason": "plugin unavailable: linear.capacity timed out"}
-        healthy = {"at": datetime.fromtimestamp(NOW, timezone.utc).isoformat(), "leaseOk": True}
-        entry = {"enabled": True, "status": "running"}
-        with mock.patch.object(recovery, "read_json", return_value=failed), mock.patch.object(recovery.time, "time", return_value=NOW), mock.patch.object(recovery.time, "sleep") as sleep:
-            self.assertEqual(recovery.reload_verified(entry), "failing")
-            self.assertEqual(sleep.call_count, 3)
-        with mock.patch.object(recovery, "read_json", side_effect=[failed, healthy]), mock.patch.object(recovery.time, "time", return_value=NOW), mock.patch.object(recovery.time, "sleep") as sleep:
-            self.assertEqual(recovery.reload_verified(entry), "healthy")
-            sleep.assert_called_once_with(10)
+    def clock(self):
+        """A fake clock that sleeping advances, so polling windows end deterministically."""
+        now = [NOW]
+        def sleep(seconds):
+            now[0] += seconds
+        return mock.patch.object(recovery.time, "time", side_effect=lambda: now[0]), mock.patch.object(recovery.time, "sleep", side_effect=sleep)
+
+    def observation(self, at, ok):
+        stamp = datetime.fromtimestamp(at, timezone.utc).isoformat()
+        return {"at": stamp, "leaseOk": True} if ok else {"at": stamp, "leaseOk": False, "reason": "plugin unavailable: linear.capacity timed out"}
+
+    def test_verification_counts_only_observations_after_the_reload(self):
+        running = {"enabled": True, "status": "running"}
+        clock, sleep = self.clock()
+        # A healthy observation from before the reload proves nothing: without a newer one the
+        # window ends unknown, which never restarts the daemon.
+        with clock, sleep, mock.patch.object(recovery, "plugin_status", return_value=running), \
+             mock.patch.object(recovery, "read_json", return_value=self.observation(NOW - 5, True)):
+            self.assertEqual(recovery.verified_since(NOW, 180), "unknown")
+        clock, sleep = self.clock()
+        # A slow plugin that fails its first fresh checks and answers within the window recovers.
+        later = iter([self.observation(NOW - 5, False), self.observation(NOW + 10, False), self.observation(NOW + 20, True)])
+        with clock, sleep as slept, mock.patch.object(recovery, "plugin_status", return_value=running), \
+             mock.patch.object(recovery, "read_json", side_effect=lambda path: next(later)):
+            self.assertEqual(recovery.verified_since(NOW, 180), "healthy")
+            self.assertEqual(slept.call_count, 2)
+        clock, sleep = self.clock()
+        with clock, sleep, mock.patch.object(recovery, "plugin_status", return_value=running), \
+             mock.patch.object(recovery, "read_json", side_effect=lambda path: self.observation(recovery.time.time(), False)):
+            self.assertEqual(recovery.verified_since(NOW, 180), "failing")
+            self.assertLessEqual(recovery.time.time(), NOW + 180)
+        clock, sleep = self.clock()
+        with clock, sleep as slept, mock.patch.object(recovery, "plugin_status", return_value={"enabled": True, "status": "failed"}):
+            self.assertEqual(recovery.verified_since(NOW, 180), "failing")
+            slept.assert_not_called()
 
     def test_cooldown_and_daily_limit_guard_repeated_failure(self):
         state, eligible = recovery.next_state({"failures": 2, "attempts": []}, "failing", NOW)
@@ -67,7 +91,7 @@ class RecoveryTests(unittest.TestCase):
         state, eligible = recovery.next_state(state, "failing", NOW + 86401)
         self.assertTrue(eligible)
 
-    def test_reload_failure_restarts_daemon_once_and_records_success(self):
+    def run_recovery(self, verdicts):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)
             commands = []
@@ -75,19 +99,30 @@ class RecoveryTests(unittest.TestCase):
                 commands.append(tuple(args))
                 if args[:2] == ["systemctl", "--user"] and args[2] == "is-active":
                     return True, "active"
-                return (True, "") if args[0] == "systemctl" else (False, "")
+                return True, ""
             with (mock.patch.object(recovery, "BASE", base),
                   mock.patch.object(recovery, "LOCK", base / "lock"),
+                  mock.patch.object(recovery, "ROLLOUT_LOCK", base / "rollout.lock"),
                   mock.patch.object(recovery, "STATE", base / "state.json"),
                   mock.patch.object(recovery, "command", side_effect=command),
-                  mock.patch.object(recovery, "plugin_status", side_effect=[{"enabled": True, "status": "failed"},
-                                                                   {"enabled": True, "status": "running"}]),
+                  mock.patch.object(recovery, "plugin_status", return_value={"enabled": True, "status": "failed"}),
+                  mock.patch.object(recovery, "verified_since", side_effect=verdicts),
                   mock.patch.object(recovery, "read_json", side_effect=lambda path: {"failures": 2, "attempts": []} if path == base / "state.json" else {}),
                   mock.patch.object(recovery.time, "time", return_value=NOW)):
-                self.assertEqual(recovery.main(), 0)
-            self.assertEqual(len([args for args in commands if "reload" in args]), 1)
-            self.assertEqual(len([args for args in commands if "restart" in args]), 1)
-            self.assertEqual(recovery.read_json(base / "state.json")["lastAction"], "daemon restarted")
+                code = recovery.main()
+            reloads = len([args for args in commands if "reload" in args])
+            restarts = len([args for args in commands if "restart" in args])
+            return code, reloads, restarts, recovery.read_json(base / "state.json")["lastAction"]
+
+    def test_second_reload_recovers_without_restarting_the_daemon(self):
+        self.assertEqual(self.run_recovery(["failing", "healthy"]), (0, 2, 0, "plugin reloaded"))
+
+    def test_unobserved_reload_never_restarts_the_daemon(self):
+        self.assertEqual(self.run_recovery(["unknown"]), (1, 1, 0, "plugin running; local RPC unverified"))
+
+    def test_restart_only_after_both_reloads_fail_and_is_verified(self):
+        self.assertEqual(self.run_recovery(["failing", "failing", "healthy"]), (0, 2, 1, "daemon restarted"))
+        self.assertEqual(self.run_recovery(["failing", "failing", "failing"]), (1, 2, 1, "recovery failed"))
 
     def test_live_rollout_prevents_parallel_recovery(self):
         with tempfile.TemporaryDirectory() as directory:
