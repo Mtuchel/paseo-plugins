@@ -332,6 +332,29 @@ test("AC-14: a ticket read that keeps failing counts every round and stops after
   });
 });
 
+test("AC-15: a catch-up record that gave up is resumed by a later catch-up, not by the same one", async () => {
+  await harness({ blockNull: true }, async ({ relations, fake, retry }) => {
+    const recordId = "catch-up:own-id:abc";
+    const section = {
+      issueId: OWN.id, identifier: OWN.identifier, plan: plan(["TUC-9 blocks TUC-7: the parser lands first"]),
+      documentUrl: null, cleanup: false, recordId, guard: { issueId: OWN.id, planHash: documentPlanHash(OWN_PLAN) },
+    };
+    await relations.file({ ...section, origin: "TUC-42" });
+    for (let round = 0; round < 6; round++) await retry();
+    assert.equal((await relations.outcome(recordId)).status, "stopped");
+    const refused = fake.calls.filter((call) => call.startsWith("block")).length;
+
+    fake.state.blockNull = false;
+    await relations.file({ ...section, origin: "TUC-42" });
+    assert.equal((await relations.outcome(recordId)).status, "stopped", "the same catch-up filing again leaves the stopped record alone");
+    assert.equal(fake.calls.filter((call) => call.startsWith("block")).length, refused);
+
+    await relations.file({ ...section, origin: "TUC-43" });
+    assert.deepEqual(await relations.outcome(recordId), { status: "done" });
+    assert.equal(fake.calls.filter((call) => call.startsWith("block")).length, refused + 1, "the blocker is written once");
+  });
+});
+
 test("AC-13: a request open while the label is already gone puts the label back", async () => {
   // The state a crash after the removal (or a failed restore) leaves: label gone, request open.
   await harness({ ownLabels: [] }, async ({ relations, fake }) => {
