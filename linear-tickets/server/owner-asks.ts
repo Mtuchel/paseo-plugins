@@ -45,28 +45,45 @@ const LINEAR_SOURCE_CACHE_MS = 60_000;
 // requests on server087 (568 open issues, 13,363 comments; 2026-10-16) and made owner-asks the
 // largest Linear caller on both pools. The overlap covers clock skew between this host and
 // Linear (a comment's updatedAt can precede its createdAt). A change read cannot see a deleted
-// comment, so every history is read again after COMMENT_FULL_READ_MS.
+// comment, so each issue's whole history is read again once it is COMMENT_VERIFY_MS old.
+// Those re-reads roll: a collection re-reads at most COMMENT_HISTORY_SLICE of the oldest ones.
+// Re-reading every history at once every 30 minutes cost about 100 requests each time on
+// server087 (576 issues, 18,594 comments; 2026-10-23), and a read the paused background budget
+// refused partway threw the finished histories away, so the next collection started over.
 const COMMENT_CHANGE_OVERLAP_MS = 5 * 60_000;
-const COMMENT_FULL_READ_MS = 30 * 60_000;
+const COMMENT_VERIFY_MS = 2 * 60 * 60_000;
+// Four OWNER_ASK_COMMENT_BATCH reads: one round of the history reader's four workers. Histories
+// are read in slices of this size, and every finished slice is kept even when a later one fails.
+const COMMENT_HISTORY_SLICE = 100;
 // The store is persisted, so the first collection after a reload extends the stored histories by
 // the changes since their read instead of reading every history again: that read took 74 requests
 // and about 20 seconds on server087 (2026-10-16) and the menu bar's first RPC after a reload timed
-// out on it. A stored store is resumed only within COMMENT_FULL_READ_MS of its whole read, so the
-// bound on deleted comments is the same as in a running collection.
-const COMMENT_STORE_VERSION = 1;
+// out on it. Each issue keeps the time of its whole read, so a resumed store has the same bound on
+// deleted comments as a running collection.
+const COMMENT_STORE_VERSION = 2;
 const COMMENT_STORE_FILE = "comments.json";
 type Linear = Pick<LinearService, "ownerAskIssues" | "ownerAskIssuesByIds" | "ownerAskComments" | "ownerAskCommentChanges" | "commentBody" | "comment" | "complete" | "viewerId">;
-type CommentStore = { byIssue: Map<string, OwnerAskComment[]>; readAt: number; fullAt: number; expiresAt: number };
+type CommentStore = { byIssue: Map<string, OwnerAskComment[]>; verifiedAt: Map<string, number>; readAt: number; expiresAt: number };
 // A stored store is used only when it is complete: anything malformed is treated as absent and the
 // collection that follows reads every history again, about twenty seconds on server087 (2026-10-16).
 // A comment the file is missing would silently drop a source, so nothing half-valid is resumed.
-const storedCommentsSchema = z.object({
-  version: z.literal(COMMENT_STORE_VERSION),
-  readAt: z.number().int().nonnegative(),
-  fullAt: z.number().int().nonnegative(),
-  byIssue: z.record(z.string(), z.array(z.object({ id: z.string(), body: z.string(), createdAt: z.string() }))),
-});
-type StoredComments = z.infer<typeof storedCommentsSchema>;
+// A version 1 store (one whole-read time for every history) resumes with that time for each issue.
+const storedComment = z.object({ id: z.string(), body: z.string(), createdAt: z.string() });
+const storedCommentsSchema = z.union([
+  z.object({
+    version: z.literal(COMMENT_STORE_VERSION),
+    readAt: z.number().int().nonnegative(),
+    verifiedAt: z.record(z.string(), z.number().int().nonnegative()),
+    byIssue: z.record(z.string(), z.array(storedComment)),
+  }).refine(stored => Object.keys(stored.byIssue).every(id => id in stored.verifiedAt)),
+  z.object({
+    version: z.literal(1),
+    readAt: z.number().int().nonnegative(),
+    fullAt: z.number().int().nonnegative(),
+    byIssue: z.record(z.string(), z.array(storedComment)),
+  }),
+]);
+type StoredComments = { version: typeof COMMENT_STORE_VERSION; readAt: number; verifiedAt: Record<string, number>; byIssue: Record<string, OwnerAskComment[]> };
 type Attention = Pick<OwnerAsk, "attention" | "attentionReason" | "blockerIdentifier">;
 
 type SourceAsk = { revision: string; attention: Attention };
@@ -284,6 +301,19 @@ function sameComments(previous: Map<string, OwnerAskComment[]>, next: Map<string
     }
   }
   return true;
+}
+
+function sameTimes(previous: Map<string, number>, next: Map<string, number>): boolean {
+  if (previous.size !== next.size) return false;
+  for (const [id, at] of previous) if (next.get(id) !== at) return false;
+  return true;
+}
+
+// Newest first, as askTimeline orders them, so the cards keep their order across reads. A later
+// copy of a comment (its edit) replaces an earlier one.
+function newestFirst(comments: OwnerAskComment[]): OwnerAskComment[] {
+  return [...new Map(comments.map(comment => [comment.id, comment])).values()]
+    .sort((a, b) => b.createdAt.localeCompare(a.createdAt) || a.id.localeCompare(b.id));
 }
 
 export class OwnerAsks {
@@ -679,58 +709,72 @@ export class OwnerAsks {
     return read;
   }
 
-  // `ids` is the whole inventory: issues that left it leave the store.
+  // `ids` is the whole inventory: issues that left it leave the store. A history read the budget
+  // refuses keeps the slices finished before it; the issues it did not reach are read next time.
   private async syncComments(ids: string[]): Promise<Map<string, OwnerAskComment[]>> {
     const startedAt = this.now();
     const generation = this.sourceGeneration;
-    const resumed = this.commentStore ?? await this.loadCommentStore();
-    const store = resumed && startedAt - resumed.fullAt < COMMENT_FULL_READ_MS ? resumed : null;
+    const store = this.commentStore ?? await this.loadCommentStore();
     const known = store ? ids.filter(id => store.byIssue.has(id)) : [];
-    const added = store ? ids.filter(id => !store.byIssue.has(id)) : ids;
+    const added = ids.filter(id => !store?.byIssue.has(id));
+    // The oldest whole reads first, so every history is read again about COMMENT_VERIFY_MS apart.
+    const stale = store ? known.filter(id => startedAt - store.verifiedAt.get(id)! >= COMMENT_VERIFY_MS)
+      .sort((a, b) => store.verifiedAt.get(a)! - store.verifiedAt.get(b)!).slice(0, COMMENT_HISTORY_SLICE) : [];
     const changes = store && known.length
       ? await this.deps.linear.ownerAskCommentChanges(known, new Date(store.readAt - COMMENT_CHANGE_OVERLAP_MS).toISOString())
       : new Map<string, OwnerAskComment[]>();
-    const histories = added.length ? await this.deps.linear.ownerAskComments(added) : new Map<string, OwnerAskComment[]>();
     const byIssue = new Map<string, OwnerAskComment[]>();
-    for (const id of ids) {
-      const stored = store?.byIssue.get(id) ?? [];
-      const history = histories.get(id);
+    const verifiedAt = new Map<string, number>();
+    for (const id of known) {
+      const stored = store!.byIssue.get(id)!;
       const changed = changes.get(id);
-      if (!history && !changed) { byIssue.set(id, stored); continue; }
-      // Newest first, as askTimeline orders them, so the cards keep their order across reads.
-      byIssue.set(id, [...new Map((history ?? [...stored, ...changed!]).map(comment => [comment.id, comment])).values()]
-        .sort((a, b) => b.createdAt.localeCompare(a.createdAt) || a.id.localeCompare(b.id)));
+      byIssue.set(id, changed ? newestFirst([...stored, ...changed]) : stored);
+      verifiedAt.set(id, store!.verifiedAt.get(id)!);
     }
-    const next: CommentStore = { byIssue, readAt: startedAt, fullAt: store?.fullAt ?? startedAt,
-      expiresAt: generation === this.sourceGeneration ? this.now() + LINEAR_SOURCE_CACHE_MS : 0 };
-    this.commentStore = next;
-    await this.storeComments(next, store);
+    const reads = [...added, ...stale];
+    try {
+      for (let start = 0; start < reads.length; start += COMMENT_HISTORY_SLICE) {
+        const slice = reads.slice(start, start + COMMENT_HISTORY_SLICE);
+        const histories = await this.deps.linear.ownerAskComments(slice);
+        for (const id of slice) {
+          byIssue.set(id, newestFirst(histories.get(id) ?? []));
+          verifiedAt.set(id, startedAt);
+        }
+      }
+    } finally {
+      const complete = ids.every(id => byIssue.has(id));
+      const next: CommentStore = { byIssue, verifiedAt, readAt: startedAt,
+        expiresAt: complete && generation === this.sourceGeneration ? this.now() + LINEAR_SOURCE_CACHE_MS : 0 };
+      this.commentStore = next;
+      await this.storeComments(next, store);
+    }
     return new Map(ids.map(id => [id, byIssue.get(id)!]));
   }
 
-  // The store on disk is resumed only within the whole-read window: outside it the collection that
-  // follows refreshes every history anyway, and that whole read is what drops deleted comments.
+  // A stored store of any age is resumed: its stale histories are read again a slice at a time.
   private async loadCommentStore(): Promise<CommentStore | null> {
     if (this.commentStoreLoaded) return this.commentStore;
     this.commentStoreLoaded = true;
-    const stored = await this.readCommentsFile();
-    if (!stored || this.now() - stored.fullAt >= COMMENT_FULL_READ_MS) return null;
-    this.commentStore = stored;
-    return stored;
+    this.commentStore = await this.readCommentsFile();
+    return this.commentStore;
   }
 
   private async readCommentsFile(): Promise<CommentStore | null> {
     try {
       const stored = storedCommentsSchema.parse(JSON.parse(await readFile(this.commentStorePath(), "utf8")));
-      return { byIssue: new Map(Object.entries(stored.byIssue)), readAt: stored.readAt, fullAt: stored.fullAt, expiresAt: 0 };
+      const byIssue = new Map(Object.entries(stored.byIssue));
+      const verifiedAt = stored.version === 1
+        ? new Map([...byIssue.keys()].map(id => [id, stored.fullAt]))
+        : new Map(Object.entries(stored.verifiedAt));
+      return { byIssue, verifiedAt, readAt: stored.readAt, expiresAt: 0 };
     } catch { return null; }
   }
 
   // Only a successful write clears dirty state; unchanged history must retry a failed write.
   private async storeComments(next: CommentStore, previous: CommentStore | null): Promise<void> {
-    if (!this.commentStoreDirty && previous && sameComments(previous.byIssue, next.byIssue)) return;
+    if (!this.commentStoreDirty && previous && sameComments(previous.byIssue, next.byIssue) && sameTimes(previous.verifiedAt, next.verifiedAt)) return;
     this.commentStoreDirty = true;
-    const stored: StoredComments = { version: COMMENT_STORE_VERSION, readAt: next.readAt, fullAt: next.fullAt, byIssue: Object.fromEntries(next.byIssue) };
+    const stored: StoredComments = { version: COMMENT_STORE_VERSION, readAt: next.readAt, verifiedAt: Object.fromEntries(next.verifiedAt), byIssue: Object.fromEntries(next.byIssue) };
     try {
       await this.write(this.commentStorePath(), JSON.stringify(stored));
       this.commentStoreDirty = false;
