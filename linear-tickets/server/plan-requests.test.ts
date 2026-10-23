@@ -47,7 +47,8 @@ async function harness(run: (h: {
       issueDocument: async () => plan,
       replanComments: async (_issueId: string, since: string) => comments.filter((item) => item.at > since),
       existingLabelId: async (name: string) => labels.find((label) => label.name.trim().toLowerCase() === name)?.id ?? null,
-      labelHistory: async (_issueId: string, relevant: (event: LabelEvent) => boolean) => events.filter(relevant),
+      // As Linear's: the predicate only ends the paging, every label change read is returned.
+      labelHistory: async () => events,
       viewerId: async () => "owner-1",
     } as never,
     apps: { ids: async () => options.apps ?? ["app-1"] },
@@ -131,6 +132,17 @@ test("AC-13: a label add from before the agent started asks for nothing", async 
     assert.deepEqual(await files(), []);
     assert.deepEqual(prompts, []);
   }, { events: [{ at: "2026-10-01T09:00:00.000Z", actorId: "owner-1", added: ["label-plan"], removed: [] }] });
+});
+
+test("AC-13: the owner's other label changes, and removing the plan label, ask for nothing", async () => {
+  await harness(async ({ files, prompts, requests }) => {
+    assert.deepEqual(await files(), []);
+    assert.deepEqual(prompts, []);
+    assert.equal(await requests.roundStartedAt("agent-1"), null);
+  }, { events: [
+    { at: "2026-10-03T09:00:00.000Z", actorId: "owner-1", added: ["label-bug"], removed: [] },
+    { at: "2026-10-03T10:00:00.000Z", actorId: "owner-1", added: [], removed: ["label-plan"] },
+  ] });
 });
 
 test("the round's start is the newest request delivered to the agent, and null before any", async () => {

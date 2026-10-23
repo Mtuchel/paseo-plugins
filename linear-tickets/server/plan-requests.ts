@@ -2,6 +2,7 @@ import { mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promise
 import { dirname, join } from "node:path";
 import type { PaseoApi } from "@getpaseo/client";
 import type { LinearService } from "./linear";
+import type { LabelEvent } from "./label-rules";
 import { documentPlanHash } from "./review-outcome";
 import { loadProbe } from "./load-probe";
 import { PLAN_LABEL } from "./plan-policy";
@@ -169,9 +170,10 @@ export class PlanRequests {
       const planLabel = await this.deps.linear.existingLabelId(PLAN_LABEL);
       if (planLabel) {
         const owner = await this.deps.linear.viewerId();
-        const events = await this.deps.linear.labelHistory(issueId, (event) => event.added.includes(planLabel) && event.at > since);
-        for (const event of events) {
-          if (event.actorId !== owner) continue;
+        // The predicate only ends the paging; the pages read hold every label change.
+        const added = (event: LabelEvent) => event.added.includes(planLabel) && event.at > since;
+        for (const event of await this.deps.linear.labelHistory(issueId, added)) {
+          if (!added(event) || event.actorId !== owner) continue;
           requests.push({ id: `label:${event.at}`, at: event.at, kind: "label", authorId: event.actorId });
         }
       }

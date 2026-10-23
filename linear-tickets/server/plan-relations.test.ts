@@ -16,7 +16,7 @@ const plan = (lines: string[]) => `## Related work\n\nText.\n\n\`\`\`related-wor
 
 type Fake = ReturnType<typeof fake>;
 
-function fake(options: { open?: boolean; unstarted?: boolean; ownLabels?: string[]; targetPlan?: string | null; targetReady?: boolean; commentNull?: boolean; failCommentOnce?: boolean; loseCommentOnce?: boolean; removeNullOnce?: boolean } = {}) {
+function fake(options: { open?: boolean; unstarted?: boolean; ownLabels?: string[]; targetPlan?: string | null; targetReady?: boolean; commentNull?: boolean; failCommentOnce?: boolean; loseCommentOnce?: boolean; removeNullOnce?: boolean; coreFails?: boolean } = {}) {
   const calls: string[] = [];
   const stated = new Set<string>();
   const state = { targetPlan: options.targetPlan === undefined ? THEIR_PLAN : options.targetPlan, commentNull: options.commentNull === true, failed: false, failCommentOnce: options.failCommentOnce === true, loseCommentOnce: options.loseCommentOnce === true, lost: false, removeNull: options.removeNullOnce === true, removeFailed: false };
@@ -26,6 +26,7 @@ function fake(options: { open?: boolean; unstarted?: boolean; ownLabels?: string
   const linear = {
     async issueCore(id: string) {
       calls.push(`core ${id}`);
+      if (options.coreFails) throw new Error("Linear is unreachable");
       return { id, identifier: id === "own-id" ? "TUC-7" : "TUC-9", creatorId: "owner", status: "Todo", statusType: status, labels: [...(labels.get(id) ?? [])].map((name, index) => ({ id: `l${index}`, name })) } as never;
     },
     async issueRef(identifier: string) {
@@ -316,6 +317,15 @@ test("AC-14: every write through an unusable app leaves the record retrying, sto
     await relations.retryPending();
     assert.equal(JSON.parse(await readFile(join(directory, "own-id.json"), "utf8")).attempts, 5, "the sweep leaves it alone");
   } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("AC-14: a ticket read that keeps failing counts every round and stops after five", async () => {
+  await harness({ coreFails: true }, async ({ relations, directory, retry }) => {
+    await relations.file({ issueId: OWN.id, identifier: OWN.identifier, plan: plan(["TUC-9 blocks TUC-7: it lands first"]), documentUrl: null, roundStartedAt: null });
+    for (let round = 0; round < 6; round++) await retry();
+    const record = JSON.parse(await readFile(join(directory, "own-id.json"), "utf8"));
+    assert.deepEqual({ attempts: record.attempts, stopped: record.stopped }, { attempts: 5, stopped: "gave-up" });
+  });
 });
 
 test("AC-14: an untrusted ticket gets exactly one comment and no link, label or replan write", async () => {

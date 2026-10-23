@@ -244,6 +244,8 @@ export class PlanRelations {
 
   private async processRound(record: RelationsRecord): Promise<void> {
     const steps = record.lines.flatMap((key) => record.steps[key] ?? []);
+    // This round consumes the due retry, so a failure anywhere in it is counted once (`process`).
+    record.retryAt = null;
     let failed = false;
     if (!record.stopped) {
       // Checked before the first write, so a feedback label added while the plan waits stops it.
@@ -282,7 +284,6 @@ export class PlanRelations {
       })) await this.save(record);
       else failed = true;
     }
-    record.retryAt = null;
     if (failed && !record.stopped) this.failedRound(record);
     await this.save(record);
     await this.announce(record, steps);
