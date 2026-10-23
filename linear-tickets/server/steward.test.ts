@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { test, type TestContext } from "node:test";
 import {
   calendarDate, classifyTicket, DEFECT_GRACE_MS, DoneTickets, isDefect, parseVerdict, Steward, StewardStateError, StewardStore, STEWARD_ACTION, STEWARD_SITUATIONS, STEWARD_STATES, STEWARD_VERIFIER_LABEL,
-  RESTART_CAP, STEWARD_WINDOW_MS, type StewardDeps, type StewardFacts, type StewardSituation,
+  REFUSAL_CAP, RESTART_CAP, STEWARD_WINDOW_MS, type StewardDeps, type StewardFacts, type StewardSituation,
 } from "./steward";
 import type { ParentProgress } from "./parents";
 import { ManualTasks, type ManualTask } from "./manual-tasks";
@@ -19,6 +19,7 @@ import { SessionRouter, SessionStore, type HostOwnership, type Succession } from
 import { hostname } from "node:os";
 import { stageEvidence } from "./recovery-diagnostic";
 import { NeedsYouIssues } from "./needs-you";
+import { WORKER_ALIVE_REASON } from "./process-liveness";
 
 // The classifier's own tests: every fact set lands on exactly one situation, and the precedence
 // between them is pinned here (steward.ts's order is what runs).
@@ -1003,6 +1004,35 @@ test("an escalated failed successor is retried once per steward window, not froz
   f.clock.now += STEWARD_WINDOW_MS;
   await f.pass();
   assert.deepEqual(f.calls.successions, ["i1", "i1"], "once the branch is recorded the next window's retry starts the successor");
+});
+
+// TUC-799/560/968 on server087: an earlier OMP worker still exiting refused the successor on three
+// passes within 12–70 minutes, which spent the restart budget and asked the owner for 24 hours.
+// Nothing was tried, so it is a queue wait like a full host: no budget, no refusal, no question.
+test("a successor waiting for an earlier OMP worker to exit is queued, not refused", async (t) => {
+  const url = "https://github.com/o/r/pull/3869";
+  let outcome: Succession = { kind: "wait", reason: WORKER_ALIVE_REASON };
+  const f = await passFixture(t, {
+    issues: [ticketIssue()],
+    records: [recordFor("i1", "ENG-1", [url])],
+    pullStates: new Map([[url, pull(url)]]),
+    succeed: async () => outcome,
+    clockNow: T0,
+  });
+  await f.seed("i1", "ENG-1", { situation: "open-pr", since: at(60) });
+  for (let pass = 0; pass < REFUSAL_CAP + 1; pass++) {
+    await f.pass();
+    f.clock.now += 10 * 60_000;
+  }
+  const waiting = await f.ticket("i1");
+  assert.deepEqual(f.calls.successions, Array(REFUSAL_CAP + 1).fill("i1"), "every pass tries again");
+  assert.deepEqual([waiting?.refusals.length, waiting?.restarts.length, f.calls.escalates], [0, 0, []], "no refusal, no spent restart, no owner question");
+  assert.equal(waiting?.queued?.reason, WORKER_ALIVE_REASON, "the ticket shows what it waits for");
+
+  outcome = { kind: "started", agent: { id: "a10", title: null, cwd: "" } };
+  await f.pass();
+  assert.equal(f.calls.successions.length, REFUSAL_CAP + 2, "once the worker is gone the successor starts");
+  assert.equal((await f.ticket("i1"))?.restarts.length, 1, "only the start that went out is charged");
 });
 
 test("a steward successor is labelled a CI repair only while the open pull request's recorded checks fail", async (t) => {

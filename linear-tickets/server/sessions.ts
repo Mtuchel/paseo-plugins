@@ -27,7 +27,7 @@ import { PermissionReplies, type DeliveryOrigin, type DeliveryResult } from "./p
 import type { PluginSettings, Settings } from "./settings";
 import { issueAgents, type TicketStarter } from "./starter";
 import { STEWARD_VERIFIER_LABEL } from "./steward";
-import { ghostAgents, LIVE_AGENT, ticketProcessLiveness, type ProcessAgent, type ProcessInspector } from "./process-liveness";
+import { ghostAgents, LIVE_AGENT, ticketProcessLiveness, WORKER_ALIVE_REASON, type ProcessAgent, type ProcessInspector } from "./process-liveness";
 import { WATCHDOG_LABEL, type TicketRoots, type WatchdogOutcome, type WatchdogRequest, type WatchdogStore } from "./watchdog";
 import type { ReviewDeletions } from "./review-deletions";
 import { DecisionPendingError, FencedError } from "./decision-journal";
@@ -1828,7 +1828,7 @@ export class SessionRouter {
     try {
       const state = await (this.deps.processLiveness ?? ticketProcessLiveness)(this.paseo!, issueId, extra, undefined, options);
       if (state === "absent") return null;
-      return state === "alive" ? "an OMP worker for this ticket is still alive" : "the OMP workers for this ticket could not be inspected";
+      return state === "alive" ? WORKER_ALIVE_REASON : "the OMP workers for this ticket could not be inspected";
     } catch {
       return "the OMP workers for this ticket could not be inspected";
     }

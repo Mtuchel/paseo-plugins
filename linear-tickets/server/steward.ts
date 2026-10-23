@@ -23,6 +23,7 @@ import { RESPONSIBILITY_GRACE_MS, type ResponsibilityCheck, type ResponsibilityT
 import { AWAY_REASON } from "./scheduler";
 import { recordedCiFails } from "./pr-nudge";
 import type { HostOwnership, RestartResult, SessionRouter, Succession } from "./sessions";
+import { WORKER_ALIVE_REASON } from "./process-liveness";
 import type { PluginSettings, Settings } from "./settings";
 import { classifyTicketAgents, issueAgents, markedAgents, WAITING_PLAN_REASON, type TicketStarter } from "./starter";
 import { paseoHome } from "./ticket-mcp";
@@ -2641,13 +2642,14 @@ function newTicket(identifier: string, at: string): StewardTicket {
 }
 
 // A start admission refused without anything being attempted: the ticket waits in the queue for a
-// slot, focus, a blocker, a parked plan or the owner's presence, and the pass retries it. Nothing
-// was tried, so no recovery budget is spent (finding: ordinary admission deferrals are queue
-// entries, not failures). Everything else a deferral can mean is a failure like any other.
+// slot, focus, a blocker, a parked plan, the owner's presence or an earlier OMP worker's exit, and
+// the pass retries it. Nothing was tried, so no recovery budget is spent (finding: ordinary
+// admission deferrals are queue entries, not failures; a worker that never exits ends as
+// queued-too-long). Everything else a deferral can mean is a failure like any other.
 function queueWait(reason: string): boolean {
   return /^(Queued: |This ticket is paused for deletion|Paseo is not connected yet|A launch for this ticket is under way|Waiting for .+ to finish)/.test(reason)
     || reason === FOCUS_REASON || reason === WAITING_PLAN_REASON || reason === AWAY_REASON
-    || reason === REPAIR_BUSY_MESSAGE || reason === EXCLUSION_CLOSED_MESSAGE
+    || reason === REPAIR_BUSY_MESSAGE || reason === EXCLUSION_CLOSED_MESSAGE || reason === WORKER_ALIVE_REASON
     || reason.startsWith(LIVE_AGAIN_PREFIX);
 }
 

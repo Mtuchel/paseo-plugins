@@ -3291,7 +3291,7 @@ and PR fences are checked again immediately before creating the helper.
 | **MOVING** | A live root with recent activity inside `steward.idleMinutes` (5 by default), an active recovery action, or an idle agent with an open PR under its own watch. A retired replacement awaiting admission is queued, not moving. |
 | **WAITING_OWNER** | A recorded wait for you that something can still end: Needs input, the `paseo-needs-you` label and a decision on the ticket. |
 | **WAITING_BLOCKER** | A named blocker that is not finished (done, canceled, duplicate or in review with merged pull requests). |
-| **QUEUED** | A thread of the ticket waits in the scheduler's line for its blockers or a slot, or an admission deferral the steward recorded — no budget was spent, the pass retries it; past `steward.queuedEscalateHours` (24 by default) the wait itself reaches you. |
+| **QUEUED** | A thread of the ticket waits in the scheduler's line for its blockers or a slot, or an admission deferral the steward recorded (a slot, focus, presence, a launch under way, a repair or an earlier OMP worker of the ticket that has not exited yet) — no budget was spent and no refusal counted, the pass retries it; past `steward.queuedEscalateHours` (24 by default) the wait itself reaches you, so a worker that never exits is still reported. |
 | **PARKED** | A verifier parked the ticket: it waits for a named blocker and/or a due date, in Todo. |
 
 **Anything else is a defect**, and the steward repairs it with at most one action per ticket and
