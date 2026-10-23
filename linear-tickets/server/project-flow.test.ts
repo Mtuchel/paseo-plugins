@@ -9,6 +9,7 @@ import { LinearApiError, LinearRefusedError, type ProjectIssue, type TicketRef }
 import { Capacity } from "./capacity";
 import { SetupError, type PlannerStart } from "./launch";
 import { REPAIR_BUSY_MESSAGE, RepairBusyError } from "./repair-exclusion";
+import { RateLimitedError } from "./rate-budget";
 import type { ProcessInspector } from "./process-liveness";
 import { plannerBrief, ProjectFlow, ProjectStore, type PlannerRecord, type ProjectRecord } from "./project-flow";
 import { orderProblems, parseOrder } from "../shared/work-order";
@@ -58,7 +59,7 @@ async function room(t: TestContext, issues: ProjectIssue[], running: string[] = 
   // Linear writes that fail (`update`: the next n project updates; one relation refused or never
   // reaching Linear); `start`: how a planner start fails (`setup`: a SetupError, `always`: a
   // timeout); `restart`: every stalled-ticket restart. `starts`: every planner start, in order.
-  const fail: { read?: boolean; update?: number; relation?: string; unreached?: string; restart?: boolean; retire?: boolean; start?: "setup" | "always"; startError?: string; busy?: number } = {};
+  const fail: { read?: boolean; update?: number; relation?: string; unreached?: string; restart?: boolean; retire?: boolean; start?: "setup" | "always"; startError?: string; busy?: number; paused?: number } = {};
   const starts: PlannerStart[] = [];
   const comments: string[] = [];
   const updates: string[] = [];
@@ -125,6 +126,7 @@ async function room(t: TestContext, issues: ProjectIssue[], running: string[] = 
       starts.push(input);
       calls.push("start run");
       if (fail.busy) { fail.busy -= 1; throw new RepairBusyError(); }
+      if (fail.paused) { fail.paused -= 1; throw new RateLimitedError("key", Date.parse("2026-01-02T00:05:00Z"), "reserve"); }
       if (fail.start === "setup") throw new SetupError("No Paseo project is mapped to ERP or its team. Open the Paseo plugin settings and map one.");
       starting = true;
       await gate;
@@ -622,6 +624,24 @@ test("a planner restart refused while a repair holds the ticket is retried witho
 
   assert.deepEqual(await poll(2), ["start run"], "the next read tries again");
   assert.equal(r.starts.length, 2, "one refused attempt and one start, never a fallback");
+  assert.equal((await r.store.all()).erp.planner?.agentId, "run-agent-1");
+  assert.equal((await r.store.all()).erp.planner?.restarts, 3, "the successful retry is the one restart");
+});
+
+test("a planner restart refused because Linear's budget is paused is retried without spending the restart budget", async (t) => {
+  const r = await room(t, [issue(1, { delegateId: APP, statusType: "started", status: "In Progress" })]);
+  await r.seed({ planned: [], planner: runRecord({ startedAt: "2026-01-01T23:50:00Z", restarts: 2 }) });
+  r.fail.paused = 1;
+  const none = paseoWith(() => []);
+  const poll = async (minutes: number) => { r.calls.length = 0; r.advance(minutes * MINUTE); await r.flow.tick(none, settings); return r.calls; };
+  assert.deepEqual(await poll(0), ["start run"]);
+  const afterPause = (await r.store.all()).erp.planner;
+  assert.ok(afterPause);
+  assert.equal(afterPause.restarts, 2, "a paused budget spends no restart");
+  assert.equal(afterPause.startedAt, "2026-01-01T23:50:00Z", "and moves no grace window");
+  assert.equal(afterPause.ownerAsked, undefined, "the owner is not asked");
+
+  assert.deepEqual(await poll(2), ["start run"], "the next read tries again");
   assert.equal((await r.store.all()).erp.planner?.agentId, "run-agent-1");
   assert.equal((await r.store.all()).erp.planner?.restarts, 3, "the successful retry is the one restart");
 });
