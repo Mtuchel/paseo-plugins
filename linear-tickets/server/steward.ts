@@ -1097,8 +1097,10 @@ export class Steward {
     const pass: Pass = { actions: 0, cap: settings.steward.maxActionsPerPass };
     // Longest-unacted first, so the per-pass cap rotates: a ticket whose action keeps deferring
     // (its claim is new each pass) moves behind the others instead of taking the same slots in
-    // Linear's order every pass.
-    candidates.sort((a, b) => (stewardActionAt(a.ticket) ?? 0) - (stewardActionAt(b.ticket) ?? 0) || a.issue.identifier.localeCompare(b.issue.identifier));
+    // Linear's order every pass. A ticket the steward never acted on waits from its situation's
+    // start, so a new backlog does not go ahead of a ticket last acted on days ago.
+    const turn = new Map(candidates.map(({ ticket }) => [ticket, stewardActionAt(ticket) ?? (Date.parse(ticket.since) || 0)]));
+    candidates.sort((a, b) => turn.get(a.ticket)! - turn.get(b.ticket)! || a.issue.identifier.localeCompare(b.issue.identifier));
     for (const candidate of candidates) {
       if (!this.alive()) return;
       try {

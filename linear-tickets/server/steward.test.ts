@@ -738,6 +738,22 @@ test("a ticket whose action keeps deferring does not take the per-pass cap from 
   assert.deepEqual(f.calls.restarts, ["i1", "i2", "i3"], "each pass's one slot goes to the ticket the steward acted on longest ago");
 });
 
+// server087, after the rotation shipped: the unfrozen open-PR tickets (last acted on days ago)
+// waited behind every ticket the steward had never acted on, because a missing action sorted as 0.
+test("a ticket never acted on takes its turn from its situation's start, not ahead of every acted one", async (t) => {
+  const f = await passFixture(t, {
+    issues: [ticketIssue(), ticketIssue({ id: "i2", identifier: "ENG-2" })],
+    records: [recordFor("i1", "ENG-1"), recordFor("i2", "ENG-2")],
+    restart: async () => ({ kind: "deferred", reason: "Queued: 50 of 50 agents are running." }),
+    cap: 1,
+    clockNow: T0,
+  });
+  await f.seed("i1", "ENG-1", { situation: "stalled", since: at(120) });
+  await f.seed("i2", "ENG-2", { situation: "stalled", since: at(3 * 24 * 60), log: [{ at: at(2 * 24 * 60), action: "restart: failed (an old refusal)" }] });
+  await f.pass(1);
+  assert.deepEqual(f.calls.restarts, ["i2"], "the ticket last acted on two days ago goes before one waiting two hours");
+});
+
 // The registry read is the pass's, not each ticket's: every candidate carries the agent snapshot
 // the pass already read for classification, so N tickets cost the same read as one. The snapshot's
 // roots still pick the ticket's own newest live agent — not a verifier, not a sub-agent, not a

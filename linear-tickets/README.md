@@ -3199,8 +3199,10 @@ a stale owner wait (a ticket in Needs input that no recorded wait and no live ag
 it got there), the archive of a finished ticket's agents, or an escalation. Restarts are capped at three per ticket within 24 hours and at `steward.maxActionsPerPass`
 starts, successors, verifiers and resumes per pass, so a backlog never floods the capacity; closes,
 archives and escalations are not capped. The pass visits tickets longest-unacted first (by the
-steward's last claim or log entry), so a ticket whose action keeps waiting in the queue moves
-behind the others and cannot hold the same slots every pass. A deliberate wait — the `hold`/`manual`/`do-not-merge`
+steward's last claim or log entry; a ticket it never acted on counts from the start of its current
+situation), so a ticket whose action keeps waiting in the queue moves behind the others and cannot
+hold the same slots every pass, and a fresh backlog does not go ahead of a ticket last acted on days
+ago. A deliberate wait — the `hold`/`manual`/`do-not-merge`
 labels, a plan under review or a parked plan, the watchdog's owner Stop, a pending permission, a
 Needs-you item, focus mode, the peer host — is never recovered or escalated by any of them: only
 the owner's own answer, retry (the trigger label) or a fresh instruction ends it.
