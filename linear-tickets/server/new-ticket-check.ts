@@ -22,7 +22,7 @@ import type { OpenWork, RelatedWork } from "./related-work";
 import type { PluginSettings, Settings } from "./settings";
 import { paseoHome } from "./ticket-mcp";
 
-// The planning-miss labels (README, "Labels"): workspace labels, ungrouped, set by people; the ops
+// The planning-miss labels (README, "Statuses and labels"): workspace labels, ungrouped, set by people; the ops
 // digest counts them. Only `missed-reach` is ever set by Paseo (the "same as" rule).
 export const MISS_LABELS = [
   { name: "missed-reach", color: "#f2994a", description: "Planning miss: the plan did not reach a place the change had to reach. Counted in the ops digest." },

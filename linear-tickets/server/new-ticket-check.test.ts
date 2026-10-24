@@ -47,6 +47,7 @@ class World {
   comments: { id: string; issueId: string; body: string }[] = [];
   relations = new Map<string, IssueRelation[]>();
   calls: string[] = [];
+  created: { name: string; color?: string; description?: string }[] = [];
   pageSize = 50;
   failPage: number | null = null;
   failOpenWork = false;
@@ -94,6 +95,7 @@ class World {
     createLabel: async (input: { name: string; color?: string; description?: string }) => {
       this.calls.push("createLabel");
       if (this.failCreate > 0) { this.failCreate--; throw new Error("create failed"); }
+      this.created.push(input);
       this.catalog.push({ id: input.name, name: input.name, isGroup: false, parentId: null, teamId: null });
       return input.name;
     },
@@ -232,6 +234,10 @@ test("AC-1: the cursor — first run, equal times across a page boundary, a fail
   await tick();
   assert.equal(JSON.parse(await readFile(path, "utf8")).since, since, "an empty poll keeps the cursor");
   assert.equal(world.comments.length, 2);
+  world.clock += 1000;
+  const after = world.file({ title: "Gutschrift PDF falsche USt im Export" });
+  await tick();
+  assert.equal(commentsOn(world, after).length, 1, "a ticket filed after an empty poll is found by the next one");
 });
 
 test("AC-1: a discovery longer than 10 pages continues on the next poll", async (t) => {
@@ -282,7 +288,7 @@ test("AC-1: thrown reads keep a ticket pending without using up its tries; three
 });
 
 test("AC-1: incomplete inputs wait up to 5 polls, then the comment names what was not read", async (t) => {
-  const { world, tick } = await harness(t);
+  const { world, tick, path } = await harness(t);
   world.unreadPlans = ["Plan: TUC-650"];
   const later = world.file({ title: "Gutschrift-PDF zeigt falsche USt" });
   await tick();
@@ -299,6 +305,12 @@ test("AC-1: incomplete inputs wait up to 5 polls, then the comment names what wa
   assert.equal(commentsOn(world, gapped).length, 0);
   await tick();
   assert.match(commentsOn(world, gapped)[0].body, /Not fully checked: only part of the team's open tickets could be read; the plans of TUC-650 could not be read\.$/);
+
+  // Nothing to say after 5 incomplete polls: no comment, and phase 1 is over.
+  const quiet = world.file({ title: "Etwas anderes", labelIds: ["sales"], labelNames: ["Area: Sales"] });
+  for (let n = 0; n < 5; n++) await tick();
+  assert.equal(commentsOn(world, quiet).length, 0);
+  assert.equal(JSON.parse(await readFile(path, "utf8")).tickets[quiet.id].commented, true);
 });
 
 test("AC-1/AC-4: an invalid label-rules.json is a gap, and no Area is asked for", async (t) => {
@@ -341,6 +353,7 @@ test("AC-5: the miss labels are created once, a failed create is retried, a conf
   assert.equal(world.count("createLabel"), 1);
   await tick();
   assert.deepEqual(world.catalog.filter((label) => !label.parentId && !label.isGroup).map((label) => label.name).sort(), ["broke-rule", "missed-conflict", "missed-reach"]);
+  assert.ok(world.created.length === 3 && world.created.every((label) => label.color && label.description), "each with a colour and a description");
   world.calls.length = 0;
   await tick();
   assert.deepEqual(world.calls, ["newIssues"], "an idle poll after the labels resolved reads only new tickets (AC-8)");
