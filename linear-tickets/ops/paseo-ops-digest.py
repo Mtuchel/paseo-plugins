@@ -21,7 +21,9 @@ on the Mac). Each run:
      instructions and a failed planning smoke check (`linear-tickets/planning-smoke.json`); and,
      per host, the tickets its responsibility check found without one responsible next step
      (TUC-1290, `~/.paseo/linear-tickets/responsibility.json`; one attention item per ticket and
-     kind, notified once ever, plus the repairs of the last 24 h);
+     kind, notified once ever, plus the repairs of the last 24 h); and, per Berlin ISO week, how
+     many tickets carry a planning-miss label (TUC-749, "Planning misses": counted in the week
+     the label was last added, a section only, never an item or a notification);
   3. merges both into the state in ~/.paseo/ops-digest/state.json and saves it BEFORE
      publishing, so a failed publish never loses an observed problem. The same save holds this
      run's history lines in the state's outbox (`historyOutbox`): one `run` line with every unit
@@ -71,7 +73,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 PASEO = os.path.expanduser("~/.local/bin/paseo")
@@ -755,6 +757,79 @@ def decision_candidates(issues):
     return {"waiting": sum(t["waiting"] for t in tickets), "tickets": tickets}
 
 
+# ---------------------------------------------------------------------------- planning misses (pure)
+
+# Planning misses (TUC-749): tickets carrying the labels people set on a plan sent back or a bug
+# filed for a missed place, conflict or rule (the new-ticket check sets `missed-reach` on a "same
+# bug as TUC-X at another place" ticket). The digest counts, per Berlin ISO week, the tickets that carry each label now, in the
+# week the label was last added; a removed label stops counting. The labels are workspace labels
+# (every team), and the section writes no item: no attention, no notification, no weekly kind.
+MISS_LABELS = ("missed-reach", "missed-conflict", "broke-rule")
+MISS_WEEKS = 8  # the current week and the 7 before it
+MISS_ISSUE_PAGES = 20  # issue pages per read (50 each); more leaves the counts incomplete
+MISS_HISTORY_PAGES = 10  # history pages per ticket, the first one included
+
+
+def week_name(day):
+    """`YYYY-Www` (two-digit week) of a date's ISO week."""
+    year, week, _ = day.isocalendar()
+    return f"{year}-W{week:02d}"
+
+
+def iso_week(ts):
+    """The Berlin ISO week of `ts`, e.g. 2026-W05."""
+    return week_name(datetime.fromtimestamp(ts, TZ).date())
+
+
+def miss_weeks(now):
+    """The current Berlin ISO week and the MISS_WEEKS - 1 before it, oldest first."""
+    day = datetime.fromtimestamp(now, TZ).date()
+    return [week_name(day - timedelta(days=7 * back)) for back in range(MISS_WEEKS - 1, -1, -1)]
+
+
+def misses_since(now):
+    """The Monday 00:00 Berlin of the oldest of the MISS_WEEKS weeks, as UTC ISO: what the read
+    filters `updatedAt` on, since adding a label updates the ticket."""
+    day = datetime.fromtimestamp(now, TZ).date()
+    monday = day - timedelta(days=day.weekday() + 7 * (MISS_WEEKS - 1))
+    return iso(datetime(monday.year, monday.month, monday.day, tzinfo=TZ).timestamp())
+
+
+def planning_misses(read, now):
+    """Counts of the planning-miss labels per Berlin ISO week from one read (the shape
+    HostIO.planning_misses returns: each issue's current `labels` and its `history`, with each
+    entry's `addedLabels` as label names, plus `historyComplete`). A label the ticket still
+    carries counts in the week its latest adding history entry names. With the full history read
+    and no adding entry the label came with the ticket, so it counts in the creation week; with
+    the history page cap hit it counts under `unknown` instead. Weeks outside the current and the
+    7 before are dropped."""
+    allowed = set(miss_weeks(now))
+    weeks, unknown = {}, {}
+    for issue in (read or {}).get("issues") or []:
+        carried = set(issue.get("labels") or [])
+        created = parse_iso(issue.get("createdAt"))
+        for label in MISS_LABELS:
+            if label not in carried:
+                continue  # a removed label stops counting
+            added = [parse_iso(node.get("createdAt")) for node in issue.get("history") or []
+                     if label in (node.get("addedLabels") or [])]
+            added = [ts for ts in added if ts is not None]
+            if not added and issue.get("historyComplete") and created is not None:
+                added = [created]
+            if not added:
+                unknown[label] = unknown.get(label, 0) + 1
+                continue
+            week = iso_week(max(added))
+            if week not in allowed:
+                continue
+            counts = weeks.setdefault(week, {})
+            counts[label] = counts.get(label, 0) + 1
+    return {"weeks": {week: {label: weeks[week][label] for label in MISS_LABELS if label in weeks[week]}
+                      for week in sorted(weeks, reverse=True)},
+            "unknown": {label: unknown[label] for label in MISS_LABELS if label in unknown},
+            "complete": bool((read or {}).get("complete", True))}
+
+
 # ---------------------------------------------------------------------------- linear budget (pure)
 
 # linear-usage.json (TUC-1291): what the linear-tickets plugin itself answered per UTC hour and
@@ -1109,7 +1184,7 @@ def responsibility_check(source, host, now, *, stale_s=RESPONSIBILITY_STALE_S):
 def empty_state():
     return {"items": {}, "pending": {}, "cleared": [], "desktopNotified": None, "document": None,
             "publishedAt": None, "notifyFailedAt": None, "ownerUrl": None, "decisionCandidates": None,
-            "historyOutbox": [], "notifiedOnce": {}}
+            "planningMisses": None, "historyOutbox": [], "notifiedOnce": {}}
 
 
 def merge_decisions(state, decisions, now):
@@ -1119,6 +1194,16 @@ def merge_decisions(state, decisions, now):
         state["decisionCandidates"] = {**decisions, "at": now, "stale": False}
     elif state.get("decisionCandidates"):
         state["decisionCandidates"] = {**state["decisionCandidates"], "stale": True}
+    return state
+
+
+def merge_misses(state, misses, now):
+    """The latest planning-miss counts; a failed read (None) keeps the last ones, marked stale.
+    Never an item: it raises no attention and no notification."""
+    if misses is not None:
+        state["planningMisses"] = {**misses, "at": now, "stale": False}
+    elif state.get("planningMisses"):
+        state["planningMisses"] = {**state["planningMisses"], "stale": True}
     return state
 
 
@@ -1332,6 +1417,35 @@ def budget_lines(usage, now):
     return out
 
 
+def miss_lines(misses, now):
+    """The "## Planning misses" block (TUC-749): one line per week with misses, newest first, one
+    line naming the empty weeks of the last MISS_WEEKS, the labels whose week is not known, and
+    the incompleteness marker. `misses` is None when the read has not happened yet."""
+    if not misses:
+        return ["## Planning misses", "", "- not read yet", ""]
+    weeks = misses.get("weeks") or {}
+    unknown = misses.get("unknown") or {}
+    out = ["## Planning misses", ""]
+    for week in sorted(weeks, reverse=True):
+        counts = weeks[week] or {}
+        parts = [f"{label} {counts[label]}" for label in MISS_LABELS if counts.get(label)]
+        if parts:
+            out.append(f"- {week}: " + ", ".join(parts))
+    empty = [week for week in miss_weeks(now)
+             if not any((weeks.get(week) or {}).get(label) for label in MISS_LABELS)]
+    if empty:
+        out.append("- No misses in " + ", ".join(empty))
+    unknown_parts = [f"{label} {unknown[label]}" for label in MISS_LABELS if unknown.get(label)]
+    if unknown_parts:
+        out.append("- Week not known: " + ", ".join(unknown_parts))
+    if not misses.get("complete", True):
+        out.append("- (incomplete: more tickets carry miss labels than were read)")
+    if misses.get("stale"):
+        out.append(f"- _(not refreshed since {local(misses['at'])})_")
+    out.append("")
+    return out
+
+
 def render(state, units, now, *, new_keys=(), agent_notes=None, notify_failed=False, trend=None, budget=None,
            responsibility=None):
     agent_notes = agent_notes or {}
@@ -1411,6 +1525,7 @@ def render(state, units, now, *, new_keys=(), agent_notes=None, notify_failed=Fa
     else:
         out.append("- Decision candidates waiting: not read yet")
     out.append("")
+    out += miss_lines(state.get("planningMisses"), now)
     out += budget_lines(budget, now)
     out += trend_lines(trend)
     if state.get("cleared"):
@@ -2069,6 +2184,54 @@ class HostIO:
           nodes { identifier url title description comments(first: 250) { nodes { body } } } } }"""
         return linear_call(self.key(), query)["issues"]["nodes"]
 
+    def planning_misses(self, since_iso):
+        """Issues carrying a planning-miss label and updated since `since_iso`, with the label
+        history each label's week comes from (TUC-749). Workspace-wide: the labels are workspace
+        labels, so no team filter; archived issues count too. Paged 50 issues at a time, up to
+        MISS_ISSUE_PAGES; an issue whose history has more pages is read further through
+        `issue(id)` up to MISS_HISTORY_PAGES pages. `complete` says whether the issue cap was
+        hit; `historyComplete` on an issue says whether its history was read whole."""
+        query = """query($labels: [String!]!, $since: DateTimeOrDuration!, $after: String) {
+          issues(first: 50, after: $after, includeArchived: true,
+                 filter: { labels: { name: { in: $labels } }, updatedAt: { gte: $since } }) {
+            nodes { id identifier createdAt labels { nodes { name } }
+              history(first: 50) { nodes { createdAt addedLabels { name } }
+                pageInfo { hasNextPage endCursor } } }
+            pageInfo { hasNextPage endCursor } } }"""
+        history_query = """query($id: String!, $after: String) {
+          issue(id: $id) { history(first: 50, after: $after) {
+            nodes { createdAt addedLabels { name } } pageInfo { hasNextPage endCursor } } } }"""
+        found, after, more = [], None, False
+        for _ in range(MISS_ISSUE_PAGES):
+            page = linear_call(self.key(), query, {"labels": list(MISS_LABELS), "since": since_iso,
+                                                   "after": after})["issues"]
+            for node in page["nodes"]:
+                history = node["history"]
+                nodes = [{"createdAt": entry["createdAt"],
+                          "addedLabels": [label["name"] for label in entry.get("addedLabels") or []]}
+                         for entry in history["nodes"]]
+                info = history.get("pageInfo") or {}
+                more_history, cursor, pages = bool(info.get("hasNextPage")), info.get("endCursor"), 1
+                while more_history and pages < MISS_HISTORY_PAGES:
+                    further = linear_call(self.key(), history_query,
+                                          {"id": node["id"], "after": cursor})["issue"]["history"]
+                    nodes += [{"createdAt": entry["createdAt"],
+                               "addedLabels": [label["name"] for label in entry.get("addedLabels") or []]}
+                              for entry in further["nodes"]]
+                    info = further.get("pageInfo") or {}
+                    more_history, cursor = bool(info.get("hasNextPage")), info.get("endCursor")
+                    pages += 1
+                found.append({"id": node["id"], "identifier": node["identifier"],
+                              "createdAt": node["createdAt"],
+                              "labels": [label["name"] for label in node["labels"]["nodes"]],
+                              "history": nodes, "historyComplete": not more_history})
+            info = page.get("pageInfo") or {}
+            more = bool(info.get("hasNextPage"))
+            if not more:
+                break
+            after = info.get("endCursor")
+        return {"issues": found, "complete": not more}
+
     def owner_url(self):
         return linear_call(self.key(), "{ viewer { url } }")["viewer"]["url"]
 
@@ -2311,8 +2474,9 @@ def backfill_history(state_path, history_dir, lock_path, now):
 
 def collect(io, now, started):
     """All items and unit outcomes of one run. Every unit attempted is listed, read or not (the
-    history's run line counts on it). Also the decisions, the linear usage and the responsibility
-    checks of this run (the latter only for the sections that render from them)."""
+    history's run line counts on it). Also the decisions, the planning misses, the linear usage
+    and the responsibility checks of this run (the latter only for the sections that render from
+    them)."""
     items, units = [], []
     try:
         digest = io.repo_digest()
@@ -2404,6 +2568,12 @@ def collect(io, now, started):
         units.append({"unit": "decision_candidates", "ok": True})
     except Exception as exc:
         units.append({"unit": "decision_candidates", "ok": False, "category": error_category(exc)})
+    misses = None
+    try:
+        misses = planning_misses(io.planning_misses(misses_since(now)), now)
+        units.append({"unit": "planning_misses", "ok": True})
+    except Exception as exc:
+        units.append({"unit": "planning_misses", "ok": False, "category": error_category(exc)})
     usage = None
     try:
         usage = io.linear_usage()
@@ -2436,7 +2606,7 @@ def collect(io, now, started):
         for ticket in sorted(tickets_of(agent, meta, teams or {"TUC"})):
             note = f"agent {agent['id'][:7]} {agent.get('status')}" + (f", active {age_text(now - last)} ago" if last else "")
             agent_notes.setdefault(ticket, note)
-    return items, units, agent_notes, decisions, usage, responsibility
+    return items, units, agent_notes, decisions, misses, usage, responsibility
 
 
 def dispatch_quarantine(io):
@@ -2467,10 +2637,11 @@ def run(io, *, now, mode="publish", state_path=STATE, lock_path=LOCK, started=No
         state = load_state(state_path)
         if mode == "publish":
             dispatch_quarantine(io)
-        items, units, agent_notes, decisions, usage, responsibility = collect(io, now, started)
+        items, units, agent_notes, decisions, misses, usage, responsibility = collect(io, now, started)
         failed = {u["unit"] for u in units if not u.get("ok")}
         merged, new_keys = merge_run(state, items, failed, now)
         merged = merge_decisions(merged, decisions, now)
+        merged = merge_misses(merged, misses, now)
         content = render(merged, units, now, new_keys=new_keys, agent_notes=agent_notes,
                          notify_failed=bool(merged.get("notifyFailedAt")), trend=load_trend(trend_path),
                          budget=usage, responsibility=responsibility)
