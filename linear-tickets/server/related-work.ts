@@ -88,10 +88,17 @@ export type ChangedSinceEntry =
   | { kind: "merged"; identifier: string; status: string; url: string; mergedAt: string; files: string[] }
   | { kind: "approved"; identifier: string; status: string | null; approvedAt: number; completedAt: string | null; overlap: FootprintOverlap };
 export type ChangedSinceQuery = { issueId: string; identifier: string; teamId: string; plan: string; approved: string };
+// A team's open work as the new-ticket check reads it (README, "New-ticket check"): the open
+// tickets, the files each approved plan names, and the plan documents that could not be read.
+export type OpenWork = { open: Pages<CandidateIssue>; plans: { identifier: string; files: string[] }[]; unreadPlans: string[] };
+// One read of a team's open tickets and their approved plans, shared by the candidate list and
+// `openWork`; `open` resolves first, so the list's pull request reads run alongside the plan reads.
+type Snapshot = { open: Promise<Pages<CandidateIssue>>; full: Promise<{ open: Pages<CandidateIssue>; plans: ApprovedPlan[]; unread: string[] }> };
 
 export class RelatedWork {
   // `until`: when the finished build expires; Infinity while it runs (single flight).
   private readonly builds = new Map<string, { list: Promise<string>; until: number }>();
+  private readonly snapshots = new Map<string, { snapshot: Snapshot; until: number }>();
   // Plan document contents by id, valid while the document's `updatedAt` is unchanged. Kept for the
   // host's lifetime: one entry per plan document of an open ticket it listed (a few hundred).
   private readonly contents = new Map<string, { updatedAt: string; content: string }>();
@@ -115,12 +122,38 @@ export class RelatedWork {
     return entry.list;
   }
 
+  // The team's open tickets and approved plans, read at most once per team every CANDIDATE_TTL_MS
+  // (single flight); a failed read is not kept.
+  private snapshot(teamId: string): Snapshot {
+    const cached = this.snapshots.get(teamId);
+    if (cached && cached.until > this.now()) return cached.snapshot;
+    const open = this.deps.linear.teamCandidates(teamId);
+    const full = open.then(async (read) => ({ open: read, ...(await this.readPlans(read.items)) }));
+    // `full` carries the same rejection to every reader.
+    open.catch(() => undefined);
+    const entry = { snapshot: { open, full }, until: Infinity };
+    this.snapshots.set(teamId, entry);
+    full.then(
+      () => { entry.until = this.now() + CANDIDATE_TTL_MS; },
+      () => { if (this.snapshots.get(teamId) === entry) this.snapshots.delete(teamId); },
+    );
+    return entry.snapshot;
+  }
+
+  // The team's open work for the new-ticket check, from the same snapshot as the candidate list.
+  // Rejects when the team's open tickets cannot be read.
+  async openWork(teamId: string): Promise<OpenWork> {
+    const { open, plans, unread } = await this.snapshot(teamId).full;
+    return { open, plans: plans.map((plan) => ({ identifier: plan.issue.identifier, files: planFootprint(plan.plan, plan.issue.identifier).files })), unreadPlans: unread };
+  }
+
   private async build(teamId: string): Promise<string> {
-    const open = await this.deps.linear.teamCandidates(teamId);
+    const { open: reading, full } = this.snapshot(teamId);
     const since = new Date(this.now() - DONE_DAYS * DAY_MS).toISOString();
-    const [done, plans] = await Promise.all([
-      this.deps.linear.doneSince(teamId, since).catch((error: unknown) => error instanceof Error ? error : new Error(String(error))),
-      this.readPlans(open.items),
+    const done = this.deps.linear.doneSince(teamId, since).catch((error: unknown) => error instanceof Error ? error : new Error(String(error)));
+    const open = await reading;
+    const [plans] = await Promise.all([
+      full,
       // A failed refresh leaves the pull requests it did not read listed as not read yet.
       this.deps.pullRequests.refresh(open.items.flatMap((issue) => issue.pullRequests), CANDIDATE_PULL_REQUEST_READS).catch(() => undefined),
     ]);
@@ -132,7 +165,7 @@ export class RelatedWork {
       plansSection(plans),
       planningSection(open.items),
       this.pullRequestSection(open.items),
-      doneSection(done, since),
+      doneSection(await done, since),
     ].join("\n\n") + "\n";
   }
 

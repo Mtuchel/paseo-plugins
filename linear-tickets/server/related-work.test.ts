@@ -304,3 +304,64 @@ Change \`server/x.ts\`.
   assert.deepEqual(planFootprint(composePlan(reapproved, annotation), "TUC-1").tickets, []);
   assert.deepEqual(await again.changedSince({ issueId: "i2", identifier: "TUC-2", teamId: "team-1", plan: documentPlanText(tuc2Plan), approved: tuc2Plan }), [], "the re-approved plan names no server/y.ts either");
 });
+
+// A team with an approved plan carrying a catch-up's `Related work:` document, a plan document
+// Linear does not return, a sent-back plan, and an open ticket whose pull request is not read.
+function ac6Fixture() {
+  const approved = "> **Approved** in Plannotator on 2026-10-12 09:30 UTC for TUC-1.\n\n# Plan\n\nChange `server/x.ts`.\n";
+  const annotation = relatedWorkDocument({ planHash: documentPlanHash(approved), section: "- TUC-4 — related: it changes `server/y.ts` too.", catchUp: "TUC-8", approvedAt: "2026-10-15T09:00:00.000Z", reach: "- `server/z.ts`: include — AC-2." });
+  const open = [
+    candidate(1, { description: "Export the ledger.", labels: ["Area: Sales"], pullRequests: [pr(1), pr(2)], planDocuments: [{ id: "d1", title: "Plan: TUC-1", updatedAt: "2026-10-12T09:31:00Z" }, { id: "d10", title: "Related work: TUC-1", updatedAt: "2026-10-15T09:01:00Z" }] }),
+    candidate(2, { status: "Planning", statusType: "started", planDocuments: [{ id: "d2", title: "Plan: TUC-2", updatedAt: "2026-10-13T10:00:00Z" }] }),
+    candidate(3, { status: "In Progress", statusType: "started", planDocuments: [{ id: "d3", title: "Plan: TUC-3", updatedAt: "2026-10-02T00:00:00Z" }] }),
+  ];
+  const documents = {
+    d1: { updatedAt: "2026-10-12T09:31:00Z", content: approved },
+    d10: { updatedAt: "2026-10-15T09:01:00Z", content: annotation },
+    d2: { updatedAt: "2026-10-13T10:00:00Z", content: "> **Sent back with feedback** in Plannotator on 2026-10-13 10:00 UTC for TUC-2.\n\n# Plan\n" },
+  };
+  const calls = { refresh: 0 };
+  const states: Record<string, { state: string; mergedAt: string | null; files: string[] }> = { [pr(1)]: { state: "OPEN", mergedAt: null, files: ["o/r/server/w.ts"] } };
+  const pullRequestFiles = {
+    refresh: async () => { calls.refresh += 1; },
+    filesOf: (url: string) => states[url]?.files ?? null,
+    stateOf: (url: string) => states[url] ? { state: states[url].state, mergedAt: states[url].mergedAt } : null,
+  };
+  return { open, documents, pullRequestFiles, calls, done: [{ id: "i90", identifier: "TUC-90", title: "Shipped export", completedAt: "2026-10-01T08:00:00Z", pullRequests: [], planDocuments: [] }] as DoneIssue[] };
+}
+
+// The list as the code before `openWork` built it, for the fixture above.
+const AC6_LIST = "This list covers the team's own tickets (TUC); search Linear for other teams' tickets. Each section says whether it is complete; look up by hand what an incomplete one names.\n\nWhen sources disagree: the code as merged is the current baseline. A plan written before a later merged change that contradicts it is re-planned, not implemented against it. A later approved plan that deliberately replaces existing behaviour stays valid: it is the newer decision. Open pull requests are proposed work, to be checked as conflicts, not authority. Ticket descriptions count least. When unsure whether a merged change still holds (it may have been reverted), read the file on `origin/main`.\n\n## Open tickets (3)\nComplete.\n- TUC-1 — Ticket 1 — Todo — labels: Area: Sales — Export the ledger.\n- TUC-2 — Ticket 2 — Planning\n- TUC-3 — Ticket 3 — In Progress\n\n## Approved plans of open tickets, newest approval first (1)\n\nIncomplete: these plan documents could not be read; read them in Linear: Plan: TUC-3.\n\n### TUC-1 — Ticket 1 (Todo), approved 2026-10-12 09:30 UTC\nRelated-work list: yes, naming TUC-4.\nFiles: `server/x.ts`, `server/y.ts`, `server/z.ts`.\nReach:\n\n- `server/z.ts`: include — AC-2.\n\n## Tickets in Planning (1)\nComplete.\n- TUC-2 — Ticket 2\n\n## Pull request files of open tickets\nIncomplete: 1 pull request is not read yet (listed below with the command that reads them).\nPull requests closed without merging are left out.\n### Open (1)\n- TUC-1 (Todo) https://github.com/o/r/pull/1: `o/r/server/w.ts`\n### Merged, newest merge first (0)\n### Not read yet (1)\n- TUC-1 https://github.com/o/r/pull/2 — not read yet: `gh pr view https://github.com/o/r/pull/2 --json files`\n\n## Done in the last 60 days (1)\nComplete.\n- TUC-90 — Shipped export (done 2026-10-01)\n";
+
+test("AC-6: the candidate list reads exactly as before, and openWork shares its one read of tickets and plans", async () => {
+  const fixture = ac6Fixture();
+  const { linear, calls } = fakeLinear(fixture.open, fixture.documents, fixture.done);
+  const related = new RelatedWork({ linear, pullRequests: fixture.pullRequestFiles, now: () => NOW });
+
+  const [work, list] = await Promise.all([related.openWork("team-1"), related.candidates("team-1")]);
+  assert.equal(list, AC6_LIST);
+  assert.deepEqual(work, {
+    open: { items: fixture.open, complete: true },
+    plans: [{ identifier: "TUC-1", files: ["server/x.ts", "server/y.ts", "server/z.ts"] }],
+    unreadPlans: ["Plan: TUC-3"],
+  });
+  assert.equal(calls.teamCandidates.length, 1, "one read of the open tickets");
+  assert.equal(calls.documentContents.length, 1, "one read of the plans");
+  assert.equal(fixture.calls.refresh, 1, "only the list reads pull requests");
+
+  // A later check within the TTL reads nothing.
+  await related.openWork("team-1");
+  assert.equal(calls.teamCandidates.length, 1);
+});
+
+test("openWork rejects while the open tickets cannot be read, and the next call reads again", async () => {
+  let now = NOW;
+  const { linear, calls, fail } = fakeLinear([candidate(1)]);
+  const related = new RelatedWork({ linear, pullRequests: { refresh: async () => undefined, filesOf: () => null, stateOf: () => null }, now: () => now });
+  fail.teamCandidates = true;
+  await assert.rejects(related.openWork("team-1"), /Linear unavailable/);
+  assert.equal((await related.openWork("team-1")).open.items.length, 1);
+  now += CANDIDATE_TTL_MS + 1;
+  await related.openWork("team-1");
+  assert.equal(calls.teamCandidates.length, 3);
+});
