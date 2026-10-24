@@ -56,6 +56,52 @@ def candidates_ticket(number, questions, comments=(), project="ERP", week="2026-
             "comments": {"nodes": [{"body": c} for c in comments]}}
 
 
+MISS_CREATED = "2026-02-10T10:00:00Z"  # months before the week a test tags
+
+
+def miss_issue(number, labels, history=(), created=MISS_CREATED, history_complete=True):
+    """One issue as HostIO.planning_misses returns it: the labels it carries now, and its
+    `[when, added names]` history entries."""
+    return {"id": f"issue-{number}", "identifier": f"TUC-{number}", "createdAt": created,
+            "labels": list(labels),
+            "history": [{"createdAt": when, "addedLabels": list(added)} for when, added in history],
+            "historyComplete": history_complete}
+
+
+def miss_read(issues, complete=True):
+    return {"issues": list(issues), "complete": complete}
+
+
+def graphql_page(nodes, next_cursor=None):
+    return {"nodes": list(nodes), "pageInfo": {"hasNextPage": bool(next_cursor), "endCursor": next_cursor}}
+
+
+def graphql_history(*entries):
+    """GraphQL history nodes: `(when, added label names)` as `addedLabels { name }`."""
+    return [{"createdAt": when, "addedLabels": [{"name": name} for name in names]} for when, names in entries]
+
+
+def graphql_issue(number, history, labels=("missed-reach",), created=MISS_CREATED):
+    return {"id": f"issue-{number}", "identifier": f"TUC-{number}", "createdAt": created,
+            "labels": {"nodes": [{"name": name} for name in labels]}, "history": history}
+
+
+class FakeGraphQL:
+    """Paged Linear answers by `after` cursor: the issue pages, and one history page map per id."""
+
+    def __init__(self, issue_pages, history_pages=None):
+        self.issue_pages = issue_pages
+        self.history_pages = history_pages or {}
+        self.calls = []
+
+    def __call__(self, auth, query, variables=None):
+        variables = variables or {}
+        self.calls.append((query, variables))
+        if "issue(id:" in query:
+            return {"issue": {"history": self.history_pages[variables["id"]][variables["after"]]}}
+        return {"issues": self.issue_pages[variables["after"]]}
+
+
 class FakeIO:
     def __init__(self):
         self.repo_items = []
@@ -77,6 +123,9 @@ class FakeIO:
         self.dispatch_error = None
         self.candidates = []
         self.candidates_error = None
+        self.misses = {"issues": [], "complete": True}
+        self.misses_error = None
+        self.misses_since = []
         self.unreachable = {}
         self.targets = []
         self.limit_resumes_data = {"pending": {}, "started": set()}
@@ -150,6 +199,12 @@ class FakeIO:
         if self.candidates_error:
             raise self.candidates_error
         return list(self.candidates)
+
+    def planning_misses(self, since_iso):
+        if self.misses_error:
+            raise self.misses_error
+        self.misses_since.append(since_iso)
+        return self.misses
 
     def linear_usage(self):
         if self.usage_error:
@@ -470,6 +525,162 @@ class DecisionCandidatesTest(unittest.TestCase):
         self.assertIn("## Decision candidates\n\n- Decision candidates waiting: 1 — "
                       "[TUC-760](https://linear.app/tuchel/issue/TUC-760) (1)\n", out)
         self.assertEqual(digest.pending_signature(state), "")
+
+
+class PlanningMissesTest(unittest.TestCase):
+    def test_counts_per_week_and_label(self):
+        read = miss_read([
+            miss_issue(900, ["missed-reach"], [("2026-09-29T10:00:00Z", ["missed-reach"])]),
+            miss_issue(901, ["missed-reach"], [("2026-09-30T07:00:00Z", ["missed-reach"])]),
+            miss_issue(902, ["broke-rule"], [("2026-09-22T10:00:00Z", ["broke-rule"])]),
+            miss_issue(903, ["missed-conflict"],
+                       [("2026-09-29T10:00:00Z", ["missed-conflict", "missed-reach"])]),
+        ])
+        result = digest.planning_misses(read, WED_10_05)
+        self.assertEqual(result["weeks"], {"2026-W40": {"missed-reach": 2, "missed-conflict": 1},
+                                           "2026-W39": {"broke-rule": 1}})
+        self.assertEqual((result["unknown"], result["complete"]), ({}, True))
+
+    def test_old_ticket_tagged_this_week_counts_this_week(self):
+        issue = miss_issue(904, ["missed-reach"], [("2026-09-28T00:30:00Z", ["missed-reach"])],
+                           created="2026-02-10T10:00:00Z")
+        self.assertEqual(digest.planning_misses(miss_read([issue]), WED_10_05)["weeks"],
+                         {"2026-W40": {"missed-reach": 1}})
+
+    def test_removed_label_is_not_counted_and_a_second_add_counts_in_the_latest_week(self):
+        removed = miss_issue(905, [], [("2026-09-29T10:00:00Z", ["missed-reach"])])
+        twice = miss_issue(906, ["missed-reach"], [("2026-09-22T10:00:00Z", ["missed-reach"]),
+                                                   ("2026-09-29T10:00:00Z", ["missed-reach"])])
+        self.assertEqual(digest.planning_misses(miss_read([removed, twice]), WED_10_05)["weeks"],
+                         {"2026-W40": {"missed-reach": 1}})
+
+    def test_label_present_since_creation_counts_in_the_creation_week(self):
+        issue = miss_issue(907, ["missed-conflict"], [], created="2026-09-23T10:00:00Z")
+        self.assertEqual(digest.planning_misses(miss_read([issue]), WED_10_05)["weeks"],
+                         {"2026-W39": {"missed-conflict": 1}})
+
+    def test_history_cap_without_an_adding_entry_gives_week_not_known(self):
+        issue = miss_issue(908, ["broke-rule"], [], history_complete=False)
+        result = digest.planning_misses(miss_read([issue], complete=False), WED_10_05)
+        self.assertEqual((result["weeks"], result["unknown"], result["complete"]),
+                         ({}, {"broke-rule": 1}, False))
+        lines = digest.miss_lines({**result, "at": WED_10_05, "stale": False}, WED_10_05)
+        self.assertIn("- Week not known: broke-rule 1", lines)
+        self.assertIn("- (incomplete: more tickets carry miss labels than were read)", lines)
+
+    def test_iso_year_boundary_is_berlin_time(self):
+        self.assertEqual(digest.iso_week(at("2026-12-31T12:00:00Z")), "2026-W53")
+        self.assertEqual(digest.iso_week(at("2027-01-03T23:30:00Z")), "2027-W01")  # 00:30 Berlin on the 4th
+        now = at("2027-01-06T08:05:00Z")
+        issue = miss_issue(909, ["missed-reach"], [], created="2026-12-31T12:00:00Z")
+        self.assertEqual(digest.planning_misses(miss_read([issue]), now)["weeks"],
+                         {"2026-W53": {"missed-reach": 1}})
+
+    def test_weeks_and_lines_newest_first_with_empty_weeks_named(self):
+        read = miss_read([
+            miss_issue(910, ["missed-reach", "broke-rule"],
+                       [("2026-09-29T10:00:00Z", ["missed-reach", "broke-rule"])]),
+        ])
+        misses = {**digest.planning_misses(read, WED_10_05), "at": WED_10_05, "stale": False}
+        self.assertEqual(digest.miss_lines(misses, WED_10_05), [
+            "## Planning misses", "",
+            "- 2026-W40: missed-reach 1, broke-rule 1",
+            "- No misses in 2026-W33, 2026-W34, 2026-W35, 2026-W36, 2026-W37, 2026-W38, 2026-W39",
+            ""])
+
+    def test_render_not_read_yet_and_stale(self):
+        self.assertIn("## Planning misses\n\n- not read yet\n", digest.render(digest.empty_state(), [], WED_10_05))
+        state = digest.empty_state()
+        state["planningMisses"] = {"weeks": {"2026-W40": {"missed-reach": 2}}, "unknown": {},
+                                   "complete": True, "at": WED_10_05, "stale": True}
+        out = digest.render(state, [], WED_11_05)
+        self.assertIn("## Planning misses\n\n- 2026-W40: missed-reach 2\n", out)
+        self.assertIn("_(not refreshed since 10:05)_", out)
+
+
+class PlanningMissesReadTest(unittest.TestCase):
+    def read(self, fake, since="2026-08-09T22:00:00Z"):
+        with mock.patch.object(digest, "linear_call", fake), \
+             mock.patch.object(digest.HostIO, "key", return_value="key"):
+            return digest.HostIO(sync_repo=False, remotes=False).planning_misses(since)
+
+    def test_issue_pages_are_followed(self):
+        first = graphql_issue(900, graphql_page(graphql_history(("2026-09-29T10:00:00Z", ["missed-reach"]))))
+        second = graphql_issue(901, graphql_page([]), labels=("broke-rule",))
+        fake = FakeGraphQL({None: graphql_page([first], "issue-c2"), "issue-c2": graphql_page([second])})
+        read = self.read(fake)
+        self.assertTrue(read["complete"])
+        self.assertEqual([i["identifier"] for i in read["issues"]], ["TUC-900", "TUC-901"])
+        pages = [(q, v) for q, v in fake.calls if "issue(id:" not in q]
+        self.assertEqual([v["after"] for _q, v in pages], [None, "issue-c2"])
+        self.assertIn("includeArchived: true", pages[0][0])
+        self.assertEqual((pages[0][1]["labels"], pages[0][1]["since"]),
+                         (list(digest.MISS_LABELS), "2026-08-09T22:00:00Z"))
+
+    def test_tag_found_on_the_second_history_page(self):
+        page1 = graphql_page(graphql_history(("2026-08-01T10:00:00Z", [])), "history-c2")
+        page2 = graphql_page(graphql_history(("2026-09-29T10:00:00Z", ["missed-reach"])))
+        issue = graphql_issue(902, page1)
+        fake = FakeGraphQL({None: graphql_page([issue])},
+                           {"issue-902": {None: page1, "history-c2": page2}})
+        read = self.read(fake)
+        self.assertTrue(read["issues"][0]["historyComplete"])
+        self.assertEqual([entry["addedLabels"] for entry in read["issues"][0]["history"]],
+                         [[], ["missed-reach"]])
+        further = [v for q, v in fake.calls if "issue(id:" in q]
+        self.assertEqual(further, [{"id": "issue-902", "after": "history-c2"}])
+        self.assertEqual(digest.planning_misses(read, WED_10_05)["weeks"],
+                         {"2026-W40": {"missed-reach": 1}})
+
+    def test_history_page_cap_leaves_the_ticket_unread(self):
+        pages = {None: graphql_page([], "h1")}
+        for n in range(1, 10):
+            pages[f"h{n}"] = graphql_page([], f"h{n + 1}")
+        issue = graphql_issue(903, pages[None])
+        fake = FakeGraphQL({None: graphql_page([issue])}, {"issue-903": pages})
+        read = self.read(fake)
+        self.assertFalse(read["issues"][0]["historyComplete"])
+        self.assertEqual(len([1 for q, _v in fake.calls if "issue(id:" in q]), 9)
+        self.assertEqual(digest.planning_misses(read, WED_10_05)["unknown"], {"missed-reach": 1})
+
+    def test_issue_page_cap_leaves_the_counts_incomplete(self):
+        pages = {None: graphql_page([graphql_issue(904, graphql_page([]))], "c1"),
+                 "c1": graphql_page([graphql_issue(905, graphql_page([]))], "c2"),
+                 "c2": graphql_page([graphql_issue(906, graphql_page([]))])}
+        with mock.patch.object(digest, "MISS_ISSUE_PAGES", 2):
+            read = self.read(FakeGraphQL(pages))
+        self.assertFalse(read["complete"])
+        self.assertEqual([i["identifier"] for i in read["issues"]], ["TUC-904", "TUC-905"])
+
+
+class PlanningMissesRunTest(RunCase):
+    def test_digest_shows_the_section_without_items_or_notification(self):
+        self.io.misses = miss_read([
+            miss_issue(900, ["missed-reach"], [("2026-09-29T10:00:00Z", ["missed-reach"])]),
+            miss_issue(901, ["broke-rule"], [("2026-09-22T10:00:00Z", ["broke-rule"])]),
+        ])
+        self.assertEqual(self.run_at(WED_10_05), 0)
+        doc = self.io.published[-1]
+        self.assertIn("## Planning misses\n\n- 2026-W40: missed-reach 1\n- 2026-W39: broke-rule 1\n", doc)
+        state = self.saved()
+        self.assertEqual(state["planningMisses"]["weeks"]["2026-W40"], {"missed-reach": 1})
+        self.assertFalse(state["planningMisses"]["stale"])
+        self.assertEqual((state["items"], state["pending"], self.io.comments, self.io.desktops), ({}, {}, [], []))
+        self.assertEqual(self.io.misses_since, [digest.misses_since(WED_10_05)])
+
+    def test_failed_read_keeps_previous_counts_marked_not_refreshed(self):
+        self.io.misses = miss_read([miss_issue(900, ["missed-reach"],
+                                               [("2026-09-29T10:00:00Z", ["missed-reach"])])])
+        self.run_at(WED_10_05)
+        self.io.misses_error = digest.LinearError("down")
+        self.assertEqual(self.run_at(WED_11_05), 0)
+        misses = self.saved()["planningMisses"]
+        self.assertEqual((misses["weeks"]["2026-W40"], misses["stale"]), ({"missed-reach": 1}, True))
+        doc = self.io.published[-1]
+        self.assertIn("- 2026-W40: missed-reach 1", doc)
+        self.assertIn("_(not refreshed since 10:05)_", doc)
+        self.assertIn("- planning_misses: error (previous items kept)", doc)
+        self.assertEqual((self.saved()["items"], self.saved()["pending"], self.io.comments), ({}, {}, []))
 
 
 ITEM_FIELDS = {"t", "event", "key", "kind", "unit", "first", "attention", "section", "group", "ticket", "host",
@@ -2292,7 +2503,8 @@ class PlanningRunTest(RunCase):
                          {"planning-missing:mirko@mac:01a116c4-60d1-7595-a7e9-731ebebbfe38",
                           f"planning-smoke:mirko@mac:{SMOKE_FINGERPRINT}"})
         run_line = read_lines(os.path.join(self.history, "history.jsonl"))[0]
-        self.assertEqual({unit: ok for unit, ok in run_line["units"].items() if unit.startswith("planning")}, {
+        self.assertEqual({unit: ok for unit, ok in run_line["units"].items()
+                          if unit.split("@")[0] in ("planning_sessions", "planning_smoke")}, {
             "planning_sessions": True, "planning_smoke": True,
             "planning_sessions@mirko@mac": True, "planning_smoke@mirko@mac": True,
             "planning_sessions@old@mini": False, "planning_smoke@old@mini": False,

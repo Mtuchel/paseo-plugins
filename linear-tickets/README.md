@@ -4499,6 +4499,15 @@ starts tuchel-platform's *Flaky quarantine* workflow (`gh workflow run flaky-qua
 text never reaches Linear or the history: errors are reduced to categories, and each line names
 the local command that shows the details. The script's docstring describes one run in detail.
 
+**Planning misses.** Right after Decision candidates the document shows, per Berlin ISO week,
+how many tickets carry each of the labels `missed-reach`, `missed-conflict` and `broke-rule`:
+the last 8 ISO weeks, each ticket counted in the week its label was last added (a label removed
+again stops counting; a label the ticket carried since creation counts in its creation week).
+A label whose history lies beyond the read's page cap is summed under `Week not known`, and an
+`(incomplete: more tickets carry miss labels than were read)` line names a read that stopped at
+the issue page cap. The section writes no item: it raises no attention, sends no notification
+and files no weekly kind; a failed read keeps the last counts, marked `not refreshed since`.
+
 Owner-needed project planners are read directly from `linear-tickets/projects.json` on every
 host, even when no agent exists or the planner's Linear notification failed. Items identify the
 owning host, project and run, use the saved project name when available (else its UUID), and tell
