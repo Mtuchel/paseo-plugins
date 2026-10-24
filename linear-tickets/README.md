@@ -1019,6 +1019,50 @@ document by hand removes the analysis from the plan's readers; the links it wrot
 ticket is not listed again for that plan. The state lives in
 `$PASEO_HOME/linear-tickets/related-catch-up.json`.
 
+**New-ticket check.** A ticket filed in a dispatch team gets one look when it is filed, while
+merging or rewording it is still cheap ([`server/new-ticket-check.ts`](server/new-ticket-check.ts),
+rules in [`server/new-ticket-match.ts`](server/new-ticket-match.ts)). It runs on the dispatch host
+(`dispatch.enabled`, not forwarding to a peer) as the last pass of every dispatch poll, for the
+dispatch teams only, and checks tickets filed after its first run; older tickets are never checked.
+The poll that first sees a new ticket compares it with the team's open tickets and approved plans,
+the same read the candidate list uses, and posts at most one comment as the Paseo app, only when a
+part applies:
+
+- **Possibly related work** (`🔎 **Possibly related work**, checked when this ticket was filed.
+  Paseo added no links for these; the plan decides.`): up to five open tickets, most reasons first,
+  each with its reasons: a similar title (two or more shared words of three letters or more, stop
+  words left out, Dice score at least 0.5), files named in its description, its approved plan or the
+  cached files of its pull requests that the new ticket also names in backticks, or the same page
+  name in quotes („…“, “…”, "…", «…»). A shared Area is named only next to one of those reasons.
+  Paseo adds no relation for these.
+- **Area:** when Linear has a workspace `Area` group, the ticket has none of its labels, and
+  [label sync](#label-rules) will not set one (no rules file, no `Area` group in it, the team not in
+  its `teamKeys`, or no rule matches). A ticket whose pull request files are not read yet is left to
+  label sync. A host whose label sync is off because the laptop runs it keeps the laptop's rules as
+  `label-rules.json.mac-owned` next to where `label-rules.json` would be (server087 does); the check
+  predicts from that copy when the host has no `label-rules.json` of its own, so keep the copy current
+  when the laptop's rules change. Label sync never reads the copy.
+- **Not fully checked: …**, only next to another part, when something could not be read: part of
+  the team's open tickets, a ticket's plan, or `label-rules.json` (then no Area is asked for). Such a
+  ticket waits up to five polls for complete inputs first. A failed read (Linear unreachable) keeps it
+  waiting without limit.
+
+Tickets Paseo files itself, from either host, get no comment: tickets created by a Paseo app, and the
+titles and description markers of its own tickets filed with the owner's key as fallback (needs-you,
+split steps, health and Greptile warnings, agents' `create_issue`, manual tasks, catch-ups, decision
+candidates; the list is `FILED_BY_PASEO`). Ten minutes after filing, a ticket that says it is the
+same bug as another ticket at another place ("same bug as TUC-640 on the credit note page",
+"gleicher Fehler wie in TUC-640, andere Seite") gets the `missed-reach` label and a `related`
+relation to each ticket it names, from a fresh read. Both are needed in one sentence: the reference
+phrase and a place word (page, screen, form, another…; Seite, Maske, anderen…). A bare "same as
+TUC-640" or "wie in TUC-640" counts only on a `Type: Bug` ticket; "see TUC-640" never counts, nor
+does a ticket typed other than Bug, an unknown identifier or the ticket itself. A ticket closed
+before its check gets nothing. Every write is skipped when already there, and the comment's id is
+reserved before it is posted, so a restart repeats nothing. The state lives in
+`$PASEO_HOME/linear-tickets/new-ticket-check.json`; without it the check starts again at that
+moment (`new-ticket check: started at <time>` in the log). Wrong comments, labels or relations stay
+in Linear until removed by hand; the Paseo app is their author.
+
 **Reach and principles.** A decision made in one ticket should apply everywhere it belongs and not
 come back in the next one, so every plan carries two more sections before `## Risk and impact`, in
 a fixed format ([`shared/plan-sections.ts`](shared/plan-sections.ts)):
@@ -3798,12 +3842,26 @@ Every ticket label the plugin sets, and what removes it:
 | `plan-rework` | a send-back | the next plan submission or an approval |
 | `no-plan` | the small-ticket route | the route undone by your `plan`, or an approved plan replacing the route |
 | `model:cheap`, `model:strong` | an approved plan, the small-ticket route, an escalation, a strong split step | swapped in one write when the tier changes; never cleared |
+| `missed-reach`, `missed-conflict`, `broke-rule` | you (a planning miss, below); the new-ticket check (see **New-ticket check**) sets `missed-reach` on a "same bug as TUC-X at another place" ticket | you; a removed label stops counting |
 
 The two `model:` labels belong to the Linear label group `model`, so a ticket carries at most
 one tier. The plugin swaps them in one write (add the new one, remove the others), which works with
 or without the group, and creates a missing tier label inside the group when the group exists.
 `model:standard`, the label of the dropped middle tier, is read as `model:strong` and is removed
 the next time the plugin writes the ticket's tier (see [Model tiers](#model-tiers)).
+
+The three planning-miss labels are ungrouped workspace labels the new-ticket check creates on its
+first poll (a label of the same name inside a group, for one team only, or twice is reported in the
+log and never applied). Set one in Linear when you send a plan back for a miss, or on the bug you
+file for it:
+
+- `missed-reach`: the plan did not reach a place the change had to reach (another page, role,
+  record, export or repository using what the ticket changes);
+- `missed-conflict`: the plan missed a conflict with other work (another ticket's plan or change);
+- `broke-rule`: the plan broke an approved rule or principle.
+
+The ops digest counts the tickets carrying each label per week (see
+[Ops digest](#ops-digest-and-weekly-ops-review)).
 
 ### One-time correction (`scripts/plan-stages-migration.ts`)
 
