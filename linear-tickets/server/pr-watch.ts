@@ -1603,16 +1603,18 @@ export class PullRequestWatch {
     };
     const checkout = this.deps.backstop?.checkout ?? new BackstopCheckout();
     const now = this.deps.backstop?.now?.() ?? Date.now();
-    // The run's linkless tickets read their attachments in one request (discovery and the stack
-    // policy read them, and a poll has many of them): the first reader pays for the batch, every
-    // later one is answered from it. A ticket the batch leaves out (a linked one, or one Linear
-    // did not return) is read alone, once per run. A failed batch fails every reader of this run:
-    // reading each ticket alone instead would send the requests the batch exists to save.
+    // The run's linkless tickets read their attachments in one batch: discovery, the watchdog and
+    // the stack policy read them (a Done ticket whose worktree is gone, every poll), and a poll has
+    // many of them. The first reader pays for the batch over every linkless record of the run,
+    // discoverable or not; every later one is answered from it. A ticket the batch leaves out (one
+    // without a record here, or one Linear did not return) is read alone, once per run. A failed
+    // batch fails every reader of this run: reading each ticket alone instead would send the
+    // requests the batch exists to save. Linked records never ask: their link names the repo.
     // Per run only: every poll and backstop builds a new context, so nothing is carried across.
     let batch: Promise<Map<string, string[]>> | null = null;
     const alone = new Map<string, Promise<string[]>>();
     const attachments = async (issueId: string): Promise<string[]> => {
-      batch ??= this.deps.linear.issuesAttachments([...new Set([...records.filter((record) => this.discoverable(record, now)).map((record) => record.issueId), issueId])]);
+      batch ??= this.deps.linear.issuesAttachments([...new Set([...records.filter((record) => !record.links["Pull request"]).map((record) => record.issueId), issueId])]);
       const found = await batch;
       const urls = found.get(issueId);
       if (urls) return urls;

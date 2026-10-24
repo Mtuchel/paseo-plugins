@@ -4025,12 +4025,16 @@ No tokens, query bodies or ticket text appear in the report.
     dropped from the batch and the rest read again; a due session the batch does not return is read
     alone. A failed batch fails its sessions for this sweep, and the next sweep reads them again.
     Webhooks do not initiate separate history reads.
-  - The PR watch reads the attachment links of a run's tickets without a worktree 50 per request
-    (`issuesAttachmentUrls`) the first time discovery, a ticket's pull-request lookup or the stack
-    policy needs one, instead of one `issueAttachmentUrls` per ticket (896 requests in that hour,
-    with about 114 such tickets). Every poll, backstop and watchdog pass builds a new run, so nothing
-    is carried across runs. A ticket the batch does not cover is read alone, once per run; a failed
-    batch fails that run's readers. The completion check still reads its ticket alone.
+  - The PR watch reads the attachment links of a run's tickets without a linked pull request 50 per
+    request (`issuesAttachmentUrls`) the first time discovery, a ticket's pull-request lookup or the
+    stack policy needs one, instead of one `issueAttachmentUrls` per ticket (896 requests in that
+    hour, with about 114 such tickets). The batch covers every linkless record of the run, not only
+    the ones discovery looks at: Done tickets whose worktree is gone and that have no branch left to
+    discover by are checked by the stack policy on every poll, and read alone they cost about 950
+    requests an hour on server087 (2026-10-24). Every poll, backstop and watchdog pass builds a new
+    run, so nothing is carried across runs. A ticket the batch does not cover is read alone, once
+    per run; a failed batch fails that run's readers. The completion check still reads its ticket
+    alone.
   - The watchdog screens a pass's quiet roots on one `issuesWatchStates` read (state and labels,
     50 tickets per request) instead of one `issueWatchState` each, and uses it for at most 30
     seconds. The checks right before an effect, and before a cycle ends, still read their ticket
