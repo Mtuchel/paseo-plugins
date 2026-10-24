@@ -75,6 +75,7 @@ import { ApprovalClaims, ClaimRequests } from "./server/approval-claims";
 import { ProjectFlow, ProjectStore } from "./server/project-flow";
 import { ProjectIssueCache } from "./server/project-issues";
 import { RelatedCatchUp } from "./server/related-catch-up";
+import { NewTicketCheck } from "./server/new-ticket-check";
 import { Presence } from "./server/presence";
 import { Focus } from "./server/focus";
 import { rateBudget, withPriority } from "./server/rate-budget";
@@ -303,6 +304,9 @@ export default function contribute(server: PluginServerContext) {
     openSession,
     paseo: () => attachedPaseo,
   });
+  // The new-ticket check (README, "New-ticket check"): a comment on likely related work and a
+  // missing Area, the planning-miss labels, and the "same as" links.
+  const newTickets = new NewTicketCheck({ linear, related: relatedWork, pullRequests: pullRequestFiles, settings });
   const writeback = new Writeback(linear, settings, { sessions, handover }, undefined, undefined, needsYou);
   // The before-merge manual tasks of a ticket (manual-tasks.ts), read by the steward's facts.
   const manualTasks = new ManualTasks({ linear, settings });
@@ -328,7 +332,7 @@ export default function contribute(server: PluginServerContext) {
     responsibility: { due: (now) => responsibility.due(now), holds: (issue) => responsibility.holds(issue), run: (input) => responsibility.run(input) },
   });
   const relay = new CommentRelay(linear, undefined, needsYou, route, replies, { covered: () => coverage.covers("Comment"), agentDirectory });
-  const dispatcher = new Dispatcher({ linear, starter, launcher, settings, route, relay, afterLaunch: openSession, handOff: (issueId, openChildren) => sessions.handOffGroup(issueId, openChildren), projects, catchUp: relatedCatchUp, steward, focus, parked: waitingPlans });
+  const dispatcher = new Dispatcher({ linear, starter, launcher, settings, route, relay, afterLaunch: openSession, handOff: (issueId, openChildren) => sessions.handOffGroup(issueId, openChildren), projects, catchUp: relatedCatchUp, newTickets, steward, focus, parked: waitingPlans });
   // The owner's plan feedback and answers, for the weekly decision candidates (README, "Decision candidates").
   const decisions = new DecisionLog();
   writeback.recordDecisions(decisions);

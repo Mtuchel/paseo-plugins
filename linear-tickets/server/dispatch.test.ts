@@ -8,6 +8,7 @@ import { Launcher } from "./launch";
 import { MISSED_REACH_NOTE, MODEL_NOTE, RELATED_WORK_NOTE, QUESTIONS_NOTE, TicketStarter, WAITING_PLAN_REASON } from "./starter";
 import { advisorNote, PLAN_REQUIRED_NOTE, PLAN_SECTIONS_NOTE, PLAN_SLICING_NOTE } from "./plan-policy";
 import { RepairBusyError } from "./repair-exclusion";
+import { RateLimitedError } from "./rate-budget";
 import type { IssueGroup, LabeledIssue } from "./linear";
 import { DEFAULT_WORKTREE_SHARDS, DEFAULT_ACTIVATION, DEFAULT_BACKSTOP, DEFAULT_DISPATCH, DEFAULT_WRITEBACK, DEFAULT_WATCHDOG, DEFAULT_STEWARD, DEFAULT_DEPUTY, type PluginSettings } from "./settings";
 import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
@@ -335,6 +336,21 @@ test("disabled dispatch, or enabled without teams, never queries Linear", async 
     assert.equal(dispatcher.snapshot().active, false);
     t.mock.timers.reset();
   }
+});
+
+test("the new-ticket check is the last pass of every poll, and its rate limit pauses the poll", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const order: string[] = [];
+  let limited = false;
+  const pass = (name: string) => ({ tick: async () => { order.push(name); if (name === "new-tickets" && limited) throw new RateLimitedError("app", Date.now() + 60_000); } });
+  const linear = new FakeLinear({});
+  const dispatcher = new Dispatcher({ linear, starter: new TicketStarter({ linear, launcher: { start: async () => ({ agentId: "a", warnings: [] }) }, branches: async () => ({ branches: [], defaultBranch: "refs/heads/main" }) }), launcher: new Launcher(linear as never), settings: { read: async () => baseSettings }, projects: pass("projects"), catchUp: pass("catch-up"), newTickets: pass("new-tickets") });
+  dispatcher.attach(fakePaseo());
+  await dispatcher.tick();
+  assert.deepEqual(order, ["projects", "catch-up", "new-tickets"]);
+  limited = true;
+  await dispatcher.tick();
+  assert.match(dispatcher.snapshot().lastError ?? "", /^paused/);
 });
 
 test("the mapped base branch falls back to the repository default when it no longer exists", async (t) => {
