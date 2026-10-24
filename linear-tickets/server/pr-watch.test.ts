@@ -4441,6 +4441,22 @@ test("the stack state of a Done ticket: open while a reopen is pending, settled 
   assert.equal(await (await other.watch()).stackState("i9"), "settled");
 });
 
+// Seen live on 2026-10-24: Done tickets whose worktrees were removed after landing, with no linked
+// pull request and no branch to discover one by, read their attachments alone on every poll for
+// the stack policy (~950 requests an hour on server087).
+test("a poll's Done tickets without a worktree, link or branch read their attachments in the run's one batch", async (t) => {
+  const h = harness(t);
+  const [first] = h.records;
+  h.records.length = 0;
+  for (const index of [1, 2, 3]) {
+    h.records.push({ ...first, issueId: `i${index}`, identifier: `TUC-${index}`, agentId: `a${index}`, branch: null, worktreePath: null, links: {} });
+    h.linear.byIssue[`i${index}`] = { status: "Done", statusType: "completed" };
+  }
+  await h.poll();
+  assert.deepEqual(h.linear.attachmentBatches.map((ids) => [...ids].sort()), [["i1", "i2", "i3"]], "one request answers every Done ticket's stack check");
+  assert.deepEqual(h.linear.attachmentReads, [], "no ticket's attachments are read alone");
+});
+
 test("at most three Done tickets are reopened per poll", async (t) => {
   t.mock.method(console, "log", () => {});
   const h = harness(t);
