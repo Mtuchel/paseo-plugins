@@ -871,6 +871,21 @@ export const LABEL_SWEEP_QUERY = `query labelSweep($first: Int!, $after: String,
     pageInfo { hasNextPage endCursor }
   }
 }`;
+// The new-ticket check (new-ticket-check.ts): the teams' tickets created since a time, and the same
+// fields for given tickets. `labels` with their group, so "Area: Sales" is told from "Sales".
+const NEW_ISSUE_FIELDS = "id identifier title description url createdAt updatedAt creator { id } team { id key } state { type } project { name } parent { id labels(first: 25) { nodes { id } } } labels(first: 50) { nodes { id name parent { name } } } attachments(first: 25) { nodes { url } }";
+export const NEW_ISSUES_QUERY = `query newIssues($first: Int!, $after: String, $filter: IssueFilter) {
+  issues(first: $first, after: $after, includeArchived: false, orderBy: createdAt, filter: $filter) {
+    nodes { ${NEW_ISSUE_FIELDS} }
+    pageInfo { hasNextPage endCursor }
+  }
+}`;
+export const ISSUES_BY_ID_QUERY = `query issuesById($ids: [ID!], $first: Int!) {
+  issues(first: $first, includeArchived: true, filter: { id: { in: $ids } }) { nodes { ${NEW_ISSUE_FIELDS} } }
+}`;
+// `labelNames`: "Group: Name" for a label in a group, else its name. `creatorId` null for an
+// integration without a user.
+export type NewIssue = SweptIssue & { teamId: string; teamKey: string; url: string; creatorId: string | null; statusType: string; labelNames: string[] };
 export const LABEL_HISTORY_QUERY = `query labelHistory($id: String!, $after: String) {
   issue(id: $id) { history(first: 100, after: $after) { nodes { createdAt actorId addedLabelIds removedLabelIds } pageInfo { hasNextPage endCursor } } }
 }`;
@@ -903,6 +918,31 @@ const PULL_REQUEST_URL = /^https:\/\/github\.com\/[^/\s]+\/[^/\s]+\/pull\/\d+/;
 // The pull request URLs among an `attachments` connection's nodes, without suffixes, deduplicated.
 function pullRequestUrls(attachments: unknown): string[] {
   return [...new Set(connection(attachments ?? { nodes: [] }).nodes.map((node) => label(record(node).url).match(PULL_REQUEST_URL)?.[0] ?? "").filter(Boolean))];
+}
+// An issue node of LABEL_SWEEP_QUERY, or of the new-ticket queries, as the label rules read it.
+function sweptIssue(item: unknown): SweptIssue {
+  const node = record(item);
+  const parent = node.parent ? record(node.parent) : null;
+  const ids = (value: unknown) => connection(value ?? { nodes: [] }).nodes.map((entry) => label(record(entry).id)).filter(Boolean);
+  return {
+    id: label(node.id), identifier: label(node.identifier), title: label(node.title), description: typeof node.description === "string" ? node.description : "",
+    createdAt: label(node.createdAt), updatedAt: label(node.updatedAt), projectName: label(node.project ?? null) || null,
+    parentId: parent ? label(parent.id) || null : null, parentLabelIds: parent ? ids(parent.labels) : [], labelIds: ids(node.labels),
+    pullRequests: pullRequestUrls(node.attachments),
+  };
+}
+function newIssue(item: unknown): NewIssue {
+  const node = record(item);
+  const team = record(node.team ?? {});
+  const labelNames = connection(node.labels ?? { nodes: [] }).nodes.map((entry) => {
+    const { name, parent } = record(entry);
+    const group = parent ? label(record(parent).name) : "";
+    return group ? `${group}: ${label(name)}` : label(name);
+  });
+  return {
+    ...sweptIssue(node), teamId: label(team.id), teamKey: label(team.key), url: label(node.url),
+    creatorId: label(record(node.creator ?? {}).id) || null, statusType: label(record(node.state ?? {}).type), labelNames,
+  };
 }
 // A user's profile URL (https://linear.app/<workspace>/profiles/<name>): in a comment, Linear
 // renders it as an @mention and notifies that user.
@@ -2347,17 +2387,22 @@ export class LinearService {
   async labelSweep(teamKeys: string[], since: string | null, after: string | null): Promise<{ issues: SweptIssue[]; next: string | null }> {
     const filter = { team: { key: { in: teamKeys } }, ...(since ? { updatedAt: { gt: since } } : {}) };
     const page = connection(record(await this.read(LABEL_SWEEP_QUERY, { first: LABEL_SWEEP_PAGE, after, filter })).issues);
-    const ids = (value: unknown) => connection(value ?? { nodes: [] }).nodes.map((node) => label(record(node).id)).filter(Boolean);
-    const issues = page.nodes.map((item) => record(item)).map((node): SweptIssue => {
-      const parent = node.parent ? record(node.parent) : null;
-      return {
-        id: label(node.id), identifier: label(node.identifier), title: label(node.title), description: typeof node.description === "string" ? node.description : "",
-        createdAt: label(node.createdAt), updatedAt: label(node.updatedAt), projectName: label(node.project ?? null) || null,
-        parentId: parent ? label(parent.id) || null : null, parentLabelIds: parent ? ids(parent.labels) : [], labelIds: ids(node.labels),
-        pullRequests: pullRequestUrls(node.attachments),
-      };
-    }).filter((issue) => issue.id && issue.createdAt);
+    const issues = page.nodes.map(sweptIssue).filter((issue) => issue.id && issue.createdAt);
     return { issues, next: page.hasNextPage ? page.endCursor : null };
+  }
+
+  // One page of the teams' tickets created at or after `since`.
+  async newIssues(teamKeys: string[], since: string, after: string | null): Promise<{ issues: NewIssue[]; next: string | null }> {
+    const filter = { team: { key: { in: teamKeys } }, createdAt: { gte: since } };
+    const page = connection(record(await this.read(NEW_ISSUES_QUERY, { first: LABEL_SWEEP_PAGE, after, filter })).issues);
+    return { issues: page.nodes.map(newIssue).filter((issue) => issue.id && issue.createdAt), next: page.hasNextPage ? page.endCursor : null };
+  }
+
+  // The tickets with these ids, archived ones included; a deleted ticket is missing from the answer.
+  async issuesById(ids: string[]): Promise<NewIssue[]> {
+    if (!ids.length) return [];
+    const page = connection(record(await this.read(ISSUES_BY_ID_QUERY, { ids, first: ids.length })).issues);
+    return page.nodes.map(newIssue).filter((issue) => issue.id && issue.createdAt);
   }
 
   // The issue's label changes, newest first, read until a page holds one `relevant` to the caller.
