@@ -6,7 +6,7 @@ import { test, type TestContext } from "node:test";
 import type { PaseoApi } from "@getpaseo/client";
 import { parseLabelRules, type LabelRules } from "./label-rules";
 import type { CandidateIssue, CatalogLabel, IssueRelation, NewIssue } from "./linear";
-import { NewTicketCheck, NewTicketStore, SAME_AS_DELAY_MS } from "./new-ticket-check";
+import { NewTicketCheck, NewTicketStore, readCheckRules, SAME_AS_DELAY_MS } from "./new-ticket-check";
 import { AREA_REQUEST, COMMENT_HEADING } from "./new-ticket-match";
 import { RateLimitedError } from "./rate-budget";
 import type { OpenWork } from "./related-work";
@@ -311,6 +311,17 @@ test("AC-1: incomplete inputs wait up to 5 polls, then the comment names what wa
   for (let n = 0; n < 5; n++) await tick();
   assert.equal(commentsOn(world, quiet).length, 0);
   assert.equal(JSON.parse(await readFile(path, "utf8")).tickets[quiet.id].commented, true);
+});
+
+test("AC-4: without its own label-rules.json the dispatch host predicts from the laptop's copy, never over its own file", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "ntc-rules-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const path = join(dir, "label-rules.json");
+  assert.equal(await readCheckRules(path), null);
+  await writeFile(`${path}.mac-owned`, JSON.stringify({ teamKeys: ["TUC"], groups: AREA_RULES }));
+  assert.deepEqual((await readCheckRules(path))?.teamKeys, ["TUC"]);
+  await writeFile(path, JSON.stringify({ teamKeys: ["ENG"], groups: AREA_RULES }));
+  assert.deepEqual((await readCheckRules(path))?.teamKeys, ["ENG"]);
 });
 
 test("AC-1/AC-4: an invalid label-rules.json is a gap, and no Area is asked for", async (t) => {

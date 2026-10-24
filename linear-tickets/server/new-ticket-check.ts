@@ -14,7 +14,7 @@ import type { PaseoApi } from "@getpaseo/client";
 import { z } from "zod";
 import { areaLabels } from "./area-labels";
 import type { PullRequestFiles } from "./label-sync";
-import { decide, readLabelRules, resolveGroupFromCatalog, type LabelRules } from "./label-rules";
+import { decide, labelRulesPath, readLabelRules, resolveGroupFromCatalog, type LabelRules } from "./label-rules";
 import type { CatalogLabel, LinearService, NewIssue } from "./linear";
 import { filedByPaseo, findings, renderComment, sameAsReferences } from "./new-ticket-match";
 import { RateLimitedError, withPriority } from "./rate-budget";
@@ -93,6 +93,14 @@ export class NewTicketStore {
     this.queue = run.catch(() => {});
     return run;
   }
+}
+
+// The rules the Area request predicts label sync from (README, "New-ticket check"): this host's
+// label-rules.json, else the copy `label-rules.json.mac-owned` a host keeps when label sync runs on
+// the laptop only (server087), so the dispatch host predicts what the laptop's label sync will set.
+// Read only: label sync itself never reads the copy.
+export async function readCheckRules(path = labelRulesPath()): Promise<LabelRules | null> {
+  return (await readLabelRules(path)) ?? (await readLabelRules(`${path}.mac-owned`));
 }
 
 export type NewTicketCheckDeps = {
@@ -375,7 +383,7 @@ export class NewTicketCheck {
 
   // An unreadable rules file is an incomplete input, not a failed read.
   private async rules(reads: PollReads): Promise<NonNullable<PollReads["rules"]>> {
-    reads.rules ??= await (this.deps.rules ?? readLabelRules)().then((value) => ({ value }), (error: unknown) => ({ error: message(error) }));
+    reads.rules ??= await (this.deps.rules ?? readCheckRules)().then((value) => ({ value }), (error: unknown) => ({ error: message(error) }));
     return reads.rules;
   }
 

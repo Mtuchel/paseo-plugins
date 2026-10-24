@@ -1038,7 +1038,10 @@ part applies:
 - **Area:** when Linear has a workspace `Area` group, the ticket has none of its labels, and
   [label sync](#label-rules) will not set one (no rules file, no `Area` group in it, the team not in
   its `teamKeys`, or no rule matches). A ticket whose pull request files are not read yet is left to
-  label sync.
+  label sync. A host whose label sync is off because the laptop runs it keeps the laptop's rules as
+  `label-rules.json.mac-owned` next to where `label-rules.json` would be (server087 does); the check
+  predicts from that copy when the host has no `label-rules.json` of its own, so keep the copy current
+  when the laptop's rules change. Label sync never reads the copy.
 - **Not fully checked: …**, only next to another part, when something could not be read: part of
   the team's open tickets, a ticket's plan, or `label-rules.json` (then no Area is asked for). Such a
   ticket waits up to five polls for complete inputs first. A failed read (Linear unreachable) keeps it
