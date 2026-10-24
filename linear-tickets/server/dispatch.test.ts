@@ -150,7 +150,7 @@ async function groupDispatch(t: TestContext, owner: () => Promise<"here" | "else
   const directory = await mkdtemp(join(tmpdir(), "group-dispatch-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const group: IssueGroup = {
-    id: "eng-1", identifier: "ENG-1", status: "Todo", statusType: "unstarted", delegateId: null, finished: false,
+    id: "eng-1", identifier: "ENG-1", status: "Todo", statusType: "unstarted", delegateId: null, finished: false, blockedBy: [],
     children: [{ id: "eng-child", identifier: "ENG-2", status: "Todo", statusType: "unstarted", delegateId: null, finished: false, assigneeId: null, labels: [], blockers: [] }],
   };
   const linear = Object.assign(new FakeLinear({ "eng-1": ["paseo"] }), {

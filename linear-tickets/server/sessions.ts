@@ -1407,10 +1407,9 @@ export class SessionRouter {
     if (["completed", "canceled", "duplicate"].includes(group.statusType)) return end(`${parent.identifier} was moved to ${group.status}, so Paseo stopped handing out its sub-issues.`);
     if (parent.delegated && group.delegateId !== appId) return end(`Paseo was unassigned from ${parent.identifier}, so it stopped handing out sub-issues. Agents already working continue.`);
     const progress = groupProgress(group, await this.owner(), appId, await this.ownLabels());
-    const ticket = await this.deps.linear.issueState(parent.issueId);
     // Own children constrain parent completion, not handing out those same children.
     const childIdentifiers = new Set(group.children.map((child) => child.identifier));
-    const parentBlockers = ticket.blockedBy.filter((identifier) => !childIdentifiers.has(identifier));
+    const parentBlockers = group.blockedBy.filter((identifier) => !childIdentifiers.has(identifier));
     const ownerTasks = progress.ownerTasks.filter((child) => !child.finished).map((child) => child.identifier);
     const childrenFinished = progress.members.every((child) => child.finished);
     const blockers = [...parentBlockers, ...(childrenFinished ? ownerTasks : [])];
@@ -1448,7 +1447,7 @@ export class SessionRouter {
         }
       }
       if (handedOut && await this.parentMayAct(parent.issueId) && (await this.parents.get(parent.issueId))?.phase !== "closed") {
-        const moved = await this.deps.linear.moveToStateNamed(parent.issueId, CODING_STATE, ticket).catch((error: unknown) => {
+        const moved = await this.deps.linear.moveToStateNamed(parent.issueId, CODING_STATE).catch((error: unknown) => {
           if (error instanceof RateLimitedError) throw error;
           return { changed: false, note: error instanceof Error ? error.message : String(error) };
         });

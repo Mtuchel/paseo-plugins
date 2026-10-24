@@ -266,6 +266,7 @@ type ContinuationDeps = Partial<Pick<ConstructorParameters<typeof SessionRouter>
 // before each send is recorded.
 function harness(options: { owner?: (issueId: string) => Promise<"here" | "elsewhere" | "unknown">; route?: ActivationSink; now?: () => number; pending?: AgentPermissionRequest[]; activeAgent?: { id: string; title: string } | null; snapshot?: () => Promise<unknown>; attach?: boolean; needsYou?: NeedsYouIssues; delegate?: (issueId: string, to: string) => Promise<void>; groups?: Record<string, IssueGroup>; blockedBy?: Record<string, string[]>; reload?: ((agentId: string) => Promise<void>) | null; send?: () => Promise<void>; agents?: ProcessAgent[]; processInspector?: ProcessInspector; processLiveness?: typeof ticketProcessLiveness; checked?: boolean; answer?: () => Promise<void>; directory?: string; manual?: boolean; budget?: RateBudget; api?: AgentApi; linear?: RouterLinear; admission?: (issueId: string, paseo: PaseoApi, settings: PluginSettings, read?: AdmissionState) => Promise<{ ok: true } | { ok: false; reason: string }>; decideReview?: (url: string, approve: boolean, feedback: string, agentId: string) => Promise<void>; decidePlan?: (link: SessionLink, mode: "later" | "split") => Promise<string | null> } & ContinuationDeps = {}) {
   const calls: Call[] = [];
+  const stateReads: string[] = [];
   const api = {
     activity: async (sessionId: string, content: { type: string; body?: string }, extra: { options?: { value: string }[] } = {}) => { calls.push(`${content.type}:${content.body ?? ""}${extra.options ? ` [${extra.options.map((o) => o.value).join("|")}]` : ""}`); },
     updateSession: async () => {},
@@ -324,10 +325,14 @@ function harness(options: { owner?: (issueId: string) => Promise<"here" | "elsew
       comment: async () => {}, hasComment: async () => false, userUrl: async () => "https://linear.app/owner",
       addLabel: async (_id: string, name: string) => { calls.push(`+${name}`); }, removeLabel: async (_id: string, name: string) => { calls.push(`-${name}`); },
       complete: async (id: string) => { calls.push(`complete ${id}`); }, cancel: async (id: string, reason: string) => { calls.push(`cancel ${id}: ${reason.split("\n")[0]}`); },
-      issueState: async (id: string) => ({ id, status: "Todo", statusType: "unstarted", blockedBy: options.blockedBy?.[id] ?? [] }) as IssueState,
+      issueState: async (id: string) => { stateReads.push(id); return { id, status: "Todo", statusType: "unstarted", blockedBy: options.blockedBy?.[id] ?? [] } as IssueState; },
       issueStatus: async () => ({ status: "Todo", statusType: "unstarted" }),
       admissionStates: async (ids: string[]) => new Map(ids.map((id) => [id, { id, status: "Todo", statusType: "unstarted", blockedBy: options.blockedBy?.[id] ?? [] } as AdmissionState])),
-      issueGroup: async (id: string) => options.groups?.[id] ?? { id, identifier: "TUC-1", status: "Todo", statusType: "unstarted", delegateId: "paseo-app", finished: false, children: [] },
+      // The parent's blockers come with its group read, as the real `issueGroup` returns them.
+      issueGroup: async (id: string) => {
+        const group = options.groups?.[id] ?? { id, identifier: "TUC-1", status: "Todo", statusType: "unstarted", delegateId: "paseo-app", finished: false, blockedBy: [], children: [] };
+        return { ...group, blockedBy: options.blockedBy?.[id] ?? group.blockedBy };
+      },
       moveToStateNamed: async (id: string, name: string) => { calls.push(`move ${id} to ${name}`); return { changed: true }; },
       delegate: options.delegate ?? (async (id: string, to: string) => { calls.push(`delegate ${id} to ${to}`); }),
     },
@@ -355,7 +360,7 @@ function harness(options: { owner?: (issueId: string) => Promise<"here" | "elsew
   if (options.groups || options.manual) Object.assign(router, { paseo });
   else if (options.attach ?? true) router.attach(paseo);
   router.stop();
-  return { router, store, replies, answered, calls, paseo, directory, cleanup: async () => { await replies.stop(); await rm(directory, { recursive: true, force: true }); } };
+  return { router, store, replies, answered, calls, stateReads, paseo, directory, cleanup: async () => { await replies.stop(); await rm(directory, { recursive: true, force: true }); } };
 }
 
 const link = (change: Partial<SessionLink> = {}): SessionLink => ({ sessionId: "s1", agentId: "agent-1", issueId: "i1", identifier: "TUC-1", createdAt: "2026-01-01T00:00:00Z", handled: [], review: null, offer: null, ...change });
@@ -527,7 +532,7 @@ test("a stalled ticket is started again with a new agent and thread: its errored
 });
 
 const child = (identifier: string, change: Partial<GroupChild> = {}): GroupChild => ({ id: identifier.toLowerCase(), identifier, status: "Todo", statusType: "unstarted", delegateId: null, finished: false, assigneeId: null, labels: [], blockers: [], ...change });
-const parent = (children: GroupChild[], change: Partial<IssueGroup> = {}): IssueGroup => ({ id: "i1", identifier: "TUC-1", status: "Todo", statusType: "unstarted", delegateId: "paseo-app", finished: false, children, ...change });
+const parent = (children: GroupChild[], change: Partial<IssueGroup> = {}): IssueGroup => ({ id: "i1", identifier: "TUC-1", status: "Todo", statusType: "unstarted", delegateId: "paseo-app", finished: false, blockedBy: [], children, ...change });
 const blocker = (identifier: string, change: Partial<GroupChild> = {}) => ({ id: identifier.toLowerCase(), identifier, status: "Todo", statusType: "unstarted", delegateId: null, finished: false, ...change });
 
 test("assigning a parent with open sub-issues hands out the open ones nobody else has instead of starting an agent, and says what each waits for", async () => {
@@ -553,7 +558,7 @@ test("assigning a parent with open sub-issues hands out the open ones nobody els
   await h.cleanup();
 });
 
-test("a blocked parent hands out nothing until its blockers finish; unassigning Paseo stops the group", async () => {
+test("a blocked parent hands out nothing until its blockers finish, read with its group; unassigning Paseo stops the group", async () => {
   const blockedBy: Record<string, string[]> = { i1: ["TUC-9"] };
   const groups = { i1: parent([child("TUC-2")]) };
   const h = harness({ groups, blockedBy });
@@ -561,8 +566,10 @@ test("a blocked parent hands out nothing until its blockers finish; unassigning 
   assert.ok(!h.calls.some((call) => call.startsWith("delegate ")));
   assert.deepEqual((await h.router.parentProgress("i1"))?.blockers, ["TUC-9"]);
   blockedBy.i1 = [];
+  const before = h.stateReads.length;
   await h.router.advanceGroups();
   assert.deepEqual(h.calls.filter((call) => call.startsWith("delegate ")), ["delegate tuc-2 to paseo-app"]);
+  assert.equal(h.stateReads.length, before, "the sweep decides the parent's blockers on its group read, with no ticket state read");
   groups.i1 = parent([child("TUC-2", { delegateId: "paseo-app" })], { delegateId: null });
   await h.router.advanceGroups();
   assert.equal((await h.router.parentProgress("i1"))?.phase, "closed");

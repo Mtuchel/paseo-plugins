@@ -641,10 +641,12 @@ function finishedIssue(node: Record<string, unknown>): boolean {
 }
 
 // A parent and its sub-issues, for handing the group to Paseo (groups.ts): each sub-issue's
-// assignee, delegate (the Paseo app once handed out), labels and blockers.
+// assignee, delegate (the Paseo app once handed out), labels and blockers. The parent's own
+// blockers are read as ISSUE_STATE_QUERY reads them, so the group sweep needs no issueState read.
 export const ISSUE_GROUP_QUERY = `query issueGroup($id: String!, $after: String) {
   issue(id: $id) {
     id identifier state { name type } delegate { id }
+    inverseRelations(first: 50) { nodes { type issue { identifier state { name type } attachments(first: 25) { nodes { url sourceType metadata } } } } }
     children(first: 50, after: $after) {
       pageInfo { hasNextPage endCursor }
       nodes {
@@ -664,7 +666,8 @@ export const ISSUE_GROUP_LABELS_QUERY = `query issueGroupLabels($id: String!, $a
 }`;
 export type GroupIssue = { id: string; identifier: string; status: string; statusType: string; delegateId: string | null; finished: boolean };
 export type GroupChild = GroupIssue & { assigneeId: string | null; labels: string[]; blockers: GroupIssue[] };
-export type IssueGroup = GroupIssue & { children: GroupChild[] };
+// `blockedBy`: the parent's unfinished blockers, exactly as `IssueState.blockedBy`.
+export type IssueGroup = GroupIssue & { blockedBy: string[]; children: GroupChild[] };
 
 // A connection read that authorizes work or evidence: absent nodes or pagination metadata is not
 // an empty last page. Track returned cursors per connection so a failed traversal never returns a
@@ -712,11 +715,7 @@ function issueStatusOf(data: Record<string, unknown>): Pick<IssueState, "status"
 function parseIssueState(issue: Record<string, unknown>): IssueState {
   const state = record(issue.state ?? {});
   const attachmentUrls = connection(issue.attachments ?? { nodes: [] }).nodes.map((node) => label(record(node).url)).filter(Boolean);
-  const blockedBy = connection(issue.inverseRelations ?? { nodes: [] }).nodes.map((node) => record(node))
-    .filter((relation) => label(relation.type) === "blocks")
-    .map((relation) => record(relation.issue ?? {}))
-    .filter((blocker) => !finishedIssue(blocker))
-    .map((blocker) => label(blocker.identifier)).filter(Boolean);
+  const blockedBy = unfinishedBlockers(issue);
   const unblocks = connection(issue.relations ?? { nodes: [] }).nodes.map((node) => record(node))
     .filter((relation) => label(relation.type) === "blocks" && !["completed", "canceled", "duplicate"].includes(label(record(record(relation.relatedIssue ?? {}).state ?? {}).type))).length;
   return {
@@ -726,6 +725,15 @@ function parseIssueState(issue: Record<string, unknown>): IssueState {
     priority: typeof issue.priority === "number" ? issue.priority : 0, createdAt: label(issue.createdAt), unblocks,
     queueBlocker: label(issue.title).startsWith(QUEUE_BLOCKER_TITLE_PREFIX),
   };
+}
+
+// Identifiers of the unfinished tickets that block this one (merged reviews count as finished).
+function unfinishedBlockers(issue: Record<string, unknown>): string[] {
+  return connection(issue.inverseRelations ?? { nodes: [] }).nodes.map((node) => record(node))
+    .filter((relation) => label(relation.type) === "blocks")
+    .map((relation) => record(relation.issue ?? {}))
+    .filter((blocker) => !finishedIssue(blocker))
+    .map((blocker) => label(blocker.identifier)).filter(Boolean);
 }
 export type IssueMetadata = Pick<IssueState, "id" | "identifier" | "labels">;
 
@@ -2012,6 +2020,7 @@ export class LinearService {
     const children = new Map<string, GroupChild>();
     const cursors = new Set<string>();
     let parent: GroupIssue | null = null;
+    let blockedBy: string[] | null = null;
     let after: string | null = null;
     do {
       const data = record(await this.read(ISSUE_GROUP_QUERY, { id, after }, (found) => Boolean(found.issue && typeof found.issue === "object")));
@@ -2020,6 +2029,7 @@ export class LinearService {
       const current = groupIssue(issue);
       if (!current.id || (parent && current.id !== parent.id)) throw new Error("Linear returned inconsistent group identity.");
       parent ??= current;
+      blockedBy ??= unfinishedBlockers(issue);
       const page = strictPage(issue.children, `${parent.identifier}'s children`, cursors);
       for (const node of page.nodes) {
         const child = record(node);
@@ -2039,7 +2049,7 @@ export class LinearService {
       after = page.after;
     } while (after);
     // Lowest number first: the order they were filed in, and the order they are handed out.
-    return { ...parent, children: [...children.values()].sort((a, b) => a.identifier.localeCompare(b.identifier, undefined, { numeric: true })) };
+    return { ...parent, blockedBy: blockedBy ?? [], children: [...children.values()].sort((a, b) => a.identifier.localeCompare(b.identifier, undefined, { numeric: true })) };
   }
 
   private async groupChildLabels(id: string, identifier: string, first: unknown): Promise<string[]> {
