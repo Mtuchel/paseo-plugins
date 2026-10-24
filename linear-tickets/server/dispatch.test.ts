@@ -338,18 +338,21 @@ test("disabled dispatch, or enabled without teams, never queries Linear", async 
   }
 });
 
-test("the new-ticket check is the last pass of every poll, and its rate limit pauses the poll", async (t) => {
+test("the new-ticket check runs before the steward in every poll, and its rate limit pauses the poll", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
   const order: string[] = [];
   let limited = false;
   const pass = (name: string) => ({ tick: async () => { order.push(name); if (name === "new-tickets" && limited) throw new RateLimitedError("app", Date.now() + 60_000); } });
+  const steward = { ...pass("steward"), ownerRetried: () => false, tickQueueBlockers: async () => {} };
   const linear = new FakeLinear({});
-  const dispatcher = new Dispatcher({ linear, starter: new TicketStarter({ linear, launcher: { start: async () => ({ agentId: "a", warnings: [] }) }, branches: async () => ({ branches: [], defaultBranch: "refs/heads/main" }) }), launcher: new Launcher(linear as never), settings: { read: async () => baseSettings }, projects: pass("projects"), catchUp: pass("catch-up"), newTickets: pass("new-tickets") });
+  const dispatcher = new Dispatcher({ linear, starter: new TicketStarter({ linear, launcher: { start: async () => ({ agentId: "a", warnings: [] }) }, branches: async () => ({ branches: [], defaultBranch: "refs/heads/main" }) }), launcher: new Launcher(linear as never), settings: { read: async () => baseSettings }, projects: pass("projects"), catchUp: pass("catch-up"), newTickets: pass("new-tickets"), steward: steward as never });
   dispatcher.attach(fakePaseo());
   await dispatcher.tick();
-  assert.deepEqual(order, ["projects", "catch-up", "new-tickets"]);
+  assert.deepEqual(order, ["projects", "catch-up", "new-tickets", "steward"]);
+  order.length = 0;
   limited = true;
   await dispatcher.tick();
+  assert.deepEqual(order, ["projects", "catch-up", "new-tickets"]);
   assert.match(dispatcher.snapshot().lastError ?? "", /^paused/);
 });
 

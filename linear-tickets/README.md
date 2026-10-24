@@ -1032,8 +1032,11 @@ ticket is not listed again for that plan. The state lives in
 **New-ticket check.** A ticket filed in a dispatch team gets one look when it is filed, while
 merging or rewording it is still cheap ([`server/new-ticket-check.ts`](server/new-ticket-check.ts),
 rules in [`server/new-ticket-match.ts`](server/new-ticket-match.ts)). It runs on the dispatch host
-(`dispatch.enabled`, not forwarding to a peer) as the last pass of every dispatch poll, for the
-dispatch teams only, and checks tickets filed after its first run; older tickets are never checked.
+(`dispatch.enabled`, not forwarding to a peer) in every dispatch poll, after the catch-up of older
+plans and before the ticket steward, for the dispatch teams only, and checks tickets filed after its
+first run; older tickets are never checked. It runs before the steward because it reads little: as
+the last pass it hardly ever ran, since the steward had spent the background room by then and the
+poll paused before it.
 The poll that first sees a new ticket compares it with the team's open tickets and approved plans,
 the same read the candidate list uses, and posts at most one comment as the Paseo app, only when a
 part applies:
