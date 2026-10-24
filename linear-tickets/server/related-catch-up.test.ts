@@ -9,6 +9,7 @@ import { modelProblem } from "../shared/plan-model";
 import { parsePlanSections } from "../shared/plan-sections";
 import { layoutProblem } from "../shared/plan-layout";
 import { RELATED_WORK_TAG, blockLines, parseBlock } from "../shared/work-order";
+import { RateLimitedError } from "./rate-budget";
 import { type ApprovedPlanInfo, type ChangedSinceEntry, type ChangedSinceQuery, relatedWorkHeader } from "./related-work";
 import type { RelationsOutcome } from "./plan-relations";
 import {
@@ -178,7 +179,8 @@ async function room(t: TestContext) {
   const sessions: string[] = [];
   const archived: string[] = [];
   const parked = new Set<string>();
-  const fail = { document: 0, comment: 0, create: 0, start: 0 };
+  // `limitedRead` / `limitedStart`: how many plan-document reads / starts Linear's budget refuses.
+  const fail = { document: 0, comment: 0, create: 0, start: 0, limitedRead: 0, limitedStart: 0 };
 
   // `failing`: how many `file` rounds of that record are refused before it writes.
   const relations = (() => {
@@ -276,7 +278,23 @@ async function room(t: TestContext) {
 
   const related: RelatedCatchUpDeps["related"] = {
     approvedPlans: async () => [...approvals].sort((left, right) => right.approvedAt.localeCompare(left.approvedAt)),
-    changedSince: async (query: ChangedSinceQuery) => { queries.push(query); return changes.get(query.identifier) ?? []; },
+    planDocuments: async (from: number) => {
+      calls.push("planDocuments");
+      if (fail.limitedRead > 0) { fail.limitedRead--; throw new RateLimitedError("key", now + HOUR, "reserve"); }
+      const list = [...documents].flatMap(([issueId, list]) => {
+        const issue = issues.get(issueId);
+        return issue ? list.filter((document) => document.title.startsWith("Plan: ")).map((document) => ({
+          id: document.url, title: document.title, url: document.url, content: document.content, updatedAt: new Date(now).toISOString(),
+          issue: { id: issue.id, identifier: issue.identifier, url: `https://linear.app/tuc/issue/${issue.identifier}`, project: "" },
+        })) : [];
+      });
+      return { from, list };
+    },
+    changedSinceAll: async (teamId: string, batch: Omit<ChangedSinceQuery, "teamId">[]) => {
+      calls.push(`changedSinceAll ${batch.length}`);
+      queries.push(...batch.map((query) => ({ ...query, teamId })));
+      return new Map(batch.map((query) => [query.issueId, changes.get(query.identifier) ?? []]));
+    },
   };
 
   const storePath = join(directory, "related-catch-up.json");
@@ -287,6 +305,7 @@ async function room(t: TestContext) {
     startTicket: async (issueId: string, _paseo: PaseoApi, _settings: PluginSettings, options: { retryHint: string; lead: string }) => {
       starts.push({ issueId, brief: options.lead });
       if (fail.start > 0) { fail.start--; throw new Error("the launch failed"); }
+      if (fail.limitedStart > 0) { fail.limitedStart--; throw new RateLimitedError("app", now + HOUR, "reserve"); }
       const agentId = `agent-${agents.length + 1}`;
       agents.push({ id: agentId, status: "running", labels: { "linear.issueId": issueId }, createdAt: new Date(now).toISOString() });
       return { agentId };
@@ -383,6 +402,36 @@ test("a failed start is retried and never files a second ticket", async (t) => {
   await r.tick(11 * MINUTE);
   assert.equal(r.creates.length, 1, "the retry files nothing new");
   assert.equal(r.starts.length, 2);
+  assert.equal((await r.state())?.planner?.agentId, "agent-1");
+});
+
+test("the brief reads the listed plans' changes once per run, not once per plan or per waiting start", async (t) => {
+  const r = await room(t);
+  r.approve(1, oldPlan("TUC-1"));
+  r.approve(2, oldPlan("TUC-2"), "2026-01-02 09:00");
+  r.approve(3, oldPlan("TUC-3"), "2026-01-03 09:00");
+  r.fail.limitedStart = 2;
+
+  await r.tick();
+  await r.tick(11 * MINUTE);
+  await r.tick(11 * MINUTE);
+  assert.equal(r.starts.length, 3, "each start Linear's budget refused is tried again");
+  assert.equal((await r.state())?.planner?.agentId, "agent-1");
+  assert.deepEqual(r.calls.filter((call) => /^(planDocuments|changedSinceAll|issueDocument)/.test(call)), ["planDocuments", "changedSinceAll 3"]);
+});
+
+test("Linear's budget refusing the brief's reads files nothing, and the next pass files and starts once", async (t) => {
+  const r = await room(t);
+  r.approve(1, oldPlan("TUC-1"));
+  r.fail.limitedRead = 1;
+
+  await r.tick();
+  assert.equal(r.creates.length, 0, "no ticket is filed with a brief Linear refused");
+  assert.equal(r.starts.length, 0);
+
+  await r.tick(11 * MINUTE);
+  assert.equal(r.creates.length, 1);
+  assert.equal(r.starts.length, 1);
   assert.equal((await r.state())?.planner?.agentId, "agent-1");
 });
 

@@ -8,7 +8,7 @@ import { normalizeIssue } from "./context";
 import { PullRequestFiles, type PullRequestRead } from "./label-sync";
 import { Launcher } from "./launch";
 import type { CandidateIssue, DoneIssue, Pages, PlanDocument } from "./linear";
-import { CANDIDATE_PULL_REQUEST_READS, CANDIDATE_TTL_MS, composePlan, PRECEDENCE_RULE, relatedWorkDocument, RelatedWork } from "./related-work";
+import { CANDIDATE_PULL_REQUEST_READS, CANDIDATE_TTL_MS, composePlan, PRECEDENCE_RULE, relatedWorkDocument, RelatedWork, type ChangedSinceEntry } from "./related-work";
 import { DEFAULT_WORKTREE_SHARDS, DEFAULT_ACTIVATION, DEFAULT_BACKSTOP, DEFAULT_DISPATCH, DEFAULT_WRITEBACK, DEFAULT_WATCHDOG, DEFAULT_STEWARD, DEFAULT_DEPUTY, type PluginSettings } from "./settings";
 import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
 import { planFootprint } from "../shared/plan-footprint";
@@ -364,4 +364,40 @@ test("openWork rejects while the open tickets cannot be read, and the next call 
   now += CANDIDATE_TTL_MS + 1;
   await related.openWork("team-1");
   assert.equal(calls.teamCandidates.length, 3);
+});
+
+test("changedSinceAll reads the team once for several plans, and each plan keeps only what changed since its own approval", async () => {
+  const planOf = (n: number, at: string) => `> **Approved** in Plannotator on ${at} UTC for TUC-${n}.\n\n# Plan\n\nChange \`server/x.ts\`.\n`;
+  const older = { issueId: "i1", identifier: "TUC-1", plan: documentPlanText(planOf(1, "2026-10-05 09:00")), approved: planOf(1, "2026-10-05 09:00") };
+  const newer = { issueId: "i2", identifier: "TUC-2", plan: documentPlanText(planOf(2, "2026-10-12 09:00")), approved: planOf(2, "2026-10-12 09:00") };
+  // TUC-3 is approved and TUC-4 is done between the two approvals; TUC-5's pull request merges after both.
+  const plans: PlanDocument[] = [{
+    id: "d3", title: "Plan: TUC-3", url: "https://linear.app/doc/d3", content: planOf(3, "2026-10-08 09:00"), updatedAt: "2026-10-08T09:01:00Z",
+    issue: { id: "i3", identifier: "TUC-3", url: "https://linear.app/x/issue/TUC-3", project: "App" },
+  }];
+  const done: DoneIssue[] = [{
+    id: "i4", identifier: "TUC-4", title: "Done between", completedAt: "2026-10-09T00:00:00Z", pullRequests: [],
+    planDocuments: [{ id: "d4", title: "Plan: TUC-4", url: "https://linear.app/doc/d4", content: planOf(4, "2026-10-01 09:00"), updatedAt: "2026-10-01T09:01:00Z" }],
+  }];
+  const open = [candidate(1), candidate(2), candidate(3), candidate(5, { status: "In Review", pullRequests: [pr(5)] })];
+  const pullRequests = {
+    refresh: async () => undefined,
+    filesOf: (url: string) => url === pr(5) ? ["o/r/server/x.ts"] : null,
+    stateOf: (url: string) => url === pr(5) ? { state: "MERGED", mergedAt: "2026-10-14T00:00:00Z" } : null,
+  };
+  const shared = fakeLinear(open, {}, done, plans);
+  const results = await new RelatedWork({ linear: shared.linear, pullRequests, now: () => NOW }).changedSinceAll("team-1", [older, newer]);
+  assert.equal(shared.calls.teamCandidates.length, 1, "one read of the open tickets");
+  assert.deepEqual(shared.calls.doneSince, ["2026-10-05T09:00:00.000Z"], "one read of the done tickets, from the oldest approval");
+  assert.deepEqual(shared.calls.planDocumentsSince, ["2026-10-04T09:00:00.000Z"], "one read of the plan documents, a day before the oldest approval");
+
+  const kinds = (entries: ChangedSinceEntry[] | Error | undefined) => Array.isArray(entries) ? entries.map((entry) => `${entry.kind} ${entry.identifier}`) : entries;
+  assert.deepEqual(kinds(results.get("i1")), ["merged TUC-5", "approved TUC-3", "approved TUC-4"]);
+  assert.deepEqual(kinds(results.get("i2")), ["merged TUC-5"], "what changed before TUC-2's approval is not TUC-2's");
+  // Each plan's answer is the one changedSince gives it alone.
+  for (const query of [older, newer]) {
+    const alone = fakeLinear(open, {}, done, plans);
+    const single = await new RelatedWork({ linear: alone.linear, pullRequests, now: () => NOW }).changedSince({ ...query, teamId: "team-1" });
+    assert.deepEqual(results.get(query.issueId), single);
+  }
 });
