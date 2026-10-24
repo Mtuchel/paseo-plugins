@@ -6,7 +6,7 @@ import { footprintOverlap, planFootprint, sameFile, type FootprintOverlap, type 
 import { hasSection, REACH_SECTION, reachBody } from "../shared/plan-sections";
 import { parseBlock, RELATED_WORK_TAG } from "../shared/work-order";
 import type { PullRequestFiles } from "./label-sync";
-import type { CandidateIssue, DoneIssue, LinearService, Pages } from "./linear";
+import type { CandidateIssue, DoneIssue, LinearService, Pages, PlanDocument } from "./linear";
 import { PLANNING_STATE, planStage } from "./plan-policy";
 import { withPriority } from "./rate-budget";
 import { approvalInterval, approvedDocument, documentPlanHash, documentPlanText, planHash } from "./review-outcome";
@@ -88,6 +88,8 @@ export type ChangedSinceEntry =
   | { kind: "merged"; identifier: string; status: string; url: string; mergedAt: string; files: string[] }
   | { kind: "approved"; identifier: string; status: string | null; approvedAt: number; completedAt: string | null; overlap: FootprintOverlap };
 export type ChangedSinceQuery = { issueId: string; identifier: string; teamId: string; plan: string; approved: string };
+// `Plan:` documents updated at or after `from` (epoch ms), as `planDocuments` read them.
+export type PlanDocuments = { from: number; list: PlanDocument[] };
 // A team's open work as the new-ticket check reads it (README, "New-ticket check"): the open
 // tickets, the files each approved plan names, and the plan documents that could not be read.
 export type OpenWork = { open: Pages<CandidateIssue>; plans: { identifier: string; files: string[] }[]; unreadPlans: string[] };
@@ -233,20 +235,14 @@ export class RelatedWork {
   // approval counts when its latest bound reaches `since`, so a legacy minute header approved in
   // that minute counts too. `planDocumentsSince` starts a day early, the widest header's window.
   async approvedSince(issueId: string, since: number, plan: string | PlanFootprint, identifier: string | null = null): Promise<ApprovalOverlap[]> {
-    const documents = await withPriority("background", "related work", () => this.deps.linear.planDocumentsSince(new Date(since - DAY_MS).toISOString()));
+    const documents = await this.planDocuments(since - DAY_MS);
     // The approval coordinator holds a claim's footprint rather than its plan text.
-    const own = typeof plan === "string" ? planFootprint(plan, identifier) : plan;
-    const overlaps: ApprovalOverlap[] = [];
-    for (const document of documents) {
-      if (!document.issue || document.issue.id === issueId || document.issue.identifier === identifier) continue;
-      if (!approvedDocument(document.content)) continue;
-      const approved = approvalInterval(document.content, document.updatedAt);
-      if (!approved || approved[1] < since) continue;
-      const overlap = footprintOverlap(own, planFootprint(composePlan(document.content, document.relatedWork ?? null), document.issue.identifier));
-      if (!overlap.files.length && !overlap.places.length && !overlap.tickets.length && !overlap.namesOther) continue;
-      overlaps.push({ identifier: document.issue.identifier, approvedAt: approved[0], overlap });
-    }
-    return overlaps.sort((a, b) => b.approvedAt - a.approvedAt);
+    return overlapsSince(documents.list, issueId, since, typeof plan === "string" ? planFootprint(plan, identifier) : plan, identifier);
+  }
+
+  // The `Plan:` documents updated at or after `from` (epoch ms), read at background priority.
+  async planDocuments(from: number): Promise<PlanDocuments> {
+    return { from, list: await withPriority("background", "related work", () => this.deps.linear.planDocumentsSince(new Date(from).toISOString())) };
   }
 
   // What changed since a source plan was approved (README, "Related work"): the approved plans
@@ -254,26 +250,63 @@ export class RelatedWork {
   // ticket done since it whose plan overlaps, each at its own instant, newest first. The cutoff is
   // the source plan's earliest bound: a plan cannot contradict itself.
   async changedSince(query: ChangedSinceQuery): Promise<ChangedSinceEntry[]> {
-    const cutoff = approvalInterval(query.approved)?.at(0);
-    if (cutoff === undefined) throw new Error(`${query.identifier}: the plan document has no approval time`);
-    if (!query.teamId) throw new Error(`${query.identifier}: the ticket's team is unknown`);
-    const since = new Date(cutoff).toISOString();
-    const [approvals, open, done] = await Promise.all([
-      this.approvedSince(query.issueId, cutoff, query.plan, query.identifier),
-      this.deps.linear.teamCandidates(query.teamId),
-      this.deps.linear.doneSince(query.teamId, since),
+    const result = (await this.changedSinceAll(query.teamId, [query])).get(query.issueId);
+    if (result instanceof Error) throw result;
+    return result ?? [];
+  }
+
+  // `changedSince` for several plans of one team (README, "Catch-up of older plans"): the plan
+  // documents, the team's open tickets and its done tickets are read once, from the earliest
+  // cutoff, and each plan keeps what falls in its own window. `documents`: plan documents already
+  // read, used when they reach back far enough. A shared read that fails rejects the call; a plan
+  // whose own part fails (no approval time, an unreadable done plan) gets its Error.
+  async changedSinceAll(teamId: string, queries: Omit<ChangedSinceQuery, "teamId">[], documents?: PlanDocuments): Promise<Map<string, ChangedSinceEntry[] | Error>> {
+    const results = new Map<string, ChangedSinceEntry[] | Error>();
+    const valid: { query: Omit<ChangedSinceQuery, "teamId">; cutoff: number }[] = [];
+    for (const query of queries) {
+      const cutoff = approvalInterval(query.approved)?.at(0);
+      if (cutoff === undefined) results.set(query.issueId, new Error(`${query.identifier}: the plan document has no approval time`));
+      else if (!teamId) results.set(query.issueId, new Error(`${query.identifier}: the ticket's team is unknown`));
+      else valid.push({ query, cutoff });
+    }
+    if (!valid.length) return results;
+    const earliest = Math.min(...valid.map(({ cutoff }) => cutoff));
+    const [plans, open, done] = await Promise.all([
+      documents && documents.from <= earliest - DAY_MS ? documents : this.planDocuments(earliest - DAY_MS),
+      this.deps.linear.teamCandidates(teamId),
+      this.deps.linear.doneSince(teamId, new Date(earliest).toISOString()),
     ]);
+    // A lone plan's own pull requests are its plan being carried out, so they are not read for it.
+    const alone = valid.length === 1 ? valid[0].query.issueId : null;
+    const urls = [...open.items, ...done.items].filter((issue) => issue.id !== alone).flatMap((issue) => issue.pullRequests);
+    await this.deps.pullRequests.refresh(urls, CANDIDATE_PULL_REQUEST_READS).catch(() => undefined);
+    // The done tickets' plan documents come with the ticket (linear.ts `doneSince`); only one
+    // Linear answered empty is read here.
+    const unread = done.items.flatMap((issue) => issue.planDocuments.filter((document) => document.title === `Plan: ${issue.identifier}` && !document.content));
+    const texts = unread.length ? await this.documentTexts(unread) : new Map<string, string>();
+    for (const { query, cutoff } of valid) {
+      try {
+        results.set(query.issueId, this.changesOf(query, cutoff, plans.list, open, done, texts));
+      } catch (error) {
+        results.set(query.issueId, error instanceof Error ? error : new Error(String(error)));
+      }
+    }
+    return results;
+  }
+
+  // One plan's part of `changedSinceAll`, from reads that may reach further back than its cutoff.
+  private changesOf(query: Omit<ChangedSinceQuery, "teamId">, cutoff: number, documents: PlanDocument[], open: Pages<CandidateIssue>, done: Pages<DoneIssue>, texts: Map<string, string>): ChangedSinceEntry[] {
     const own = planFootprint(query.plan, query.identifier);
+    const approvals = overlapsSince(documents.filter((document) => Date.parse(document.updatedAt) >= cutoff - DAY_MS), query.issueId, cutoff, own, query.identifier);
+    const doneSince = done.items.filter((issue) => Date.parse(issue.completedAt) >= cutoff);
     // A ticket is open or done, never both; the done list adds the completion time. The ticket's own
     // pull requests are its plan being carried out (a later slice of the same plan), not a change to it.
     const tickets = [
       ...open.items.map((issue) => ({ id: issue.id, identifier: issue.identifier, status: issue.status as string | null, completedAt: null as string | null, pullRequests: issue.pullRequests })),
-      ...done.items.map((issue) => ({ id: issue.id, identifier: issue.identifier, status: "Done" as string | null, completedAt: issue.completedAt as string | null, pullRequests: issue.pullRequests })),
+      ...doneSince.map((issue) => ({ id: issue.id, identifier: issue.identifier, status: "Done" as string | null, completedAt: issue.completedAt as string | null, pullRequests: issue.pullRequests })),
     ].filter((ticket) => ticket.id !== query.issueId);
     const known = new Map(tickets.map((ticket) => [ticket.identifier, ticket]));
     const entries: ChangedSinceEntry[] = approvals.map((approval) => ({ kind: "approved", identifier: approval.identifier, status: known.get(approval.identifier)?.status ?? null, approvedAt: approval.approvedAt, completedAt: known.get(approval.identifier)?.completedAt ?? null, overlap: approval.overlap }));
-    const urls = tickets.flatMap((ticket) => ticket.pullRequests);
-    await this.deps.pullRequests.refresh(urls, CANDIDATE_PULL_REQUEST_READS).catch(() => undefined);
     for (const ticket of tickets) for (const url of ticket.pullRequests) {
       const state = this.deps.pullRequests.stateOf(url);
       if (state?.state !== "MERGED" || !state.mergedAt || Date.parse(state.mergedAt) < cutoff) continue;
@@ -283,11 +316,7 @@ export class RelatedWork {
     // Tickets done since the cutoff whose plan also overlaps, whether or not it was approved since.
     const byTicket = new Map<string, Extract<ChangedSinceEntry, { kind: "approved" }>>();
     for (const entry of entries) if (entry.kind === "approved") byTicket.set(entry.identifier, entry);
-    // The done tickets' plan documents come with the ticket (linear.ts `doneSince`); only one
-    // Linear answered empty is read here.
-    const donePlans = done.items.flatMap((issue) => issue.planDocuments.filter((document) => document.title === `Plan: ${issue.identifier}`).map((document) => ({ issue, document })));
-    const unread = donePlans.filter(({ document }) => !document.content);
-    const texts = unread.length ? await this.documentTexts(unread.map(({ document }) => document)) : new Map<string, string>();
+    const donePlans = doneSince.flatMap((issue) => issue.planDocuments.filter((document) => document.title === `Plan: ${issue.identifier}`).map((document) => ({ issue, document })));
     for (const { issue, document } of donePlans) {
       if (issue.id === query.issueId) continue;
       const content = document.content || texts.get(document.id);
@@ -383,4 +412,20 @@ function doneSection(done: Pages<DoneIssue> | Error, since: string): string {
     completeness(done.complete, `Linear had more done tickets than the plugin reads; search Linear for those completed since ${since.slice(0, 10)}.`),
     ...done.items.map((issue) => `- ${issue.identifier} — ${issue.title} (done ${issue.completedAt.slice(0, 10)})`),
   ].join("\n");
+}
+
+// The approved plans among `documents` of tickets other than `issueId` whose approval reaches
+// `since` (its latest bound) and whose footprint overlaps `own`, newest approval first.
+function overlapsSince(documents: PlanDocument[], issueId: string, since: number, own: PlanFootprint, identifier: string | null): ApprovalOverlap[] {
+  const overlaps: ApprovalOverlap[] = [];
+  for (const document of documents) {
+    if (!document.issue || document.issue.id === issueId || document.issue.identifier === identifier) continue;
+    if (!approvedDocument(document.content)) continue;
+    const approved = approvalInterval(document.content, document.updatedAt);
+    if (!approved || approved[1] < since) continue;
+    const overlap = footprintOverlap(own, planFootprint(composePlan(document.content, document.relatedWork ?? null), document.issue.identifier));
+    if (!overlap.files.length && !overlap.places.length && !overlap.tickets.length && !overlap.namesOther) continue;
+    overlaps.push({ identifier: document.issue.identifier, approvedAt: approved[0], overlap });
+  }
+  return overlaps.sort((a, b) => b.approvedAt - a.approvedAt);
 }

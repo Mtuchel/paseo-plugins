@@ -982,6 +982,16 @@ look, never with a second ticket, and an agent that stops without a plan is rest
 times, then you get one comment on the catch-up ticket. A catch-up waiting for your review, parked
 or not, is never restarted.
 
+What changed since each approval costs the same few Linear reads however many plans are listed: the
+plan documents saved since a day before the oldest listed approval, the team's open tickets and the
+tickets done since that approval are read once, and each listed plan keeps only what changed since
+its own approval. A listed plan whose `Plan:` document is missing from that read is read alone; a
+read that fails leaves the changes unknown in the brief, without a read per plan. The brief written
+into the ticket is kept in memory and reused by that run's starts for 30 minutes, so a start that is
+retried reads nothing again; a brief with an unknown entry is not kept. When Linear's budget refuses
+these reads (background work paused or the key's limit hit), nothing is filed or started and no
+restart is counted; the next look tries again.
+
 Its plan follows your planning instructions' parts. After the last part come the usual `## Reach`,
 `## Principles and rules`, `## Verification`, `## Model` and `## Risk and impact` (a fixed text the
 brief gives: impact 2, `data-fix`, recommendation owner), then `## Listed tickets` with one

@@ -26,7 +26,7 @@ import type { ParkedPlans } from "./parked";
 import type { PlanRelations } from "./plan-relations";
 import { PlannerTickets, plannerRecoverySchema, type PlannerRecord, type PlannerRestart, type PlannerStore, type PlannerTarget } from "./planner-tickets";
 import type { ProcessInspector } from "./process-liveness";
-import { withPriority } from "./rate-budget";
+import { RateLimitedError, withPriority } from "./rate-budget";
 import { documentPlanHash, documentPlanText, planHash } from "./review-outcome";
 import { PRECEDENCE_RULE, relatedWorkDocument, relatedWorkHeader, type ApprovedPlanInfo, type ChangedSinceEntry, type RelatedWork } from "./related-work";
 import type { PluginSettings, Settings } from "./settings";
@@ -44,6 +44,9 @@ const DECLINED_GAP_MS = 7 * 24 * 60 * 60_000;
 // Closed catch-up ids kept for `isCatchUp`: a review of an old one is rare, and the open one is
 // always there.
 const CLOSED_KEEP = 50;
+// How long a complete catch-up brief is reused for its run's next start attempts.
+const BRIEF_TTL_MS = 30 * 60_000;
+const DAY_MS = 24 * 60 * 60_000;
 const FINISHED: Record<string, true> = { completed: true, canceled: true, duplicate: true };
 // A catch-up section writes links only (D5): no hold label and no duplicate closing.
 const CATCH_UP_KINDS: Record<string, true> = { blocks: true, relates: true, replan: true };
@@ -105,7 +108,7 @@ export type RelatedCatchUpDeps = {
   linear: Pick<LinearService,
     | "teamIdByKey" | "issueCore" | "issueDocument" | "upsertDocumentAsApp" | "commentAsApp"
     | "createIssueAsApp" | "complete" | "viewerId" | "trustedAppIds">;
-  related: Pick<RelatedWork, "approvedPlans" | "changedSince">;
+  related: Pick<RelatedWork, "approvedPlans" | "planDocuments" | "changedSinceAll">;
   relations: Pick<PlanRelations, "file" | "outcome">;
   // Starts the catch-up ticket's planning agent (TicketStarter.start) and opens its Linear thread.
   startTicket: (issueId: string, paseo: PaseoApi, settings: PluginSettings, options: { retryHint: string; lead: string }) => Promise<{ agentId: string }>;
@@ -308,6 +311,8 @@ export class RelatedCatchUp {
   private readonly store: CatchUpStore;
   private readonly operations = new Map<string, Promise<unknown>>();
   private lastPoll = Number.NEGATIVE_INFINITY;
+  // The last complete brief of each team's run (`brief`).
+  private readonly briefs = new Map<string, { runId: string; at: number; text: string }>();
 
   constructor(private readonly deps: RelatedCatchUpDeps) {
     this.store = deps.store ?? new CatchUpStore();
@@ -477,7 +482,7 @@ export class RelatedCatchUp {
       issueId: plan.issueId, identifier: plan.identifier, title: plan.title, status: plan.status,
       planHash: plan.planHash, approvedAt: plan.approvedAt, hasReach: plan.hasReach,
     }));
-    const changes = await this.changes(teamId, listed);
+    const { changes, complete } = await this.changes(teamId, listed);
     const brief = catchUpBrief(listed, changes);
     const count = listed.length;
     const title = `Catch up the related work of ${count} approved plan${count === 1 ? "" : "s"}`;
@@ -500,30 +505,55 @@ export class RelatedCatchUp {
     // (`revive`), never with a second ticket.
     const opened = await this.plannerStore(teamId).open(run, { planner: null, lastClosed: null, closedIds: [], covered: {} });
     if (!opened.opened) return;
+    // The description is the run's brief (`brief` rebuilds the same text from the record).
+    if (complete) this.briefs.set(teamId, { runId: run.id, at: this.now(), text: brief });
     console.log(`[linear-tickets] catch-up ${run.identifier}: filed for ${count} approved plan${count === 1 ? "" : "s"}`);
     await this.tickets(teamId).launch(this.target(teamId, run), run, settings, paseo);
   }
 
   // What changed since each listed plan's approval, read from its `Plan:` document (the cutoff is
-  // the approval in its header). A failed read leaves that ticket's changes unknown rather than
-  // failing the whole brief: the agent then compares itself.
-  private async changes(teamId: string, listed: CatchUpListed[]): Promise<Record<string, ChangedSinceEntry[]>> {
-    const changes: Record<string, ChangedSinceEntry[]> = {};
+  // the approval in its header). One read of the plan documents from the oldest listed approval
+  // covers every listed plan's own document (saved at or after its approval); a plan missing from
+  // it is read alone. The team's open and done tickets are then read once for all of them
+  // (RelatedWork `changedSinceAll`). A failed read leaves those tickets' changes unknown rather
+  // than failing the whole brief: the agent then compares itself. Linear's budget refusing a read
+  // fails the brief instead, so the start waits for the next pass. `complete`: nothing failed.
+  private async changes(teamId: string, listed: CatchUpListed[]): Promise<{ changes: Record<string, ChangedSinceEntry[]>; complete: boolean }> {
+    const changes: Record<string, ChangedSinceEntry[]> = Object.fromEntries(listed.map((entry) => [entry.issueId, []]));
+    let complete = true;
+    const failed = (what: string) => (error: unknown) => {
+      if (error instanceof RateLimitedError) throw error;
+      console.error(`[linear-tickets] catch-up: ${what} could not be read: ${message(error)}`);
+      complete = false;
+      return null;
+    };
+    if (!listed.length) return { changes, complete };
+    const approvals = listed.map((entry) => Date.parse(entry.approvedAt)).filter(Number.isFinite);
+    const documents = approvals.length
+      ? await this.deps.related.planDocuments(Math.min(...approvals) - DAY_MS).catch(failed("the listed plans' documents"))
+      : null;
+    if (approvals.length && !documents) return { changes, complete };
+    const queries: { issueId: string; identifier: string; plan: string; approved: string }[] = [];
     for (const entry of listed) {
-      const document = await this.deps.linear.issueDocument(entry.issueId, `Plan: ${entry.identifier}`).catch(() => null);
-      if (!document) { changes[entry.issueId] = []; continue; }
-      changes[entry.issueId] = await this.deps.related.changedSince({
-        issueId: entry.issueId, identifier: entry.identifier, teamId,
-        plan: documentPlanText(document.content), approved: document.content,
-      }).catch((error: unknown) => {
-        console.error(`[linear-tickets] catch-up: what changed since ${entry.identifier}'s approval could not be read: ${message(error)}`);
-        return [];
-      });
+      const title = `Plan: ${entry.identifier}`;
+      const document = documents?.list.find((found) => found.issue?.id === entry.issueId && found.title === title)
+        ?? await this.deps.linear.issueDocument(entry.issueId, title).catch(failed(`${entry.identifier}'s plan document`));
+      if (document) queries.push({ issueId: entry.issueId, identifier: entry.identifier, plan: documentPlanText(document.content), approved: document.content });
     }
-    return changes;
+    const results = queries.length ? await this.deps.related.changedSinceAll(teamId, queries, documents ?? undefined).catch(failed("what changed since the listed approvals")) : null;
+    for (const query of queries) {
+      const result = results?.get(query.issueId);
+      if (result instanceof Error) failed(`what changed since ${query.identifier}'s approval`)(result);
+      else if (result) changes[query.issueId] = result;
+    }
+    return { changes, complete };
   }
 
+  // A complete brief is kept for its run for BRIEF_TTL_MS, so a start that waits (Linear's budget,
+  // a repair) and is retried every pass does not read every listed plan's changes again.
   private async brief(teamId: string, record: CatchUpRecord): Promise<string> {
+    const kept = this.briefs.get(teamId);
+    if (kept && kept.runId === record.id && this.now() - kept.at < BRIEF_TTL_MS) return kept.text;
     const listed = record.listed.flatMap((issueId) => {
       const section = record.outcomes[issueId];
       return section ? [{
@@ -531,7 +561,11 @@ export class RelatedCatchUp {
         planHash: section.planHash, approvedAt: section.approvedAt, hasReach: section.hasReach,
       }] : [];
     });
-    return catchUpBrief(listed, await this.changes(teamId, listed));
+    const { changes, complete } = await this.changes(teamId, listed);
+    const text = catchUpBrief(listed, changes);
+    if (complete) this.briefs.set(teamId, { runId: record.id, at: this.now(), text });
+    else this.briefs.delete(teamId);
+    return text;
   }
 
   // The run lifecycle's view of one team (planner-tickets.ts): the open catch-up and its record.
