@@ -415,7 +415,7 @@ async function passFixture(t: any, over: {
         if (!issue || !issue.childrenComplete) throw new Error("Complete group evidence unavailable");
         return {
           id: issue.id, identifier: issue.identifier, status: issue.status, statusType: issue.statusType,
-          delegateId: issue.delegateId, finished: false,
+          delegateId: issue.delegateId, finished: false, blockedBy: [],
           children: issue.children.map((child) => ({ ...child, finished: child.statusType === "completed", labels: [], blockers: [] })),
         };
       },
@@ -1631,7 +1631,7 @@ test("parent verification uses complete group membership beyond the steward inve
       id: `c${index}`, identifier: `ENG-${index + 2}`, status: "Done", statusType: "completed",
       delegateId: null, assigneeId: null, finished: true, labels: [], blockers: [],
     }));
-    const group: IssueGroup = { id: "i1", identifier: "ENG-1", status: "In Progress", statusType: "started", delegateId: "app1", finished: false, children };
+    const group: IssueGroup = { id: "i1", identifier: "ENG-1", status: "In Progress", statusType: "started", delegateId: "app1", finished: false, blockedBy: [], children };
     const f = await passFixture(t, {
       issues: [ticketIssue({ children: children.slice(0, 50), childrenComplete: false })],
       parents: [parentProgress({ children: children.map((child) => ({ issueId: child.id, identifier: child.identifier, status: child.status, finished: true })) })],

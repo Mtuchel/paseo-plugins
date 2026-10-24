@@ -4135,6 +4135,14 @@ No tokens, query bodies or ticket text appear in the report.
   return is read alone, and a failed batch fails each thread's check as its own read did. The
   per-thread order, gates and outcomes are unchanged, and the states are as fresh as before: read
   in the same pass. Dispatch, activation and the session paths still read the ticket themselves.
+- **The group sweep reads each open parent once a minute, blockers included.** Each sweep steps
+  every parent whose group is not closed. It used to read the group (`issueGroup`, 84 points) and
+  then the parent alone (`issueState`, 498 points) only for its external blockers: on server087 on
+  2026-10-24, seven open parents made `session-sweep.groups` 550–690 app and 200–290 key requests
+  an hour. The group read now carries the parent's blocking relations, decided by the same rule
+  (Done, Canceled, Duplicate, or in review with its pull requests merged, count as finished), so
+  the sweep no longer reads the parent alone. Blockers are as fresh as before: read
+  in the same step. Moving the parent to In Progress after a hand-out reads its state itself.
 - **Status moves, turn write-backs and the PR watch read the ticket without its relations**
   (TUC-1324). The full `issueState` read (every blocker with its pull requests and what the
   ticket blocks) is kept for decisions on dependencies: queue admission and the other readers

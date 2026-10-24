@@ -61,6 +61,26 @@ test("issueGroup reads every child and label page, retaining late owner labels a
   assert.equal(group.children[74].statusType, "unstarted");
 });
 
+test("issueGroup carries the parent's unfinished blockers exactly as issueState decides them, from its first page", async () => {
+  const inverseRelations = { nodes: [
+    { type: "blocks", issue: { identifier: "TUC-8", state: { name: "In Progress", type: "started" }, attachments: { nodes: [] } } },
+    { type: "blocks", issue: { identifier: "TUC-9", state: { name: "Done", type: "completed" }, attachments: { nodes: [] } } },
+    { type: "blocks", issue: { identifier: "TUC-11", state: { name: "In Review", type: "started" }, attachments: { nodes: [{ url: "https://github.com/o/r/pull/1", sourceType: "github", metadata: { status: "merged" } }] } } },
+    { type: "related", issue: { identifier: "TUC-10", state: { name: "Todo", type: "unstarted" }, attachments: { nodes: [] } } },
+  ] };
+  const { linear } = service(undefined, (query, variables) => {
+    if (query === ISSUE_STATE_QUERY) return { issue: { ...issue, inverseRelations } };
+    assert.equal(query, ISSUE_GROUP_QUERY);
+    return { issue: variables.after === null
+      ? { ...issue, inverseRelations, children: groupConnection([groupChild(2)], "next") }
+      : { ...issue, inverseRelations: { nodes: [] }, children: groupConnection([groupChild(3)]) } };
+  });
+  const single = await linear.issueState("i1");
+  const group = await linear.issueGroup("i1");
+  assert.deepEqual(group.blockedBy, single.blockedBy);
+  assert.deepEqual(group.blockedBy, ["TUC-8"], "open blockers only: done and merged-review blockers are finished");
+});
+
 test("explicit last-page metadata accepts exactly 50 children and exactly 20 labels without a size heuristic", async () => {
   const labels = Array.from({ length: 20 }, (_, index) => ({ name: `label-${index}` }));
   const children = Array.from({ length: 50 }, (_, index) => ({ ...groupChild(index + 2), labels: groupConnection(labels) }));
