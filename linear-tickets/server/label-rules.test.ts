@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { chosenByHand, decide, globToRegExp, parseLabelRules, planLabelChanges, SETTLE_MS, type LabelEvent, type ResolvedGroup, type SweptIssue } from "./label-rules";
+import { chosenByHand, decide, globToRegExp, parseLabelRules, planLabelChanges, resolveGroupFromCatalog, SETTLE_MS, type LabelEvent, type ResolvedGroup, type SweptIssue } from "./label-rules";
 
 const NOW = Date.parse("2026-10-02T12:00:00.000Z");
 const OLD = new Date(NOW - SETTLE_MS - 1).toISOString();
@@ -118,4 +118,22 @@ test("a label counts as chosen by hand unless the latest change to the group's l
   assert.equal(chosenByHand([event("2026-10-02", "mirko", [], ["sales"])], group, false, plugin), true, "a person removed it: none stays");
   assert.equal(chosenByHand([], group, true, plugin), true, "set when the issue was created");
   assert.equal(chosenByHand([], group, false, plugin), false);
+});
+
+test("a group resolved from the catalog keeps the workspace labels the sync would use and leaves out missing ones", () => {
+  const label = (id: string, name: string, over: { isGroup?: boolean; parentId?: string | null; teamId?: string | null } = {}) => ({ id, name, isGroup: false, parentId: null, teamId: null, ...over });
+  const catalog = [
+    label("team-area", "Area", { isGroup: true, teamId: "team-1" }),
+    label("area", "area", { isGroup: true }),
+    label("quality", "QUALITY", { parentId: "area" }),
+    label("sales", "Sales"),
+    label("platform", "Platform", { teamId: "team-1" }),
+    label("by-hand", "Docs", { parentId: "area" }),
+  ];
+  const group = resolveGroupFromCatalog(RULES, catalog, "Area");
+  assert.equal(group?.id, "area", "the workspace group, not the team's of the same name");
+  assert.deepEqual(group?.labels.map((entry) => [entry.rule.name, entry.id]), [["Quality", "quality"], ["Sales", "sales"]], "an ungrouped label is moved in by the sync; a team label and a missing one are left out");
+  assert.deepEqual(group?.members, ["quality", "by-hand", "sales"]);
+  assert.equal(resolveGroupFromCatalog(RULES, catalog, "Type"), null, "Linear has no Type group yet");
+  assert.equal(resolveGroupFromCatalog(RULES, catalog, "Priority"), null, "the rules have no such group");
 });

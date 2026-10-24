@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
+import type { CatalogLabel } from "./linear";
 import { paseoHome } from "./ticket-mcp";
 
 // Label groups the plugin keeps current on every issue of some teams: one label per group and issue
@@ -141,6 +142,25 @@ export type Reason = "pull requests" | "parent" | "project" | "keywords";
 export type Decision = { labelId: string; reason: Reason };
 // Changed files of a pull request as "owner/repo/path"; null while unknown (not read, or the read failed).
 export type FilesOf = (url: string) => string[] | null;
+// The rules' group of that name as the label sync would resolve it from the workspace labels, without
+// creating or moving anything: names match case-insensitively, a configured label counts when it
+// exists in the group or ungrouped (the sync moves that one in), and one that does not exist yet is
+// left out. null when the rules have no such group or Linear has no group label of that name.
+export function resolveGroupFromCatalog(rules: LabelRules, catalog: CatalogLabel[], groupName: string): ResolvedGroup | null {
+  const rule = rules.groups.find((group) => group.name.toLowerCase() === groupName.toLowerCase());
+  if (!rule) return null;
+  const workspace = catalog.filter((entry) => !entry.teamId);
+  const named = (name: string, group: boolean) => workspace.find((entry) => entry.isGroup === group && entry.name.toLowerCase() === name.toLowerCase());
+  const groupId = named(rule.name, true)?.id;
+  if (!groupId) return null;
+  const labels: ResolvedGroup["labels"] = [];
+  for (const label of rule.labels) {
+    const existing = named(label.name, false);
+    if (existing && (existing.parentId === groupId || !existing.parentId)) labels.push({ rule: label, id: existing.id });
+  }
+  const members = [...new Set([...workspace.filter((entry) => entry.parentId === groupId).map((entry) => entry.id), ...labels.map((entry) => entry.id)])];
+  return { rule, id: groupId, labels, members };
+}
 
 // Changes to Linear's labels take effect after Linear's 3-minute creation window: changes inside it
 // leave no history, so a label the plugin set then would later look as if a person had set it.
