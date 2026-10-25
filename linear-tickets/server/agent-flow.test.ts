@@ -871,6 +871,57 @@ test("a queued thread whose ticket already has a running agent is linked to it i
   await h.cleanup();
 });
 
+test("two waiting threads of one ticket start one agent in a pass: the second is linked to the agent the first started", async () => {
+  const starts: string[] = [];
+  const listed: { id: string; title: string }[] = [];
+  // The directory's normal live cache: what the second thread lists must not predate the start.
+  const agentDirectory = new AgentDirectory();
+  const h = routerHarness([], {
+    api: { activity: async () => {}, openSessions: async () => [], activities: async () => [], sessionStatus: async () => "stale", sessionStatuses: async () => new Map() } as never,
+    linear: { viewerId: async () => OWNER, addLabel: async () => {}, removeLabel: async () => {}, complete: async () => {}, admissionStates: async (ids: string[]) => new Map(ids.map((id) => [id, { id, statusType: "unstarted", status: "Todo" }])) } as never,
+    starter: {
+      admission: async () => ({ ok: true as const }),
+      start: async (id: string) => {
+        starts.push(id);
+        listed.push({ id: "fresh", title: "Started for q1" });
+        return { agentId: "fresh", warnings: [], provider: "omp", target: "repo", resumed: false, untrusted: false, plan: null };
+      },
+    },
+    agentDirectory,
+  }, listed);
+  agentDirectory.attach(h.paseo);
+  await h.store.put({ ...link, sessionId: "q1", agentId: null, queued: true });
+  await h.store.put({ ...link, sessionId: "q2", agentId: null, queued: true, createdAt: "2026-01-02T00:00:00Z" });
+  await h.router.startQueued();
+  assert.deepEqual(starts, ["i1"]);
+  assert.deepEqual([(await h.store.get("q2"))?.agentId, (await h.store.get("q2"))?.queued], ["fresh", false]);
+  await h.cleanup();
+});
+
+test("a cached listing that misses the ticket's running agent starts no second one; the next pass links to it", async () => {
+  const starts: string[] = [];
+  const listed: { id: string; title: string }[] = [];
+  const agentDirectory = new AgentDirectory();
+  const h = routerHarness([], {
+    api: { activity: async () => {}, openSessions: async () => [], activities: async () => [], sessionStatus: async () => "stale", sessionStatuses: async () => new Map() } as never,
+    linear: { viewerId: async () => OWNER, addLabel: async () => {}, removeLabel: async () => {}, complete: async () => {}, admissionStates: async (ids: string[]) => new Map(ids.map((id) => [id, { id, statusType: "unstarted", status: "Todo" }])) } as never,
+    starter: { admission: async () => ({ ok: true as const }), start: async (id: string) => { starts.push(id); throw new Error("unused"); } },
+    agentDirectory,
+  }, listed);
+  agentDirectory.attach(h.paseo);
+  await agentDirectory.all();
+  // Started elsewhere after the directory listed the daemon, before anything invalidated it.
+  listed.push({ id: "elsewhere", title: "Started by dispatch" });
+  await h.store.put({ ...link, sessionId: "q1", agentId: null, queued: true });
+  await h.router.startQueued();
+  assert.deepEqual(starts, []);
+  assert.deepEqual([(await h.store.get("q1"))?.agentId, (await h.store.get("q1"))?.queued], [null, true]);
+  await h.router.startQueued();
+  assert.deepEqual(starts, []);
+  assert.deepEqual([(await h.store.get("q1"))?.agentId, (await h.store.get("q1"))?.queued], ["elsewhere", false]);
+  await h.cleanup();
+});
+
 test("a parked plan's thread offers no resume when its agent is retired, and starts a fresh agent once the owner decided", async () => {
   const starts: string[] = [];
   const h = routerHarness([], {
