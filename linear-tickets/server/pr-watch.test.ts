@@ -117,9 +117,9 @@ const CRASH = "OMP RPC process is closed";
 const CRASHED = { status: "error", lastError: CRASH, pendingPermissions: [] };
 const RESTARTED = { status: "idle", lastError: CRASH, pendingPermissions: [] };
 
-// A real SessionRouter on a fake Paseo daemon with one agent: its snapshot is `agent`, a reload
-// (`reload <id>` in the calls) sets it to `reloaded`, and a send is recorded like the fake
-// router's prompts (`send` runs first and may throw).
+// A real SessionRouter on a fake Paseo daemon whose agents a1–a3 all have the snapshot `agent`:
+// a reload (`reload <id>` in the calls) sets it to `reloaded`, and a send is recorded like the fake
+// router's prompts (`send` runs first and may throw). The live listing is read anew on every call.
 function crashDaemon(t: TestContext, calls: string[]) {
   const daemon = { agent: CRASHED as Record<string, unknown>, reloaded: RESTARTED as Record<string, unknown>, send: async () => {}, router: null as unknown as SessionRouter };
   let held = false;
@@ -127,8 +127,9 @@ function crashDaemon(t: TestContext, calls: string[]) {
   const directory = mkdtempSync(join(tmpdir(), "paseo-pr-watch-crash-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const replies = new PermissionReplies({ directory, daemon: async () => null });
+  const agentDirectory = new AgentDirectory({ liveTtlMs: 0 });
   daemon.router = new SessionRouter({
-    agentDirectory: new AgentDirectory(),
+    agentDirectory,
     launcher: { gate: () => {
       if (held) return null;
       held = true;
@@ -139,10 +140,15 @@ function crashDaemon(t: TestContext, calls: string[]) {
     parents: new ParentStore(directory),
     reloader: async () => async (agentId: string) => { calls.push(`reload ${agentId}`); daemon.agent = daemon.reloaded; },
   } as never);
-  Object.assign(daemon.router, { paseo: { agents: {
+  const paseo = { agents: {
     ref: (id: string) => ({ refresh: async () => ({ agent: daemon.agent }), send: async (text: string) => { await daemon.send(); calls.push(`prompt ${id}\n${text}`); } }),
-    list: async () => ({ entries: [], pageInfo: { hasMore: false, nextCursor: null } }),
-  } } });
+    list: async (input: { filter?: { includeArchived?: boolean; labels?: Record<string, string> } }) => ({
+      entries: input.filter?.labels ? [] : ["a1", "a2", "a3"].map((id) => ({ agent: { ...daemon.agent, id } })),
+      pageInfo: { hasMore: false, nextCursor: null },
+    }),
+  } };
+  Object.assign(daemon.router, { paseo });
+  agentDirectory.attach(paseo as never);
   return daemon;
 }
 

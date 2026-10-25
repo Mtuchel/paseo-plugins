@@ -2766,7 +2766,9 @@ and ghosts on 2026-10-09; the plugin's own connection archives them by id.
 for example "OMP RPC process is closed") receives no message. Crash recovery runs in every
 two-minute poll of the pull request watch, right after the watchdog and before any pull request
 work, whatever the background Linear budget says: background work being paused does not hold it
-back. It covers every crashed agent of a ticket with a running record, open pull request or not.
+back. It covers every crashed agent of a ticket with a running record, open pull request or not;
+the shared agent listing (at most 20 seconds old) names them, and each is read again before it is
+judged.
 A crashed agent is restarted the way `paseo agent reload` does it, keeping its conversation and
 worktree, and then gets one message that names the crash, tells it to run `git status` and finish
 or abort an interrupted rebase, and says "Your ticket … is in …. Continue the lifecycle step you
@@ -6029,7 +6031,11 @@ Every daemon request the plugin makes is counted per caller and request kind; on
 (an archived listing is its own kind, `agents.list[archived]`). The periodic readers that only list
 agents share one directory instead of polling on their own timers: live agents are cached for 20
 seconds, the archived index for 10 minutes, and an agent created or archived drops the live cache
-at once.
+at once. An agent that leaves the live listing is read once on its own and added to the archived
+index (or dropped from it, when deleted) instead of rescanning the whole archived listing; more
+than 50 at once, or a read that fails, rescans it. Crash recovery asks the live listing which
+agents are crashed and reads only those again, so a crash shows up within one poll after the
+listing sees it.
 Work that starts, claims or decides ownership still reads the daemon directly, so a decision never
 runs on a cached list. Only the Paseo project listing a start resolves its project and shard pool
 from is shared for a minute (the daemon describes every project through its git queue for each

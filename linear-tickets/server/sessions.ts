@@ -1751,9 +1751,14 @@ export class SessionRouter {
     return "sent";
   }
 
-  // The crashed process of an existing, unarchived agent (its last error), else null.
+  // The crashed process of an existing, unarchived agent (its last error), else null. The crash
+  // pass asks this for every running record each poll, so the shared live listing answers first:
+  // only an agent it shows crashed is read again (to judge its current state), and one it lacks is
+  // archived or deleted. A crash newer than that listing is seen on a later poll.
   async crashed(agentId: string | null): Promise<string | null> {
     if (!this.paseo || agentId === null) return null;
+    const listed = (await this.deps.agentDirectory.live()).find((agent) => agent.id === agentId);
+    if (!listed || !crashedProcess(listed)) return null;
     const found = await this.agent(agentId);
     return found ? crashedProcess(found.agent) : null;
   }

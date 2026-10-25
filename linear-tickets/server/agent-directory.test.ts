@@ -19,7 +19,9 @@ function daemon() {
     live: [] as Agent[],
     archived: [] as Agent[],
     calls: [] as Call[],
+    reads: [] as string[],
     failure: null as null | "no-page-info" | "repeat-cursor" | "throw",
+    readFailure: false,
     gate: null as Promise<void> | null,
   };
   const paseo = {
@@ -38,6 +40,15 @@ function daemon() {
         const nextCursor = hasMore ? (state.failure === "repeat-cursor" ? String(limit) : String(start + limit)) : null;
         return { entries, pageInfo: { hasMore, nextCursor } };
       },
+      // One agent read: null for an agent the daemon no longer has.
+      ref: (id: string) => ({
+        refresh: async () => {
+          state.reads.push(id);
+          if (state.readFailure) throw new Error("daemon unavailable");
+          const found = [...state.live, ...state.archived].find(agent => agent.id === id);
+          return found ? { agent: { ...found } } : null;
+        },
+      }),
     },
   } as unknown as PaseoApi;
   return { state, paseo, scans: (archived: boolean) => state.calls.filter(call => call.includeArchived === archived && !call.cursor).length };
@@ -185,7 +196,7 @@ test("all() reports each agent once and the live record wins over an archived on
   assert.equal(all[0]!.labels.k, "live");
 });
 
-test("an agent that leaves the live listing is found in all() without waiting for the archived index to expire", async () => {
+test("an agent that leaves the live listing is read once into all(), without rescanning the archived listing", async () => {
   const d = daemon(), c = clock();
   d.state.live = [agent("a1"), agent("a2"), agent("a3")];
   const directory = new AgentDirectory({ now: c.now, liveTtlMs: 20_000, archivedTtlMs: 600_000 });
@@ -200,11 +211,13 @@ test("an agent that leaves the live listing is found in all() without waiting fo
   const all = await directory.all();
   assert.deepEqual(ids(all), ["a1", "a2"]);
   assert.equal(all.find(agent => agent.id === "a2")!.archivedAt, "2026-10-23T20:00:00.000Z");
-  assert.equal(d.scans(true), 2, "the dropped agents made the archived index stale");
+  assert.deepEqual(d.state.reads.sort(), ["a2", "a3"]);
+  assert.equal(d.scans(true), 1, "the departures were read one by one, not by an archived rescan");
 
   c.advance(20_000);
-  await directory.all();
-  assert.equal(d.scans(true), 2, "no further archived scan while nothing else left the live listing");
+  assert.deepEqual(ids(await directory.all()), ["a1", "a2"]);
+  assert.equal(d.state.reads.length, 2, "an agent is read once, when it leaves");
+  assert.equal(d.scans(true), 1);
 });
 
 test("a live() reader alone also notices agents that left, so a later all() still includes them", async () => {
@@ -219,6 +232,22 @@ test("a live() reader alone also notices agents that left, so a later all() stil
   c.advance(20_000);
   await directory.live(); // the drop is seen here, not by all()
   c.advance(1);
+  assert.deepEqual(ids(await directory.all()), ["a1", "a2"]);
+  assert.deepEqual(d.state.reads, ["a2"]);
+});
+
+test("a departure that cannot be read fails that reader, and the next all() rescans the archived listing", async () => {
+  const d = daemon(), c = clock();
+  d.state.live = [agent("a1"), agent("a2")];
+  const directory = new AgentDirectory({ now: c.now, liveTtlMs: 20_000, archivedTtlMs: 600_000 });
+  directory.attach(d.paseo);
+  await directory.all();
+
+  d.state.live = [agent("a1")];
+  d.state.archived = [agent("a2", "2026-10-23T20:00:00.000Z")];
+  d.state.readFailure = true;
+  c.advance(20_000);
+  await assert.rejects(directory.all(), /daemon unavailable/);
   assert.deepEqual(ids(await directory.all()), ["a1", "a2"]);
   assert.equal(d.scans(true), 2);
 });
