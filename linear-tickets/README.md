@@ -337,9 +337,11 @@ a write. Multi-request tools can still partly complete before a later hold.
 
 | Scope | Write (as Paseo) |
 | --- | --- |
-| The agent's own ticket | comment, status (not Plan review or Plan approved), links, relations, manual tasks; evidence files (also on the ticket's sub-issues) |
-| Issues the agent created with `create_issue` | comment, status (not Plan review or Plan approved), links, relations, title and description |
-| Any other issue | comment and relations only |
+| The agent's own ticket | comment, status (not Plan review or Plan approved), links, relations (add and remove), manual tasks; evidence files (also on the ticket's sub-issues) |
+| Issues the agent created with `create_issue` | comment, status (not Plan review or Plan approved), links, relations (add and remove), title and description |
+| Any other issue | comment and relations only (from the own ticket or a created issue) |
+
+On any issue, an agent may also edit the comments it posted itself.
 
 Deleting or archiving issues, changing another issue's status, assignee or priority, and project,
 team or label settings are not possible. The server checks every target itself, so the limits hold
@@ -353,6 +355,11 @@ agent's own ticket):
 - `get_comments` — an issue's full comment history, 50 per page (pass the returned `nextCursor`
   as `cursor`), including the comments a long ticket's snapshot left out;
 - `add_comment` — post a Markdown comment, on any issue;
+- `edit_comment` — replace the body of a comment this agent posted (with `add_comment` or as a
+  `set_status` reason), on any issue. Only comments recorded under
+  `$PASEO_HOME/linear-tickets/agent-comments/<ticket>/` qualify: Linear shows every agent's
+  comments as Paseo, so the author alone would let one ticket's agent rewrite another's. Anyone
+  else's comment stays as written, and the agent posts a new one;
 - `set_status` — move the ticket (or an issue the agent created) to another state of its team by
   name; a canceled or duplicate state needs a `reason`, posted on the issue before the move. The
   team's **Needs input** state cannot be set: it is Paseo's owner-wait state, opened only together
@@ -374,6 +381,9 @@ agent's own ticket):
   attachment;
 - `add_relation` — relate the ticket (or an issue the agent created) to any issue: related,
   blocks, blocked by or duplicate of;
+- `remove_relation` — remove such a relation, named the same way (`blocked_by` is the other
+  issue's "blocks" onto this one; `related` matches whichever side created it). A relation that
+  is already gone returns `removed: false` instead of an error, so a retry is harmless;
 - `create_issue` — file a follow-up, related to the ticket (or blocking it, or blocked by it), or a
   sub-issue of it. A follow-up is only for a substantial finding the owner should see on its own
   (a defect, a data, security or money risk, or a missing guarantee); it is created in the team's
@@ -452,9 +462,24 @@ A coding tool's own Linear connection (for example omp's Linear MCP server, sign
 writes as you. Ticket agents running omp may use only its read tools (`get_*`, `list_*`,
 `search_documentation`, `extract_images`, listed by name in
 `omp/linear-tickets-plan-first.ts`): the plugin's omp extension blocks every other tool of that
-server, called directly or through its `xd://` device, and tells the agent to use the
-`linear_ticket` tools instead. It guards against mistakes, not against an agent that sets out to
-get around it; other providers are not covered.
+server, called directly or through its `xd://` device, and the refusal names the `linear_ticket`
+tool that does the same thing as Paseo:
+
+| Owner tool | Refusal points to |
+| --- | --- |
+| `prepare_attachment_upload`, `prepare_file_upload`, `create_attachment`, `create_attachment_from_upload` | `attach_file` |
+| `save_comment` | `add_comment`; with an `id`, `edit_comment` |
+| `delete_comment` | `edit_comment` or a new `add_comment` (agents do not delete comments) |
+| `save_issue` without `id` | `create_issue` |
+| `save_issue` with `id` | by field: `state` → `set_status`; `title`, `description`, `patch` → `update_issue`; `links` → `link_url`; `blocks`, `blockedBy`, `relatedTo`, `duplicateOf` → `add_relation`; `removeBlocks`, `removeBlockedBy`, `removeRelatedTo`, `duplicateOf: null` → `remove_relation`; any other field → ask the owner |
+| `save_document` | `add_comment` on the ticket: a plan document is the record the owner approved, and only a plan review round replaces it, so agents get no document tool |
+| anything else | ask the owner |
+
+The launch note says the same up front. The owner tools stay visible to the agent: an omp
+extension can neither unmount another server's `xd://` devices nor shadow its tools (checked with
+omp 18.12.6), and turning off omp's Linear server would also take away its read tools. It guards
+against mistakes, not against an agent that sets out to get around it; other providers are not
+covered.
 
 ## Settings
 

@@ -255,9 +255,9 @@ async function scopeOf(issue) {
 }
 
 const ALLOWED = {
-  own: ["add_comment", "set_status", "link_url", "attach_file", "add_relation", "add_manual_task"],
-  created: ["add_comment", "set_status", "link_url", "add_relation", "update_issue"],
-  other: ["add_comment", "add_relation (from your ticket or an issue you created)"],
+  own: ["add_comment", "set_status", "link_url", "attach_file", "add_relation", "remove_relation", "add_manual_task"],
+  created: ["add_comment", "set_status", "link_url", "add_relation", "remove_relation", "update_issue"],
+  other: ["add_comment", "add_relation and remove_relation (from your ticket or an issue you created)"],
   read_only: [],
 };
 
@@ -265,7 +265,7 @@ const ALLOWED = {
 async function writable(ref, action) {
   const issue = await loadIssue(ref);
   const scope = await scopeOf(issue);
-  if (scope === "other") throw new Error(issue.identifier + " is neither this agent's ticket nor an issue it created, so " + action + " is not allowed there. On other issues you may only comment (add_comment) and add relations (add_relation); ask the owner for anything else.");
+  if (scope === "other") throw new Error(issue.identifier + " is neither this agent's ticket nor an issue it created, so " + action + " is not allowed there. On other issues you may only comment (add_comment) and add or remove relations from your ticket (add_relation, remove_relation); ask the owner for anything else.");
   return { issue, scope };
 }
 
@@ -285,6 +285,20 @@ async function relate(from, to, type) {
 }
 
 const RELATION_TYPES = ["related", "blocks", "blocked_by", "duplicate_of"];
+// An issue's relations with their ids, both directions, for remove_relation.
+const RELATIONS = "query relations($id: String!) { issue(id: $id) { relations(first: 100) { nodes { id type relatedIssue { id identifier } } } inverseRelations(first: 100) { nodes { id type issue { id identifier } } } } }";
+// The relation ids between from and the other issue (an identifier or ID) that match type, read as
+// add_relation reads it: "<from> blocks <other>". related is one relation whichever side created it.
+function matchingRelations(data, other, type) {
+  const node = data.issue || {};
+  const same = (candidate) => !!candidate && (candidate.id === other || String(candidate.identifier).toLowerCase() === other.toLowerCase());
+  const out = ((node.relations && node.relations.nodes) || []).filter((r) => same(r.relatedIssue));
+  const into = ((node.inverseRelations && node.inverseRelations.nodes) || []).filter((r) => same(r.issue));
+  if (type === "related") return out.concat(into).filter((r) => r.type === "related").map((r) => r.id);
+  if (type === "blocks") return out.filter((r) => r.type === "blocks").map((r) => r.id);
+  if (type === "blocked_by") return into.filter((r) => r.type === "blocks").map((r) => r.id);
+  return out.filter((r) => r.type === "duplicate").map((r) => r.id);
+}
 // Plan review and Plan approved are the plan pipeline's states, not an agent's: Paseo opens the
 // review and records the owner's decision. An agent setting either leaves a ticket whose status
 // promises a review page that does not exist (the responsibility check then reports it).
@@ -470,6 +484,25 @@ const tools = [
     },
   },
   {
+    name: "edit_comment",
+    description: "Replace the Markdown body of a comment this agent posted (with add_comment or as a set_status reason), on any issue, as Paseo. Take its id from get_comments. Comments by anyone else, other Paseo agents included, stay as written: post a new comment instead.",
+    inputSchema: { type: "object", properties: { comment: { type: "string", minLength: 1, maxLength: 100, description: "The comment's id, from get_comments." }, body: { type: "string", minLength: 1, maxLength: 20000 } }, required: ["comment", "body"], additionalProperties: false },
+    async run(input) {
+      if (COMMENTS_DIRECTORY === null) throw new Error("This server is read-only and does not write to Linear.");
+      const id = text(input.comment, "comment", 100);
+      if (!/^[A-Za-z0-9-]+$/.test(id)) throw new Error("comment must be a comment id from get_comments.");
+      const body = text(input.body, "body", 20000);
+      // Only this agent's own record proves it wrote the comment: Linear shows every agent's comments
+      // as Paseo, so the author alone would let one ticket's agent rewrite another's.
+      const record = await readFile(join(COMMENTS_DIRECTORY, id + ".json"), "utf8").then(JSON.parse, () => null);
+      if (!record || record.id !== id) throw new Error("Comment " + id + " was not posted by this agent, so it cannot be edited. Post a new comment with add_comment instead.");
+      const data = await linear("mutation editComment($id: String!, $input: CommentUpdateInput!) { commentUpdate(id: $id, input: $input) { success comment { url } } }", { id, input: { body } });
+      const result = data.commentUpdate || {};
+      if (!result.success) throw new Error("Linear did not apply the edit.");
+      return { edited: true, issue: record.identifier || undefined, url: (result.comment && result.comment.url) || null };
+    },
+  },
+  {
     name: "set_status",
     description: "Move this agent's Linear ticket, or an issue it created (issue), to another workflow state of its team, by exact state name (see get_ticket/get_issue). Plan review and Plan approved are refused: Paseo opens the plan review and records the owner's plan decision; submit the plan instead. A canceled or duplicate state needs a reason, which is posted on the issue first. \"" + NEEDS_INPUT_STATE + "\" is Paseo's owner-wait state: it is set only with a question to the owner and cleared when the answer arrives, so it cannot be set here.",
     inputSchema: { type: "object", properties: { status: { type: "string", minLength: 1, maxLength: 200 }, reason: { type: "string", minLength: 1, maxLength: 2000 }, issue: ISSUE_PROPERTY }, required: ["status"], additionalProperties: false },
@@ -575,6 +608,33 @@ const tools = [
       if (to.id === from.id) throw new Error("An issue cannot be related to itself.");
       await relate(from, to, input.type);
       return { related: true, from: from.identifier, type: input.type, issue: to.identifier };
+    },
+  },
+  {
+    name: "remove_relation",
+    description: "Remove a relation between this agent's ticket (or an issue it created, from) and another issue, named as add_relation names it: related, blocks, blocked_by or duplicate_of, read as \"<from> blocks <issue>\". get_issue lists an issue's relations. Relations between two other issues stay: ask the owner.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        issue: { ...ISSUE_PROPERTY, description: "The other issue, identifier such as ENG-123." },
+        type: { type: "string", enum: RELATION_TYPES },
+        from: { ...ISSUE_PROPERTY, description: "This agent's ticket (default) or an issue it created." },
+      },
+      required: ["issue", "type"],
+      additionalProperties: false,
+    },
+    async run(input) {
+      if (!RELATION_TYPES.includes(input.type)) throw new Error("type must be one of: " + RELATION_TYPES.join(", "));
+      const other = text(input.issue, "issue", 100);
+      const { issue: from } = await writable(input.from, "removing relations from it");
+      const ids = matchingRelations(await linear(RELATIONS, { id: from.id }), other, input.type);
+      // Nothing to remove is the state the call asks for (a retry after an unclear answer lands here).
+      if (!ids.length) return { removed: false, from: from.identifier, type: input.type, issue: other, note: "No such relation; get_issue lists the relations " + from.identifier + " has." };
+      for (const id of ids) {
+        const data = await linear("mutation unrelate($id: String!) { issueRelationDelete(id: $id) { success } }", { id });
+        if (!data.issueRelationDelete || !data.issueRelationDelete.success) throw new Error("Linear did not remove the relation.");
+      }
+      return { removed: true, from: from.identifier, type: input.type, issue: other };
     },
   },
   {
@@ -782,7 +842,7 @@ async function handle(message) {
       serverInfo: { name: "linear-ticket", version: "1.0.0" },
       instructions: readOnly
         ? "Reads cover any Linear issue: search with search_issues, then open one with get_issue. This server is read-only and writes nothing to Linear."
-        : "Reads cover any Linear issue. Writes go out as Paseo: comments and relations on any issue; status and links on the ticket this agent was launched from and the issues it created; evidence files (attach_file) on the ticket and its sub-issues; title and description only on the issues it created.",
+        : "Reads cover any Linear issue. Writes go out as Paseo: comments and relations on any issue (relations from the ticket this agent was launched from or an issue it created), and edits of the comments this agent posted; status and links on that ticket and the issues it created; evidence files (attach_file) on the ticket and its sub-issues; title and description only on the issues it created.",
     });
   }
   if (method === "ping") return reply({});
