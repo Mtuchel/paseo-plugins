@@ -655,6 +655,35 @@ test("refreshing peer reviews does not announce the same waiting review again", 
     sendPush: async (_subscription, message) => { sent.push(message.title); } });
 });
 
+test("a peer stays listed while its answer is read again, and is withheld only once that answer is a minute old", async t => {
+  const originalFetch = globalThis.fetch;
+  const gate = new EventEmitter();
+  let hold = false;
+  let clock = Date.parse("2026-01-01T10:00:00Z");
+  t.mock.method(globalThis, "fetch", async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+    if (String(input) !== "https://peer.test/api/inbox") return originalFetch(input, init);
+    if (hold) { gate.emit("entered"); await once(gate, "release"); }
+    return Response.json(PEER_INBOX);
+  });
+  await withLinks(async (links, get) => {
+    await links.announce();
+    clock += 31_000;
+    hold = true;
+    const entered = once(gate, "entered");
+    const refreshing = await (await get("/")).text();
+    await entered;
+    assert.match(refreshing, /data-agent="agent-9"/, "a read under way keeps the peer's last answer on the page");
+    assert.doesNotMatch(refreshing, /Not reachable/);
+    clock += 30_000;
+    const old = await (await get("/")).text();
+    assert.doesNotMatch(old, /data-agent="agent-9"/, "a minute-old answer is withheld while the read still runs");
+    assert.match(old, /Not reachable, so its reviews are missing: peer</);
+    hold = false;
+    gate.emit("release");
+    await pageWithPeer(get, "agent-9");
+  }, undefined, { peers: async () => ["https://peer.test"], now: () => new Date(clock) });
+});
+
 test("a peer read started during a forwarded mutation cannot restore its old waiting row", async t => {
   const originalFetch = globalThis.fetch;
   const gate = new EventEmitter();
