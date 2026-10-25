@@ -17,6 +17,10 @@ type Flight = { generation: number; promise: Promise<PaseoAgent[]> };
 
 type PageInfo = { hasMore?: boolean; nextCursor?: string | null } | null | undefined;
 
+// More agents than this leaving the live listing at once (a bulk archive) cost more to read one by
+// one than one rescan of the archived listing.
+const MAX_DEPARTURE_READS = 50;
+
 export class AgentDirectory {
   private readonly now: () => number;
   private readonly liveTtlMs: number;
@@ -32,6 +36,8 @@ export class AgentDirectory {
   private archivedFlight: Flight | null = null;
   // The ids of the last completed live scan: a later scan that lacks one saw an agent leave.
   private lastLiveIds: Set<string> | null = null;
+  // Agents that left the live listing since the archived index was last brought up to date.
+  private departed = new Set<string>();
 
   constructor(options: AgentDirectoryOptions = {}) {
     this.now = options.now ?? (() => performance.now());
@@ -49,6 +55,7 @@ export class AgentDirectory {
     this.archivedSnapshot = null;
     this.archivedEpoch++;
     this.lastLiveIds = null;
+    this.departed.clear();
   }
 
   invalidate(): void {
@@ -91,31 +98,65 @@ export class AgentDirectory {
     if (!paseo) throw new Error("Paseo source unavailable");
     const now = this.now();
     const snapshot = this.archivedSnapshot;
-    if (snapshot && snapshot.epoch === this.archivedEpoch && now - snapshot.completedAt < this.archivedTtlMs) {
-      return [...snapshot.agents];
-    }
-    // Keyed on the archived epoch only: invalidate() (every agent created or archived) concerns the
-    // live list, and restarting a ~36 page archived scan for it would cost what this saves. An
-    // agent archived meanwhile leaves the live list, which advances the epoch.
     const epoch = this.archivedEpoch;
     const flight = this.archivedFlight;
     if (flight && flight.generation === epoch) return [...(await flight.promise)];
-    const promise = this.scan(paseo, true).then((agents) => {
+    if (snapshot && snapshot.epoch === epoch && now - snapshot.completedAt < this.archivedTtlMs) {
+      if (this.departed.size === 0) return [...snapshot.agents];
+      // A few agents left the live listing: one agent read each instead of rescanning the whole
+      // archived listing (~55 pages, each of which makes the daemon rebuild every agent).
+      if (this.departed.size <= MAX_DEPARTURE_READS) return [...(await this.track(epoch, this.readDepartures(paseo, snapshot)))];
+    }
+    // Keyed on the archived epoch only: invalidate() (every agent created or archived) concerns the
+    // live list, and restarting the archived scan for it would cost what this saves. Agents
+    // archived meanwhile leave the live list and are read one by one (see readDepartures).
+    this.departed.clear();
+    return [...(await this.track(epoch, this.scan(paseo, true).then((agents) => {
       const archived = agents.filter((agent) => Boolean(agent.archivedAt));
       if (this.archivedEpoch === epoch) this.archivedSnapshot = { agents: archived, completedAt: this.now(), epoch };
       return archived;
-    }).finally(() => {
+    })))];
+  }
+
+  private track(epoch: number, work: Promise<PaseoAgent[]>): Promise<PaseoAgent[]> {
+    const promise = work.finally(() => {
       if (this.archivedFlight?.promise === promise) this.archivedFlight = null;
     });
     this.archivedFlight = { generation: epoch, promise };
-    return [...(await promise)];
+    return promise;
   }
 
-  // Every completed live scan detects departures, also one that only live() ran: all() then
-  // rescans the archived index instead of waiting out archivedTtlMs.
+  // Brings the archived index up to date with the agents that left the live listing: an archived
+  // one is added with its archive time, a deleted one dropped. A failed read makes the next reader
+  // rescan the whole archived listing instead of keeping an index that may lack the agent.
+  private async readDepartures(paseo: PaseoApi, snapshot: ArchivedSnapshot): Promise<PaseoAgent[]> {
+    const ids = [...this.departed];
+    this.departed.clear();
+    const byId = new Map(snapshot.agents.map((agent) => [agent.id, agent]));
+    try {
+      for (const id of ids) {
+        const read = await paseo.agents.ref(id).refresh().catch((error: unknown) => {
+          if (error instanceof Error && /not found/i.test(error.message)) return null;
+          throw error;
+        });
+        if (!read) byId.delete(id);
+        else if (read.agent.archivedAt) byId.set(id, read.agent);
+      }
+    } catch (error) {
+      if (this.archivedEpoch === snapshot.epoch) this.archivedEpoch++;
+      throw error;
+    }
+    const agents = [...byId.values()];
+    if (this.archivedSnapshot === snapshot) this.archivedSnapshot = { ...snapshot, agents };
+    return agents;
+  }
+
+  // Every completed live scan detects departures, also one that only live() ran: all() then reads
+  // them instead of waiting out archivedTtlMs.
   private observeLive(agents: PaseoAgent[]): void {
     const ids = new Set(agents.map((agent) => agent.id));
-    if (this.lastLiveIds && [...this.lastLiveIds].some((id) => !ids.has(id))) this.archivedEpoch++;
+    if (this.lastLiveIds) for (const id of this.lastLiveIds) if (!ids.has(id)) this.departed.add(id);
+    for (const id of ids) this.departed.delete(id);
     this.lastLiveIds = ids;
   }
 
