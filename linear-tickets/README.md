@@ -6060,11 +6060,15 @@ at once. An agent that leaves the live listing is read once on its own and added
 index (or dropped from it, when deleted) instead of rescanning the whole archived listing; more
 than 50 at once, or a read that fails, rescans it. Crash recovery asks the live listing which
 agents are crashed and reads only those again, so a crash shows up within one poll after the
-listing sees it.
-Work that starts, claims or decides ownership still reads the daemon directly, so a decision never
-runs on a cached list. Only the Paseo project listing a start resolves its project and shard pool
-from is shared for a minute (the daemon describes every project through its git queue for each
-listing); a project the shared listing does not name is looked up again at once.
+listing sees it. The sweep's queued threads read their ticket's agents from the directory too:
+there it only decides that a thread keeps waiting. Before a thread links to an agent, reconnects
+its stopped one or starts a new one, it reads the ticket's agents from the daemon again, and
+waits for the next sweep when the two disagree; a start drops the live cache, so the next waiting
+thread of that ticket links to the agent it started.
+Every other step that starts, claims or decides ownership reads the daemon directly, so a decision
+never runs on a cached list. Only the Paseo project listing a start resolves its project and shard
+pool from is shared for a minute (the daemon describes every project through its git queue for
+each listing); a project the shared listing does not name is looked up again at once.
 
 The CPU profiler only runs while the owner asks for it. The switch is the file
 `$PASEO_HOME/linear-tickets/diagnostics/profile-until` holding an ISO end time with its zone, for

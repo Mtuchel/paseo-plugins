@@ -39,7 +39,7 @@ import { rateBudget, RateLimitedError, withPriority, type RateBudget } from "./r
 
 const HANDLED_LIMIT = 200;
 const SWEEP_MS = 60_000;
-const QUEUED_OWNER_MAX_PAGES = 100;
+const TICKET_HISTORY_MAX_PAGES = 100;
 const PARENT_HANDOUT_LIMIT = 12;
 // A verified live agent subscription delivers prompts immediately. History remains a five-minute
 // backstop even while quiet; unavailable coverage restores minute reads. A failed history read
@@ -389,8 +389,9 @@ export function planSteps(markdown: string): string[] {
 
 type Deps = {
   api: AgentApi;
-  // The shared read-only agent listing (TUC-3006), read by watchdogRoots.
-  agentDirectory: Pick<AgentDirectory, "live">;
+  // The shared read-only agent listing (TUC-3006), read by watchdogRoots, crash recovery and the
+  // queued threads' ticket history (queuedOwners).
+  agentDirectory: Pick<AgentDirectory, "live" | "all" | "invalidate">;
   linear: Pick<LinearService, "viewerId" | "appUserId" | "addLabel" | "removeLabel" | "complete" | "cancel" | "issueState" | "issueStatus" | "admissionStates" | "issueGroup" | "delegate" | "moveToStateNamed" | "comment" | "hasComment" | "userUrl">;
   starter: Pick<TicketStarter, "start" | "admission">;
   // The ticket's handover record: a successor resumes from it and takes it over (succeed).
@@ -676,31 +677,37 @@ export class SessionRouter {
     return agent ? { id: agent.id, title: agent.title ?? null } : null;
   }
 
-  // Bounded public ticket history: a different Linear thread's retired root cannot settle this
-  // queue. A current root takes precedence, including one a newer thread started meanwhile.
-  private async queuedOwners(link: SessionLink): Promise<{ current: PaseoAgent | null; previous: PaseoAgent | null }> {
+  // Public ticket history: a different Linear thread's retired root cannot settle this queue. A
+  // current root takes precedence, including one a newer thread started meanwhile.
+  private async queuedOwners(link: SessionLink, agents: PaseoAgent[]): Promise<{ current: PaseoAgent | null; previous: PaseoAgent | null }> {
     const candidates: PaseoAgent[] = [];
     let previous: PaseoAgent | null = null;
-    let cursor: string | undefined;
-    const cursors = new Set<string>();
-    for (let pageNumber = 0; ; pageNumber++) {
-      if (pageNumber === QUEUED_OWNER_MAX_PAGES) throw new Error("The ticket's agent history could not be fully read.");
-      const page = await this.paseo!.agents.list({ filter: { labels: { "linear.issueId": link.issueId }, includeArchived: true }, page: { limit: 200, ...(cursor ? { cursor } : {}) } });
-      for (const { agent } of page.entries) {
-        if (agent.labels?.["linear.issueId"] !== link.issueId || agent.labels?.["paseo.parent-agent-id"]) continue;
-        if (agent.labels?.["linear.sessionId"] === link.sessionId && (!previous || agent.createdAt > previous.createdAt)) previous = agent;
-        if (!agent.archivedAt && agent.status !== "closed" && !crashedProcess(agent)) candidates.push(agent);
-      }
-      if (!page.pageInfo) throw new Error("The ticket's agent history could not be fully read.");
-      if (!page.pageInfo.hasMore) break;
-      cursor = page.pageInfo.nextCursor ?? undefined;
-      if (!cursor || cursors.has(cursor)) throw new Error("The ticket's agent history could not be fully read.");
-      cursors.add(cursor);
+    for (const agent of agents) {
+      if (agent.labels?.["linear.issueId"] !== link.issueId || agent.labels?.["paseo.parent-agent-id"]) continue;
+      if (agent.labels?.["linear.sessionId"] === link.sessionId && (!previous || agent.createdAt > previous.createdAt)) previous = agent;
+      if (!agent.archivedAt && agent.status !== "closed" && !crashedProcess(agent)) candidates.push(agent);
     }
     const ghosts = await ghostAgents(candidates, this.clock(), this.deps.processInspector);
     let current: PaseoAgent | null = null;
     for (const agent of candidates) if (!ghosts.has(agent.id) && (!current || agent.createdAt > current.createdAt)) current = agent;
     return { current, previous };
+  }
+
+  // The ticket's whole agent history, read from the daemon (bounded).
+  private async ticketHistory(issueId: string): Promise<PaseoAgent[]> {
+    const agents: PaseoAgent[] = [];
+    let cursor: string | undefined;
+    const cursors = new Set<string>();
+    for (let pageNumber = 0; ; pageNumber++) {
+      if (pageNumber === TICKET_HISTORY_MAX_PAGES) throw new Error("The ticket's agent history could not be fully read.");
+      const page = await this.paseo!.agents.list({ filter: { labels: { "linear.issueId": issueId }, includeArchived: true }, page: { limit: 200, ...(cursor ? { cursor } : {}) } });
+      agents.push(...page.entries.map((entry) => entry.agent));
+      if (!page.pageInfo) throw new Error("The ticket's agent history could not be fully read.");
+      if (!page.pageInfo.hasMore) return agents;
+      cursor = page.pageInfo.nextCursor ?? undefined;
+      if (!cursor || cursors.has(cursor)) throw new Error("The ticket's agent history could not be fully read.");
+      cursors.add(cursor);
+    }
   }
 
   async created(session: Record<string, unknown> & { id: string }): Promise<void> {
@@ -1146,7 +1153,16 @@ export class SessionRouter {
         console.log(`[linear-tickets] ${link.identifier}: queued thread ended in Linear (${status ?? "gone"}); no agent started`);
         return;
       }
-      const { current: existing, previous } = await this.queuedOwners(link);
+      // Every pass reads the owners from the shared directory, which decides only that the thread
+      // waits. A step that links, starts or reconnects confirms them on the daemon first; when the
+      // daemon disagrees, the thread waits for the next pass, which lists afresh.
+      const { current: existing, previous } = await this.queuedOwners(link, await this.deps.agentDirectory.all());
+      const confirmed = async (): Promise<boolean> => {
+        const fresh = await this.queuedOwners(link, await this.ticketHistory(link.issueId));
+        if (fresh.current?.id === existing?.id && fresh.previous?.id === previous?.id) return true;
+        this.deps.agentDirectory.invalidate();
+        return false;
+      };
       // Reconnecting an empty retired run is accounting, not a resume or a successful completion.
       // An undelivered owner message is still a legitimate queue: keep it unlinked so the sweep
       // can deliver it to a later live owner. Never revive the retired root or release a hold.
@@ -1159,6 +1175,7 @@ export class SessionRouter {
           if (link.queueReason !== reason) await this.deps.store.patch(link.sessionId, { queueReason: reason });
           return;
         }
+        if (!await confirmed()) return;
         await this.deps.store.patch(link.sessionId, { ...(previous ? { agentId: previous.id } : {}), queued: false, queueReason: undefined, restartRequested: undefined });
         return;
       }
@@ -1175,6 +1192,7 @@ export class SessionRouter {
         return;
       }
       if (existing) {
+        if (!await confirmed()) return;
         // A caller's failed store patch replays its activity, never the send. Refresh first:
         // retirement between the directory read and dispatch must not resurrect a dead agent.
         const text = link.pendingText;
@@ -1211,6 +1229,7 @@ export class SessionRouter {
         if (link.queueReason !== admission.reason) await this.deps.store.patch(link.sessionId, { queueReason: admission.reason });
         return;
       }
+      if (!await confirmed()) return;
     } catch (error) {
       if (error instanceof RateLimitedError) throw error;
       if (link.queueReason !== undefined) await this.deps.store.patch(link.sessionId, { queueReason: undefined });
@@ -1227,6 +1246,10 @@ export class SessionRouter {
       }
       await this.deps.store.patch(link.sessionId, { queued: false, queueReason: undefined, restartRequested: undefined });
       await this.say(link.sessionId, "error", `Paseo could not start the agent: ${error instanceof Error ? error.message : error}`).catch(() => {});
+    } finally {
+      // The next waiting thread of this ticket must list an agent this start created (even one
+      // whose report failed) before the daemon's agent.created hook invalidates the listing.
+      this.deps.agentDirectory.invalidate();
     }
   }
 
