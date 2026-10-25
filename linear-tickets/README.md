@@ -5608,7 +5608,10 @@ Answer/config invalidation fences in-flight transport reads, so they cannot repu
 request. Concurrent peer reads share their request. Actual peer transport failures remain visible
 and are checked again on the next transport refresh, not the next Linear collection.
 The combined frontdoor snapshot also collects plan-review peers independently; a slow review
-peer cannot delay the decision inbox. Expired review rows are withheld, and forwarding invalidates
+peer cannot delay the decision inbox. A review peer's answer is read again once it is 30 s old and
+stays listed for up to 60 s, so a read still under way never blanks that peer as "Not reachable"
+(before, every refresh showed the peer's reviews as missing for the length of its read); a failed
+read replaces the answer at once. Older review rows are withheld, and forwarding invalidates
 that peer's cached rows while retaining the target backend and review-generation fences.
 The frontdoor rechecks incomplete coverage after its two-second minimum snapshot gap, rather
 than holding a cold partial snapshot until the next thirty-second expiry. Notification collection

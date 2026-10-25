@@ -40,6 +40,11 @@ const MISSES_TO_CLOSE = 2;
 const AGENT_ID = /^[A-Za-z0-9_-]+$/;
 const RECENT_DECISIONS = 10;
 const PEER_TIMEOUT_MS = 4_000;
+// A peer's answer is read again once it is this old; the sweep's announce reads at about the same pace.
+const PEER_REFRESH_MS = 30_000;
+// How long a peer's last answer stays on the page. Longer than a refresh cycle, so a read still under
+// way never blanks the peer as "unreachable"; a failed read replaces the answer at once.
+const PEER_SHOWN_MS = 2 * PEER_REFRESH_MS;
 const MAX_BODY_BYTES = 16_384;
 const MAX_FEEDBACK_CHARS = 4_000;
 
@@ -981,12 +986,12 @@ export class ReviewLinks {
   }
 
   // The frontdoor captures review and decision views together. A slow review peer must not
-  // delay decision receipts or local inbox reads. Expired peer rows are withheld, not actionable.
+  // delay decision receipts or local inbox reads. Peer rows older than PEER_SHOWN_MS are withheld, not actionable.
   private async view(waitForPeers = false): Promise<InboxView> {
     const peers = await this.peers().catch(() => []);
     for (const peer of peers) {
       const cached = this.peerSnapshots.get(peer);
-      if (this.peerReads.has(peer) || (cached && this.now().getTime() - cached.at < 30_000)) continue;
+      if (this.peerReads.has(peer) || (cached && this.now().getTime() - cached.at < PEER_REFRESH_MS)) continue;
       const read = this.readPeerInbox(peer).then(value => {
         if (this.peerReads.get(peer) === read) this.peerSnapshots.set(peer, { value, at: this.now().getTime() });
       }).finally(() => { if (this.peerReads.get(peer) === read) this.peerReads.delete(peer); });
@@ -998,7 +1003,7 @@ export class ReviewLinks {
     const own = await this.rows();
     const answers = peers.map(peer => {
       const cached = this.peerSnapshots.get(peer);
-      return cached && this.now().getTime() - cached.at < 30_000 ? cached.value : this.unavailablePeer(peer);
+      return cached && this.now().getTime() - cached.at < PEER_SHOWN_MS ? cached.value : this.unavailablePeer(peer);
     });
     const open = [...own.open];
     const decided = [...own.decided];
