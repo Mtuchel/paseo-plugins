@@ -85,6 +85,15 @@ test("metering the same source twice returns the same object, so identity checks
   assert.equal(usage.meter(raw).agents, usage.meter(raw).agents);
 });
 
+test("metering an already metered source returns it unchanged, so each request is counted once", async () => {
+  const usage = new DaemonUsage();
+  const once = usage.meter(api());
+  const twice = usage.meter(once);
+  assert.equal(twice, once);
+  await asCaller("plan-pipeline", () => twice.agents.list({ filter: { includeArchived: true } }));
+  assert.deepEqual(usage.drain().byCaller, { "plan-pipeline": { "agents.list[archived]": 1 } });
+});
+
 test("drain returns the counts since the previous drain and starts a new window", async () => {
   let now = 1_000;
   const usage = new DaemonUsage({ now: () => now });

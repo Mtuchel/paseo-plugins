@@ -87,6 +87,11 @@ export class DaemonUsage {
       },
     });
     this.proxies.set(target, proxy);
+    // Metering a metered object again (index.server.ts meters each hook's daemon, then attach()
+    // meters it once more) returns it as is: a second layer would count every request twice and
+    // make each hook look like a new daemon, which re-attaches the agent directory and drops its
+    // archived index.
+    this.proxies.set(proxy, proxy);
     return proxy;
   }
 
