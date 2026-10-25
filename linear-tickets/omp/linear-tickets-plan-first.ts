@@ -299,6 +299,63 @@ export function linearWrite(toolName: string, input: Record<string, unknown> | u
   return LINEAR_READ_TOOLS.has(tool) ? null : tool;
 }
 
+// The arguments of a Linear MCP call: the call's input, or the JSON written to its xd:// device.
+function linearArguments(toolName: string, input: Record<string, unknown> | undefined): Record<string, unknown> {
+  if (toolName !== "write") return input ?? {};
+  try {
+    const parsed: unknown = JSON.parse(typeof input?.content === "string" ? input.content : "");
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? Object.fromEntries(Object.entries(parsed)) : {};
+  } catch { return {}; }
+}
+
+const UPLOAD_TOOLS: Record<string, true> = {
+  [LINEAR_MCP + "prepare_attachment_upload"]: true, [LINEAR_MCP + "prepare_file_upload"]: true,
+  [LINEAR_MCP + "create_attachment"]: true, [LINEAR_MCP + "create_attachment_from_upload"]: true,
+};
+const SAVE_ISSUE_FIELDS: Record<string, true> = {
+  id: true, state: true, title: true, description: true, patch: true, links: true, blocks: true, blockedBy: true, relatedTo: true,
+  duplicateOf: true, removeBlocks: true, removeBlockedBy: true, removeRelatedTo: true,
+};
+
+// Why a blocked owner write was stopped and which Paseo tool does it instead, by the tool and the
+// fields the call set (README, "Agent access to Linear").
+export function linearWriteRefusal(toolName: string, input: Record<string, unknown> | undefined): string | null {
+  const tool = linearWrite(toolName, input);
+  if (!tool) return null;
+  const args = linearArguments(toolName, input);
+  const has = (key: string) => args[key] !== undefined;
+  const T = TICKET_TOOL_PREFIX;
+  let instead: string;
+  if (Object.hasOwn(UPLOAD_TOOLS, tool)) {
+    instead = `Use ${T}attach_file with the file's absolute path instead: it uploads the screenshot or other evidence file to your ticket or one of its sub-issues as Paseo and returns the asset URL for your pull request body.`;
+  } else if (tool === LINEAR_MCP + "save_comment") {
+    instead = has("id")
+      ? `Use ${T}edit_comment instead: it edits a comment you posted (its id is in ${T}get_comments). Comments by anyone else stay as written; post a new one with ${T}add_comment.`
+      : `Use ${T}add_comment instead; it posts on any issue.`;
+  } else if (tool === LINEAR_MCP + "delete_comment") {
+    instead = `Agents do not delete comments: correct one you posted with ${T}edit_comment, or post a new one with ${T}add_comment.`;
+  } else if (tool === LINEAR_MCP + "save_issue" && !has("id")) {
+    instead = `Use ${T}create_issue instead: a follow-up in Backlog, or with kind=sub_issue a sub-issue of your ticket.`;
+  } else if (tool === LINEAR_MCP + "save_issue") {
+    const uses: string[] = [];
+    if (has("state")) uses.push(`${T}set_status for the status`);
+    if (has("title") || has("description") || has("patch")) uses.push(`${T}update_issue for the title or description of an issue you created (your ticket keeps the owner's text: comment instead)`);
+    if (has("links")) uses.push(`${T}link_url for a link`);
+    if (has("blocks") || has("blockedBy") || has("relatedTo") || (has("duplicateOf") && args.duplicateOf !== null)) uses.push(`${T}add_relation to add a relation`);
+    if (has("removeBlocks") || has("removeBlockedBy") || has("removeRelatedTo") || args.duplicateOf === null) uses.push(`${T}remove_relation to remove a relation`);
+    const rest = Object.keys(args).filter((key) => !Object.hasOwn(SAVE_ISSUE_FIELDS, key));
+    if (rest.length) uses.push(`ask the owner for ${rest.join(", ")}: agents do not set those`);
+    instead = uses.length
+      ? `Use ${uses.join("; ")}.`
+      : `Use ${T}set_status, ${T}update_issue, ${T}link_url, ${T}add_relation or ${T}remove_relation instead.`;
+  } else if (tool === LINEAR_MCP + "save_document") {
+    instead = `Agents do not edit Linear documents: a plan document is the record the owner approved, and only a plan review round replaces it. Post the correction or addendum with ${T}add_comment on the ticket instead.`;
+  } else {
+    instead = `No ${T}* tool does this: ask the owner.`;
+  }
+  return `Stopped by the linear-tickets plugin: ${tool} would write to Linear as the owner. ${instead} Reading with the Linear tools is fine; every Linear write goes through the ${T}* tools, which write as Paseo.`;
+}
+
 type TicketServer = { command: string; args: string[]; env: Record<string, string> };
 type JsonSchema = { type?: string; enum?: string[]; description?: string; properties?: Record<string, JsonSchema>; required?: string[] };
 type TicketTool = { name: string; description: string; inputSchema: JsonSchema; annotations?: { readOnlyHint?: boolean } };
@@ -593,10 +650,8 @@ export default function linearTicketsPlanFirst(pi: ExtensionApi): void {
     }
     if (!TICKET) return undefined;
     const input = event.input;
-    const linearTool = linearWrite(event.toolName, input);
-    if (linearTool) {
-      return { block: true, reason: `Stopped by the linear-tickets plugin: ${linearTool} would act as the owner. Ticket agents change Linear only through the ${TICKET_TOOL_PREFIX}* tools, which write as Paseo: comments and relations on any issue, status and links on your ticket and the issues you created, attach_file for evidence files (screenshots, PDFs, videos) on your ticket and its sub-issues, create_issue for follow-ups. Reading with the Linear tools is fine. For anything else in Linear, ask the owner (or add a manual task).` };
-    }
+    const refusal = linearWriteRefusal(event.toolName, input);
+    if (refusal) return { block: true, reason: refusal };
     const tests = writtenPaths(event.toolName, input).length ? acceptanceTests() : null;
     let testWrite = blockedTestWrite(tests, event.toolName, input, ctx?.models?.current(), process.env[STRONG_MODEL_ENV]);
     if (testWrite && pi.getThinkingLevel?.() === "high") {

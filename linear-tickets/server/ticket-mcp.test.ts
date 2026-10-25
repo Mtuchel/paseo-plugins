@@ -258,7 +258,7 @@ test("the MCP server reads, comments, moves and links only its own ticket over s
     const init = (await mcp.request("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "t", version: "1" } })).result as { protocolVersion: string };
     assert.equal(init.protocolVersion, "2025-06-18");
     const list = (await mcp.request("tools/list")).result as { tools: { name: string }[] };
-    assert.deepEqual(list.tools.map((tool) => tool.name), ["get_ticket", "get_issue", "get_comments", "search_issues", "add_comment", "set_status", "link_url", "attach_file", "add_relation", "create_issue", "update_issue", "add_manual_task"], "an ordinary ticket agent never sees the steward's verdict tool");
+    assert.deepEqual(list.tools.map((tool) => tool.name), ["get_ticket", "get_issue", "get_comments", "search_issues", "add_comment", "edit_comment", "set_status", "link_url", "attach_file", "add_relation", "remove_relation", "create_issue", "update_issue", "add_manual_task"], "an ordinary ticket agent never sees the steward's verdict tool");
 
     const ticket = JSON.parse((await mcp.call("get_ticket")).text);
     assert.equal(ticket.identifier, "ENG-42");
@@ -537,6 +537,48 @@ test("writes follow the issue's scope: own ticket, issues the agent created, any
     assert.equal((await mcp.call("create_issue", { title: "Tenth", description: "d", kind: "sub_issue" })).isError, false, "the created and unknown records count 9 of 10 sub-issues");
     assert.match((await mcp.call("create_issue", { title: "Eleventh", description: "d", kind: "sub_issue" })).text, /already filed 10 sub-issues/);
     assert.equal(created, 5);
+  } finally { mcp.stop(); await broker.stop(); await linear.close(); await rm(home, { recursive: true, force: true }); }
+});
+
+test("edit_comment edits only comments this agent recorded; remove_relation removes the matching relation from its own ticket", async () => {
+  const home = await mkdtemp(join(tmpdir(), "paseo-linear-mcp-edit-"));
+  const other = { ...issue, id: "other-1", identifier: "ENG-7", title: "Someone else's" };
+  const eng7 = { id: "other-1", identifier: "ENG-7" };
+  const linear = await fakeLinear((call) => {
+    if (call.query.includes("query ticket")) return { issue: call.variables.id === "ENG-7" ? other : issue };
+    if (call.query.includes("commentCreate")) return { commentCreate: { success: true, comment: { id: "c-1", url: "https://linear.app/c/1", createdAt: "2026-02-01T00:00:00.000Z" } } };
+    if (call.query.includes("commentUpdate")) return { commentUpdate: { success: true, comment: { url: "https://linear.app/c/1" } } };
+    if (call.query.includes("query relations")) return { issue: {
+      relations: { nodes: [{ id: "r-blocks", type: "blocks", relatedIssue: eng7 }, { id: "r-other", type: "related", relatedIssue: { id: "x-9", identifier: "ENG-9" } }] },
+      inverseRelations: { nodes: [{ id: "r-blocked", type: "blocks", issue: eng7 }, { id: "r-related", type: "related", issue: eng7 }] },
+    } };
+    if (call.query.includes("issueRelationDelete")) return { issueRelationDelete: { success: true } };
+    return {};
+  });
+  const script = await writeTicketMcpScript(home);
+  const { broker, budget } = await brokerOn(home, linear);
+  samples(budget);
+  const mcp = runServer(script, ["--issue", ISSUE_ID, "--paseo-home", home], { LINEAR_API_KEY: "k" });
+  const writes = (name: string) => linear.calls.filter((c) => c.query.includes(name)).map((c) => c.variables);
+  try {
+    assert.equal((await mcp.call("add_comment", { body: "Started." })).isError, false);
+    const edited = await mcp.call("edit_comment", { comment: "c-1", body: "Started on the retry path." });
+    assert.deepEqual(JSON.parse(edited.text), { edited: true, url: "https://linear.app/c/1" });
+    assert.deepEqual(writes("commentUpdate"), [{ id: "c-1", input: { body: "Started on the retry path." } }]);
+    // Linear shows every agent's comments as Paseo; only this agent's record lets it edit one.
+    assert.match((await mcp.call("edit_comment", { comment: "c-from-another-agent", body: "x" })).text, /was not posted by this agent.*add_comment/);
+    assert.match((await mcp.call("edit_comment", { comment: "../../credentials", body: "x" })).text, /comment id from get_comments/);
+    assert.equal(writes("commentUpdate").length, 1, "a refused edit never reaches Linear");
+
+    // blocked_by is ENG-7's "blocks" relation onto this ticket, not this ticket's blocks onto ENG-7.
+    assert.deepEqual(JSON.parse((await mcp.call("remove_relation", { issue: "ENG-7", type: "blocked_by" })).text), { removed: true, from: "ENG-42", type: "blocked_by", issue: "ENG-7" });
+    assert.deepEqual(writes("issueRelationDelete"), [{ id: "r-blocked" }]);
+    // related matches whichever side created it, by identifier in any case.
+    assert.equal((await mcp.call("remove_relation", { issue: "eng-7", type: "related" })).isError, false);
+    assert.deepEqual(writes("issueRelationDelete").at(-1), { id: "r-related" });
+    assert.equal(JSON.parse((await mcp.call("remove_relation", { issue: "ENG-7", type: "duplicate_of" })).text).removed, false);
+    assert.match((await mcp.call("remove_relation", { issue: "ENG-42", type: "related", from: "ENG-7" })).text, /ENG-7 is neither this agent's ticket nor an issue it created/);
+    assert.equal(writes("issueRelationDelete").length, 2, "no match and a foreign from remove nothing");
   } finally { mcp.stop(); await broker.stop(); await linear.close(); await rm(home, { recursive: true, force: true }); }
 });
 
@@ -1171,7 +1213,7 @@ test("without the broker the tools stay available and every request fails closed
     const init = (await mcp.request("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "t", version: "1" } })).result as { protocolVersion: string };
     assert.equal(init.protocolVersion, "2025-06-18");
     const list = (await mcp.request("tools/list")).result as { tools: { name: string }[] };
-    assert.equal(list.tools.length, 12, "the tools stay mounted when the broker is down");
+    assert.equal(list.tools.length, 14, "the tools stay mounted when the broker is down");
     for (const call of [() => mcp.call("get_ticket"), () => mcp.call("add_comment", { body: "Started." })]) {
       const result = await call();
       assert.equal(result.isError, true);

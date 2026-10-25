@@ -15,7 +15,8 @@ const MAX_UPLOAD_BODY = 25 * 1024 * 1024;
 const UPLOAD_DEADLINE_MS = 60_000;
 const HEADER_NAME = /^[A-Za-z0-9!#$%&'*+.^_|~-]+$/;
 const TOOLS: Record<string, true> = { get_ticket: true, get_issue: true, get_comments: true, search_issues: true, add_comment: true,
-  set_status: true, link_url: true, add_relation: true, create_issue: true, update_issue: true, add_manual_task: true, attach_file: true };
+  edit_comment: true, set_status: true, link_url: true, add_relation: true, remove_relation: true, create_issue: true, update_issue: true,
+  add_manual_task: true, attach_file: true };
 const UNAVAILABLE = "The host's Linear budget service is unavailable; no request was sent. Retry after the plugin is running.";
 const UNKNOWN = "The Linear request may have completed; check the ticket before retrying a write.";
 export type BrokerRequest = { authorization: string; query: string; variables: Record<string, unknown>; tool: string };
