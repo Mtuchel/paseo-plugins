@@ -1,7 +1,8 @@
 // The factory board (/board): one static document the inbox frontdoor serves itself, outside its
-// snapshot cache. Its only data source is GET /api/board, read on load and every minute; when that
-// read fails the last reading stays on screen, marked as a backend outage with the error text, and
-// the page keeps asking. Every value that reaches the document goes through esc().
+// snapshot cache. Its only data source is GET /api/board, read on load and every minute while the
+// page is visible (a hidden page reads again once it is shown); when that read fails the last
+// reading stays on screen, marked as a backend outage with the error text, and the page keeps
+// asking. Every value that reaches the document goes through esc().
 
 const STYLE = `
 :root{color-scheme:light dark;--bg:#f2f2f7;--card:#fff;--fg:#1c1c1e;--sub:#3c3c43;--muted:#6e6e73;--line:#d8d8dd;--chip:#ececf1;--tint:#0a64d6;
@@ -469,7 +470,9 @@ async function load(){
     claim(await answer.json());
   }catch(error){down(error)}}
 load();
-setInterval(load,60000);
+// Every read collects both hosts' facts and the tails of their working agents from the daemons;
+// a page nobody sees asks nothing, and the visibilitychange handler catches up once it is shown.
+setInterval(()=>{if(!document.hidden)load()},60000);
 `;
 
 export function boardPage(): string {
