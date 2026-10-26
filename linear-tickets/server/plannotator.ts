@@ -35,6 +35,7 @@ import type { ReviewDeletions } from "./review-deletions";
 import { RateLimitedError, withPriority } from "./rate-budget";
 import { DecisionJournal, DecisionPendingError, FencedError, HaltedError, type DecisionAttempt, type ResolveAction, type ReviewGeneration, type RouteSnapshot } from "./decision-journal";
 import { applyLater, applySplit, CATCH_UP_RETIRE, CATCH_UP_SPLIT, splitProblem, type PanelWork, type Steps } from "./split";
+import { requireAnsweredQuestions, unansweredQuestions, type UnansweredQuestion } from "./plan-questions";
 
 // The plan text of a running review, from the same endpoint its page loads.
 export async function readReviewPlan(localUrl: string): Promise<string> {
@@ -301,6 +302,8 @@ export class PlannotatorBridge {
   // What became of a review whose decision Plannotator did not confirm (review-outcome.ts);
   // `probe` false: the address serves another review now, only saved outcomes count.
   private outcomes: (review: PendingReview, probe: boolean) => Promise<ReviewOutcome> = (review, probe) => reviewOutcome(review, undefined, probe ? undefined : async () => false);
+  // The plan's questions an approval without answers leaves open (plan-questions.ts).
+  private questions: (plan: string) => Promise<UnansweredQuestion[]> = (plan) => unansweredQuestions(plan);
 
   constructor(
     private readonly linear: Linear,
@@ -330,6 +333,10 @@ export class PlannotatorBridge {
 
   useReviewOutcomes(outcomes: (review: PendingReview, probe: boolean) => Promise<ReviewOutcome>): void {
     this.outcomes = outcomes;
+  }
+
+  useQuestionCheck(check: (plan: string) => Promise<UnansweredQuestion[]>): void {
+    this.questions = check;
   }
 
   useDeletions(deletions: Pick<ReviewDeletions, "get" | "forAgent">): void {
@@ -477,8 +484,13 @@ export class PlannotatorBridge {
   // The owner's Approve / Send back from the review inbox or the Linear panel: journaled for its
   // exact review, then sent to Plannotator. A refusal voids it (the review stays decidable); a
   // lost answer leaves it uncertain until Plannotator's report, its saved outcome or the owner
-  // settles it. The decision is carried out in the background.
+  // settles it. The decision is carried out in the background. An approval while the plan has
+  // unanswered questions is refused before anything is recorded (QuestionsUnansweredError).
   async decideOwner(localUrl: string, approve: boolean, feedback: string, agentId: string, origin: OwnerOrigin): Promise<void> {
+    if (approve) {
+      const shown = await this.fetchPlan(localUrl).catch(() => "");
+      if (shown) await requireAnsweredQuestions(shown, this.questions);
+    }
     const attempt = await this.admitted(async () => {
       const review = await this.ownerReview(agentId, localUrl, origin);
       const planContent = await this.fetchPlan(localUrl).catch(() => "");
@@ -506,6 +518,7 @@ export class PlannotatorBridge {
     if (!planContent.trim()) throw new Error("The plan could not be read from Plannotator.");
     const problem = mode === "split" ? splitProblem(planContent) : null;
     if (problem) throw new Error(problem);
+    await requireAnsweredQuestions(planContent, this.questions);
     const attempt = await this.admitted(async () => {
       const review = await this.ownerReview(agentId, stored.localUrl, { reviewId: stored.reviewId, openedAt: stored.openedAt });
       const snapshot = await this.snapshot(agentId, review);
@@ -753,6 +766,19 @@ export class PlannotatorBridge {
     }
   }
 
+  // Why a plan with questions waits for the owner (plan-questions.ts): an automatic approval
+  // carries no answers, so any question the agent did not settle is the owner's to answer. A check
+  // that cannot run keeps the plan with the owner too.
+  private async questionsReason(plan: string): Promise<string | null> {
+    try {
+      const open = (await this.questions(plan)).length;
+      return open ? `it asks you ${open === 1 ? "a question" : `${open} questions`}` : null;
+    } catch (error) {
+      console.error(`[linear-tickets] the plan's questions could not be checked: ${message(error)}`);
+      return "its questions could not be checked";
+    }
+  }
+
   private async judgeNow(review: ReviewGeneration, localUrl: string, agentId: string, issueId: string, planText: string, settings: PluginSettings, catchUp: boolean): Promise<Judgement | null> {
     // A replayed `opened` event: the review's decision is in the journal already.
     const decided = this.journal.attempts(review.id).find((attempt) => attempt.state !== "void");
@@ -768,7 +794,9 @@ export class PlannotatorBridge {
       const tierOnly = !catchUp && approvedBefore ? onlyTierAdded(approvedBefore.content, planText) : false;
       if (!tierOnly && "problem" in rated) return null;
       const advice = await this.advice(agentId);
-      const outcome = tierOnly || "problem" in rated ? { approve: tierOnly, reasons: [] } : autoApproval(rated.risk, settings.autoApprove, await this.reviewFacts(state, advice && advice.hash === planHash(planText) ? advice.verdict : null, settings, planText, { agentId }, catchUp));
+      const rule = tierOnly || "problem" in rated ? { approve: tierOnly, reasons: [] } : autoApproval(rated.risk, settings.autoApprove, await this.reviewFacts(state, advice && advice.hash === planHash(planText) ? advice.verdict : null, settings, planText, { agentId }, catchUp));
+      const asked = await this.questionsReason(planText);
+      const outcome = asked ? { approve: false, reasons: [...rule.reasons, asked] } : rule;
       if (!outcome.approve) return { approved: false, line: `${rating} Needs your approval: ${outcome.reasons.join("; ")}.`, reasons: outcome.reasons };
       // Every other check passed, so only a plan that would be approved automatically claims. The
       // coordinator answers `granted` only when no overlapping plan holds or holds a newer approval;
@@ -843,7 +871,9 @@ export class PlannotatorBridge {
     const rated = parsePlanRisk(parked.plan);
     if ("problem" in rated) return;
     const settings = await this.settings.read();
-    const outcome = autoApproval(rated.risk, settings.autoApprove, await this.reviewFacts(await this.linear.issueState(parked.issueId), verdict, settings, parked.plan, { agentId: parked.agentId, startedAt: parked.roundStartedAt }, Boolean(await this.catchUpOf(parked.issueId))));
+    const rule = autoApproval(rated.risk, settings.autoApprove, await this.reviewFacts(await this.linear.issueState(parked.issueId), verdict, settings, parked.plan, { agentId: parked.agentId, startedAt: parked.roundStartedAt }, Boolean(await this.catchUpOf(parked.issueId))));
+    const asked = await this.questionsReason(parked.plan);
+    const outcome = asked ? { approve: false, reasons: [...rule.reasons, asked] } : rule;
     const rating = `Risk: ${ratingText(rated.risk)}.`;
     let reasons = outcome.reasons;
     let approved = outcome.approve;

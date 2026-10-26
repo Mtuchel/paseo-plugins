@@ -11,6 +11,7 @@ import { DEFAULT_WORKTREE_SHARDS, DEFAULT_ACTIVATION, DEFAULT_BACKSTOP, DEFAULT_
 import { openInBrowser, parseEvent, planDocument, PlannotatorBridge, plannotatorPaths, planRound, roundStep, writeOpenScript, type CatchUpHooks, type Parking } from "./plannotator";
 import { ReviewClosedError } from "./sessions";
 import type { ParkedPlan } from "./parked";
+import { QuestionsUnansweredError } from "./plan-questions";
 import { Handover, PARKED_PLAN_LINE, type HandoverRecord } from "./handover";
 import { Writeback } from "./writeback";
 import { DEFAULT_AUTO_APPROVE } from "../shared/plan-risk";
@@ -3168,4 +3169,68 @@ test("a catch-up sent back returns its record to planning and is delivered like 
   assert.ok(calls.includes("+plan-rework issue-1"));
   assert.ok(calls.some((call) => call.startsWith("comment issue-1: ↩️ **Plan sent back**")));
   assert.ok(!calls.some((call) => call.startsWith("catchup-apply")), "a send-back applies nothing");
+});
+
+// Plan questions (README, "Plan questions"): approvals without answers wait for every question.
+const ASKED = async () => [{ number: 1, line: 12, prompt: "Which store?", status: "open" }];
+
+test("an inbox approval is refused before anything is journaled while the plan has unanswered questions; a send-back still goes through", async () => {
+  const f = tracked({ "linear.issueId": "issue-1", "linear.identifier": "TUC-25" });
+  const decided: boolean[] = [];
+  await withEvents([{ type: "opened", agentId: "agent-1", localUrl: "http://localhost:4000/", remoteUrl: null, at: "2026-01-01T10:00:00Z" }], async (directory) => {
+    const bridge = new PlannotatorBridge(f.linear, { read: async () => settings }, directory, undefined, async () => RISKY(2), undefined, undefined, undefined, async (_url, approve) => { decided.push(approve); }, () => {});
+    bridge.useQuestionCheck(ASKED);
+    bridge.attach(f.paseo);
+    await bridge.drain();
+    await assert.rejects(bridge.decideOwner("http://localhost:4000/", true, "", "agent-1", { source: "inbox" }), (error: Error) => error instanceof QuestionsUnansweredError && /Q1\. Which store\? \(line 12\)/.test(error.message));
+    assert.deepEqual(decided, [], "Plannotator was not asked");
+    assert.equal(bridge.decisionJournal.attempts().length, 0, "nothing is journaled");
+    await bridge.decideOwner("http://localhost:4000/", false, "Answer it yourself.", "agent-1", { source: "inbox" });
+    assert.deepEqual(decided, [false]);
+    await bridge.stop();
+  });
+});
+
+test("approve-later and split from the panel are refused while the plan has unanswered questions", async () => {
+  for (const mode of ["later", "split"] as const) {
+    const { calls, linear, paseo } = setup({ "linear.issueId": "issue-1", "linear.identifier": "TUC-25" });
+    const { sessions } = panelFakes(calls);
+    const { parking } = parkingFake(calls);
+    await withEvents([], async (directory) => {
+      const bridge = new PlannotatorBridge(linear, { read: async () => settings }, directory, sessions as never, async () => SPLIT_PLAN, undefined, undefined, undefined, async () => {}, () => {}, parking);
+      bridge.useQuestionCheck(ASKED);
+      bridge.attach(paseo);
+      await assert.rejects(bridge.decidePanel(PANEL as never, mode), QuestionsUnansweredError);
+      assert.equal(bridge.decisionJournal.attempts().length, 0, `${mode}: nothing is journaled`);
+      await bridge.stop();
+    });
+    assert.ok(!calls.some((call) => call.startsWith("hold ") || call.startsWith("create ") || call === "group"), `${mode}: the workflow did not run`);
+  }
+});
+
+test("a plan that asks the owner a question is not approved automatically, nor when its questions cannot be checked", async () => {
+  const plan = RISKY(1);
+  const run = async (check: () => Promise<{ number: number; line: number; prompt: string; status: string }[]>) => {
+    const { calls, linear, paseo } = setup({ "linear.issueId": "issue-1", "linear.identifier": "TUC-25" });
+    const decisions: boolean[] = [];
+    await withEvents([
+      { type: "advised", agentId: "agent-1", verdict: "agreed", hash: planHash(plan), at: "2026-01-01T09:59:00Z" },
+      { type: "opened", agentId: "agent-1", localUrl: "http://localhost:4000/", remoteUrl: "https://host.ts.net:4000/", at: "2026-01-01T10:00:00Z" },
+    ], async (directory) => {
+      const bridge = new PlannotatorBridge(linear, { read: async () => settings }, directory, undefined, async () => plan, undefined, undefined, undefined, async (_url, approve) => { decisions.push(approve); });
+      bridge.useQuestionCheck(check);
+      bridge.attach(paseo);
+      await bridge.drain();
+      await bridge.drain();
+      bridge.stop();
+    });
+    return { decisions, comment: calls.find((call) => call.startsWith("comment issue-1: 📋")) ?? "" };
+  };
+  const asked = await run(ASKED);
+  assert.deepEqual(asked.decisions, []);
+  assert.match(asked.comment, /it asks you a question/);
+  const unchecked = await run(async () => { throw new Error("bun is gone"); });
+  assert.deepEqual(unchecked.decisions, []);
+  assert.match(unchecked.comment, /its questions could not be checked/);
+  assert.deepEqual((await run(async () => [])).decisions, [true], "a plan without questions is approved as before");
 });

@@ -6,6 +6,7 @@ import test from "node:test";
 import { setImmediate } from "node:timers/promises";
 import { once } from "node:events";
 import { createServer, type AddressInfo } from "node:net";
+import { createServer as createHttpServer } from "node:http";
 import type { PaseoApi } from "@getpaseo/client";
 import type { AgentPermissionRequest, AgentPermissionResponse } from "@getpaseo/protocol/agent-types";
 import { fingerprint } from "./deputy";
@@ -468,6 +469,27 @@ test("feedback for a review whose Plannotator server is gone reaches the agent i
   assert.equal((await h.store.get("s1"))?.review, null);
   assert.match(h.calls.at(-1) ?? "", /^send a1: Your Plannotator plan review closed[\s\S]*Split step 2 in two/);
   await h.cleanup();
+});
+
+test("an approval Plannotator refuses for unanswered questions keeps the review open and tells the owner why", async () => {
+  const server = createHttpServer((_request, response) => {
+    response.writeHead(422, { "content-type": "application/json" });
+    response.end(JSON.stringify({ error: "Answer every question before approving. Still waiting: Q1. Which store?", code: "questions_unanswered" }));
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const port = (server.address() as AddressInfo).port;
+  const h = routerHarness([], { decideReview: (url, approve, feedback) => decidePlannotatorReview(url, approve, feedback) });
+  try {
+    await h.store.put({ ...link, review: { localUrl: `http://127.0.0.1:${port}` } });
+    await h.router.prompted("s1", { id: "p1", content: { body: "approve" } });
+    assert.deepEqual((await h.store.get("s1"))?.review, { localUrl: `http://127.0.0.1:${port}` }, "the review stays decidable");
+    assert.equal(h.calls.at(-1), "response:Answer every question before approving. Still waiting: Q1. Which store?");
+    assert.ok(!h.calls.some((call) => call.startsWith("send a1")), "nothing reaches the agent");
+  } finally {
+    server.close();
+    await h.cleanup();
+  }
 });
 
 test("a ticket keeps one open Paseo thread: older threads are closed once a newer one has the agent", async () => {

@@ -32,6 +32,7 @@ import { ghostAgents, LIVE_AGENT, ticketProcessLiveness, WORKER_ALIVE_REASON, ty
 import { WATCHDOG_LABEL, type TicketRoots, type WatchdogOutcome, type WatchdogRequest, type WatchdogStore } from "./watchdog";
 import type { ReviewDeletions } from "./review-deletions";
 import { DecisionPendingError, FencedError } from "./decision-journal";
+import { QUESTIONS_UNANSWERED_CODE, QuestionsUnansweredError } from "./plan-questions";
 import { RepairBusyError } from "./repair-exclusion";
 import { candidates, normalizeModel } from "../shared/model-fallbacks";
 import { availability, claims, finishPending, incidentFor, LIMIT_SPACING, limitError, limitSchedule, limitTime, updateEpisode, type LimitPending, type LimitResumeStore, type UsageReader } from "./limit-resume";
@@ -984,7 +985,7 @@ export class SessionRouter {
         const reply = await this.deps.decidePlan(link, later ? "later" : "split");
         if (reply) await this.say(sessionId, "response", reply);
       } catch (error) {
-        if (!(error instanceof DecisionPendingError || error instanceof FencedError)) throw error;
+        if (!(error instanceof DecisionPendingError || error instanceof FencedError || error instanceof QuestionsUnansweredError)) throw error;
         await this.say(sessionId, "response", error.message);
       }
       return;
@@ -998,7 +999,7 @@ export class SessionRouter {
         await this.say(sessionId, "thought", approve ? "Plan approved." : "Plan sent back with your feedback.");
         return;
       } catch (error) {
-        if (error instanceof DecisionPendingError || error instanceof FencedError) { await this.say(sessionId, "response", error.message); return; }
+        if (error instanceof DecisionPendingError || error instanceof FencedError || error instanceof QuestionsUnansweredError) { await this.say(sessionId, "response", error.message); return; }
         if (!(error instanceof ReviewClosedError)) throw error;
         if (error.outcomeUnknown) {
           await this.say(sessionId, "response", "Plannotator did not answer, so it is not confirmed that it took your decision. Paseo asks it again and carries the decision out once it is confirmed; the review inbox shows it under Being applied.");
@@ -2864,6 +2865,13 @@ export async function decidePlannotatorReview(localUrl: string, approve: boolean
     const code = error instanceof Error && error.cause && typeof error.cause === "object" && "code" in error.cause ? error.cause.code : null;
     throw new ReviewClosedError(`Plannotator is not reachable at ${origin}: ${error instanceof Error ? error.message : error}`, code !== "ECONNREFUSED");
   });
+  if (response.status === 422) {
+    // Plannotator refused the approval: the plan has unanswered questions; the review stays open.
+    const body: unknown = await response.json().catch(() => null);
+    if (body && typeof body === "object" && "code" in body && body.code === QUESTIONS_UNANSWERED_CODE) {
+      throw new QuestionsUnansweredError("error" in body && typeof body.error === "string" ? body.error : "Answer every question in Plannotator before approving.");
+    }
+  }
   if (!response.ok) throw new ReviewClosedError(`Plannotator answered HTTP ${response.status}; the review is already closed.`);
 }
 
