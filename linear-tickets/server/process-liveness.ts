@@ -141,20 +141,26 @@ function rpcProcesses(output: string): { pid: number; session?: string; ambiguou
 // owner. Public snapshots carry provider runtime/persistence identities; no private disk schema.
 // `subagents`: closed or archived subagents' workers count too (SessionRouter.whileIdle, which
 // must not run while any worker of the ticket lives); otherwise only roots are inspected.
-export async function ticketProcessLiveness(paseo: PaseoApi, issueId: string, extra: ProcessAgent[] = [], inspect: ProcessInspector = inspector, options: { subagents?: boolean } = {}): Promise<ProcessLiveness> {
+// `agents`: a listing the caller already read, archived agents included (any tickets: this one's
+// are picked by label), instead of listing the ticket's agents from the daemon.
+export async function ticketProcessLiveness(paseo: PaseoApi, issueId: string, extra: ProcessAgent[] = [], inspect: ProcessInspector = inspector, options: { subagents?: boolean; agents?: ProcessAgent[] } = {}): Promise<ProcessLiveness> {
   try {
     const agents = new Map<string, ProcessAgent>();
-    let cursor: string | undefined;
-    const cursors = new Set<string>();
-    for (let pageNumber = 0; ; pageNumber++) {
-      if (pageNumber === MAX_PAGES) return "unknown";
-      const page = await paseo.agents.list({ filter: { labels: { "linear.issueId": issueId }, includeArchived: true }, page: { limit: 200, ...(cursor ? { cursor } : {}) } });
-      for (const { agent } of page.entries) agents.set(agent.id, agent);
-      if (!page.pageInfo) return "unknown";
-      if (!page.pageInfo.hasMore) break;
-      cursor = page.pageInfo.nextCursor ?? undefined;
-      if (!cursor || cursors.has(cursor)) return "unknown";
-      cursors.add(cursor);
+    if (options.agents) {
+      for (const agent of options.agents) if (agent.id && agent.labels?.["linear.issueId"] === issueId) agents.set(agent.id, agent);
+    } else {
+      let cursor: string | undefined;
+      const cursors = new Set<string>();
+      for (let pageNumber = 0; ; pageNumber++) {
+        if (pageNumber === MAX_PAGES) return "unknown";
+        const page = await paseo.agents.list({ filter: { labels: { "linear.issueId": issueId }, includeArchived: true }, page: { limit: 200, ...(cursor ? { cursor } : {}) } });
+        for (const { agent } of page.entries) agents.set(agent.id, agent);
+        if (!page.pageInfo) return "unknown";
+        if (!page.pageInfo.hasMore) break;
+        cursor = page.pageInfo.nextCursor ?? undefined;
+        if (!cursor || cursors.has(cursor)) return "unknown";
+        cursors.add(cursor);
+      }
     }
     // The caller refreshed before this listing. Include a missing target, but never let that
     // earlier snapshot erase a newly closed/archived identity returned by the listing.

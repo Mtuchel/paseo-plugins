@@ -1153,14 +1153,25 @@ export class SessionRouter {
         console.log(`[linear-tickets] ${link.identifier}: queued thread ended in Linear (${status ?? "gone"}); no agent started`);
         return;
       }
-      // Every pass reads the owners from the shared directory, which decides only that the thread
-      // waits. A step that links, starts or reconnects confirms them on the daemon first; when the
-      // daemon disagrees, the thread waits for the next pass, which lists afresh.
-      const { current: existing, previous } = await this.queuedOwners(link, await this.deps.agentDirectory.all());
-      const confirmed = async (): Promise<boolean> => {
-        const fresh = await this.queuedOwners(link, await this.ticketHistory(link.issueId));
-        if (fresh.current?.id === existing?.id && fresh.previous?.id === previous?.id) return true;
+      // Every pass reads the owners and the ticket's OMP workers from the shared directory, which
+      // decides only that the thread waits. A step that links, starts or reconnects confirms the
+      // owners on the daemon first; when the daemon disagrees, the thread waits for the next pass,
+      // which lists afresh. A start re-reads the workers in startFor itself.
+      const listed = await this.deps.agentDirectory.all();
+      const { current: existing, previous } = await this.queuedOwners(link, listed);
+      // `workers`: the step also needs every OMP worker of the ticket to have exited (a link: a
+      // start checks them in startFor).
+      const confirmed = async (workers: boolean): Promise<boolean> => {
+        const history = await this.ticketHistory(link.issueId);
+        const fresh = await this.queuedOwners(link, history);
+        if (fresh.current?.id !== existing?.id || fresh.previous?.id !== previous?.id) {
+          this.deps.agentDirectory.invalidate();
+          return false;
+        }
+        const wait = workers ? await this.processWait(link.issueId, [], { agents: history }) : null;
+        if (!wait) return true;
         this.deps.agentDirectory.invalidate();
+        if (link.queueReason !== wait) await this.deps.store.patch(link.sessionId, { queueReason: wait });
         return false;
       };
       // Reconnecting an empty retired run is accounting, not a resume or a successful completion.
@@ -1175,11 +1186,11 @@ export class SessionRouter {
           if (link.queueReason !== reason) await this.deps.store.patch(link.sessionId, { queueReason: reason });
           return;
         }
-        if (!await confirmed()) return;
+        if (!await confirmed(false)) return;
         await this.deps.store.patch(link.sessionId, { ...(previous ? { agentId: previous.id } : {}), queued: false, queueReason: undefined, restartRequested: undefined });
         return;
       }
-      const wait = await this.processWait(link.issueId);
+      const wait = await this.processWait(link.issueId, [], { agents: listed });
       if (wait) {
         if (link.queueReason !== wait) await this.deps.store.patch(link.sessionId, { queueReason: wait });
         return;
@@ -1192,7 +1203,7 @@ export class SessionRouter {
         return;
       }
       if (existing) {
-        if (!await confirmed()) return;
+        if (!await confirmed(true)) return;
         // A caller's failed store patch replays its activity, never the send. Refresh first:
         // retirement between the directory read and dispatch must not resurrect a dead agent.
         const text = link.pendingText;
@@ -1229,7 +1240,7 @@ export class SessionRouter {
         if (link.queueReason !== admission.reason) await this.deps.store.patch(link.sessionId, { queueReason: admission.reason });
         return;
       }
-      if (!await confirmed()) return;
+      if (!await confirmed(false)) return;
     } catch (error) {
       if (error instanceof RateLimitedError) throw error;
       if (link.queueReason !== undefined) await this.deps.store.patch(link.sessionId, { queueReason: undefined });
@@ -1854,7 +1865,7 @@ export class SessionRouter {
 
   // Called only with the Launcher gate held; successor/recovery paths also hold the ticket's turn.
   // Unobservable is a pending wait, not exit; no dispatch claim, send, reload or launch precedes it.
-  private async processWait(issueId: string, extra: ProcessAgent[] = [], options: { subagents?: boolean } = {}): Promise<string | null> {
+  private async processWait(issueId: string, extra: ProcessAgent[] = [], options: { subagents?: boolean; agents?: ProcessAgent[] } = {}): Promise<string | null> {
     try {
       const state = await (this.deps.processLiveness ?? ticketProcessLiveness)(this.paseo!, issueId, extra, undefined, options);
       if (state === "absent") return null;

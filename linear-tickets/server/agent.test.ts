@@ -354,7 +354,7 @@ function harness(options: { owner?: (issueId: string) => Promise<"here" | "elsew
     stop: async (agentId) => { calls.push(`stop ${agentId}`); },
     decideReview: options.decideReview ?? (async (url, approve, feedback) => { calls.push(`review ${url} ${approve ? "approve" : `deny:${feedback}`}`); }),
     ...("reload" in options ? { reloader: async () => options.reload ? async (agentId: string) => { calls.push(`reload ${agentId}`); await options.reload!(agentId); } : null } : {}),
-    ...(options.processLiveness ? { processLiveness: options.processLiveness } : options.processInspector ? { processLiveness: (paseo: PaseoApi, issueId: string, extra?: ProcessAgent[]) => ticketProcessLiveness(paseo, issueId, extra, options.processInspector) } : {}),
+    ...(options.processLiveness ? { processLiveness: options.processLiveness } : options.processInspector ? { processLiveness: (paseo: PaseoApi, issueId: string, extra?: ProcessAgent[], _inspect?: ProcessInspector, mode?: Parameters<typeof ticketProcessLiveness>[4]) => ticketProcessLiveness(paseo, issueId, extra, options.processInspector, mode) } : {}),
   });
   // Deterministic session/queue tests drive the sweep themselves, as do the group tests.
   if (options.groups || options.manual) Object.assign(router, { paseo });
