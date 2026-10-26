@@ -5719,7 +5719,10 @@ is read until the board is opened. An agent's timeline tail is read again only w
 has not moved keeps the tail read before, so an open board costs the daemon one tail read per
 agent that worked in the last minute instead of one per live ticket agent. When Linear or GitHub
 cannot be read the board stays up from the hosts' facts and marks that source unavailable. The
-page refreshes every minute and shows when each source was last read.
+page refreshes every minute while it is visible and shows when each source was last read; a page
+in a background tab or a minimized window asks nothing, and reads again as soon as it is shown
+when its reading is older than a minute. A board left open in a background tab used to keep both
+daemons reading tails around the clock (140 to 600 tail reads an hour on server087, 2026-10-25/26).
 
 ## Owner asks
 
