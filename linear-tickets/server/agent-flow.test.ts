@@ -27,7 +27,7 @@ import type { CandidateIssue, DoneIssue, PlanDocument } from "./linear";
 import type { PullRequestRead } from "./label-sync";
 import { advisorNote, PLAN_REQUIRED_NOTE, PLAN_SECTIONS_NOTE, PLAN_SLICING_NOTE, planPolicy } from "./plan-policy";
 import { REPAIR_BUSY_MESSAGE, RepairBusyError } from "./repair-exclusion";
-import type { ProcessInspector } from "./process-liveness";
+import { ticketProcessLiveness, WORKER_ALIVE_REASON, type ProcessInspector } from "./process-liveness";
 import { ReviewDeletions } from "./review-deletions";
 import { WatchdogStore } from "./watchdog";
 import type { RouteRecord, SmallRoutes } from "./small-route";
@@ -920,6 +920,56 @@ test("a cached listing that misses the ticket's running agent starts no second o
   assert.deepEqual(starts, []);
   assert.deepEqual([(await h.store.get("q1"))?.agentId, (await h.store.get("q1"))?.queued], ["elsewhere", false]);
   await h.cleanup();
+});
+
+// An archived OMP root whose worker process still runs: the ticket waits for it to exit.
+const HANDLE = "/home/mirko/.omp/agent/sessions/worktree/2026-10-05T11-05-57-212Z_01a10bbd-e6dc-7761-93d1-081ca47d9501.jsonl";
+const exitedRoot = { id: "exited", title: "Archived planner", provider: "omp", cwd: "/repo/worktree", archivedAt: "2026-01-02T00:00:00Z", persistence: { provider: "omp", sessionId: "01a10bbd-e6dc-7761-93d1-081ca47d9501", nativeHandle: HANDLE } };
+const workerRuns: ProcessInspector = { processes: async () => `2100185 omp --mode rpc-ui --session ${HANDLE}\n`, cwd: async () => "/elsewhere", canonicalPath: async (path) => path };
+
+function workerHarness(listed: { id: string; title: string }[], starts: string[]) {
+  const agentDirectory = new AgentDirectory();
+  const h = routerHarness([], {
+    api: { activity: async () => {}, openSessions: async () => [], activities: async () => [], sessionStatus: async () => "stale", sessionStatuses: async () => new Map() } as never,
+    linear: { viewerId: async () => OWNER, addLabel: async () => {}, removeLabel: async () => {}, complete: async () => {}, admissionStates: async (ids: string[]) => new Map(ids.map((id) => [id, { id, statusType: "unstarted", status: "Todo" }])) } as never,
+    starter: { admission: async () => ({ ok: true as const }), start: async (id: string) => { starts.push(id); throw new Error("unused"); } },
+    processLiveness: (paseo, issueId, extra, _inspect, options) => ticketProcessLiveness(paseo, issueId, extra, workerRuns, options),
+    agentDirectory,
+  }, listed);
+  agentDirectory.attach(h.paseo);
+  const ticketListings: unknown[] = [];
+  const list = h.paseo.agents.list.bind(h.paseo.agents);
+  Object.assign(h.paseo.agents, { list: async (input: { filter?: { labels?: unknown } }) => { if (input.filter?.labels) ticketListings.push(input.filter.labels); return list(input as never); } });
+  return { ...h, agentDirectory, ticketListings };
+}
+
+test("a thread waiting for its ticket's OMP worker to exit asks the daemon nothing about the ticket", async () => {
+  const starts: string[] = [];
+  const h = workerHarness([exitedRoot], starts);
+  await h.store.put({ ...link, sessionId: "q1", agentId: null, queued: true });
+  await h.router.startQueued();
+  await h.router.startQueued();
+  assert.deepEqual(starts, []);
+  assert.equal((await h.store.get("q1"))?.queueReason, WORKER_ALIVE_REASON);
+  assert.deepEqual(h.ticketListings, [], "owners and workers come from the shared directory");
+  await h.cleanup();
+});
+
+test("a cached listing that misses a still-running worker neither starts an agent nor links one: the daemon's listing decides", async () => {
+  for (const running of [false, true]) {
+    const starts: string[] = [];
+    const listed: { id: string; title: string }[] = running ? [{ id: "running", title: "Running agent" }] : [];
+    const h = workerHarness(listed, starts);
+    await h.agentDirectory.all();
+    // Archived after the directory listed the daemon, its process not yet exited.
+    listed.push(exitedRoot);
+    await h.store.put({ ...link, sessionId: "q1", agentId: null, queued: true });
+    await h.router.startQueued();
+    assert.deepEqual(starts, [], `running ${running}`);
+    const after = await h.store.get("q1");
+    assert.deepEqual([after?.agentId, after?.queued, after?.queueReason], [null, true, WORKER_ALIVE_REASON], `running ${running}`);
+    await h.cleanup();
+  }
 });
 
 test("a parked plan's thread offers no resume when its agent is retired, and starts a fresh agent once the owner decided", async () => {
