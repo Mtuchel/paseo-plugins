@@ -26,6 +26,7 @@ import type { PipelineReview } from "./plan-pipeline";
 import { CLAIM_ROUTE, ClaimBody, RecordBody, SettleBody, type ApprovalClaims, type HolderAnswer } from "./approval-claims";
 import { withPriority } from "./rate-budget";
 import { ReviewClosedError } from "./sessions";
+import { QuestionsUnansweredError } from "./plan-questions";
 
 // The checked inbox backend. The browser-facing port 127.0.0.1:47832 and the tailnet origin
 // :8444 belong to the persistent inbox frontdoor now (inbox-frontdoor.ts, installed by
@@ -833,6 +834,7 @@ export class ReviewLinks {
       // own answer decides, and only a lost answer leaves the outcome unknown.
       if (error instanceof DecisionPendingError) throw new DecisionError(409, error.message);
       if (error instanceof FencedError) throw new DecisionError(503, error.message);
+      if (error instanceof QuestionsUnansweredError) throw new DecisionError(422, error.message);
       const uncertain = error instanceof ReviewClosedError && error.outcomeUnknown;
       throw new DecisionError(uncertain ? 502 : 409, error instanceof Error ? error.message : String(error), uncertain);
     }
