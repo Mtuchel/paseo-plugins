@@ -901,8 +901,11 @@ test("a paged source review is answered through the canonical owner action", asy
 const flush = () => new Promise<void>((resolve) => { setImmediate(() => resolve()); });
 // A background collection is never part of the answer that triggered it: turn the event loop until
 // it has reached the step the test waits on, so the counts that follow are the collection's own.
+// The bound is time, not a number of turns: the collection reads files on the way, and under a full
+// parallel test run those reads can outlast any fixed number of turns.
 const until = async (condition: () => boolean) => {
-  for (let turn = 0; turn < 100 && !condition(); turn++) await flush();
+  const deadline = performance.now() + 5_000;
+  while (!condition() && performance.now() < deadline) await flush();
   assert.ok(condition(), "the background collection did not reach the expected step");
 };
 const openQuestion = (body: Record<string, unknown>) => (body.live as { agentId: string; requestId: string; revision: string }[])[0];
