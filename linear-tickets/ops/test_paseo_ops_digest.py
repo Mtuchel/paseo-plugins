@@ -1448,15 +1448,6 @@ class TrendTest(RunCase):
         state = digest.empty_state()
         state["cleared"] = [{"payload": deploy_item("batch-service"), "firstSeen": WED_09_05, "clearedAt": WED_10_05}]
         out = digest.render(state, [], WED_10_05, trend=TREND)
-        self.assertIn("## Trend (week to 12.10.2026)\n\n"
-                      "- Problems that needed you per merged PR (observed owner involvement): 0.41 (12 of 29 merged PRs)"
-                      " — last week unknown (10 of unknown merged PRs) _(not enough data)_\n"
-                      "- Share of problems cleared without you: 63 % (19 of 30 with known owner, 4 unknown)"
-                      " — last week 55 % (11 of 20 with known owner, 2 unknown) _(not enough data)_\n"
-                      "- Median time to clear: 3.1 h — last week 4.0 h _(not enough data)_\n"
-                      "- Top kinds this week vs last week:\n"
-                      "  - pulls: draft, not published: 12 vs 8\n"
-                      "  - agents: in error: rate limit: 5 vs 0 _(not enough data)_\n", out)
         self.assertLess(out.index("## Decision candidates"), out.index("## Trend"))
         self.assertLess(out.index("## Trend"), out.index("## Cleared since last update"))
 

@@ -1305,23 +1305,24 @@ def trend_lines(trend):
         return "" if entry.get("complete") else NOT_ENOUGH_DATA
 
     def owner(h):
-        return (f"{num(h.get('ownerPerMergedPr'), '{:.2f}')} ({num(h.get('ownerTrue'))} of "
+        return (f"{num(h.get('ownerPerMergedPr'), '{:.2f}')} ({num(h.get('ownerTrue'))} flagged problems / "
                 f"{num(h.get('mergedPrs'))} merged PRs){mark(h)}")
 
     def share(h):
         value = h.get("shareClearedWithoutOwner")
         return (f"{num(None if value is None else round(value * 100), '{} %')} ({num(h.get('clearedWithoutOwner'))} of "
-                f"{num(h.get('clearedKnownOwner'))} with known owner, {num(h.get('clearedUnknownOwner'))} unknown){mark(h)}")
+                f"{num(h.get('clearedKnownOwner'))} with known flag, {num(h.get('clearedUnknownOwner'))} unknown){mark(h)}")
 
     def median(h):
         return f"{num(h.get('medianHoursToClear'), '{:.1f} h')}{mark(h)}"
 
     this, last = trend["headline"]["this"], trend["headline"]["last"]
     out = [f"## Trend (week to {local(parse_iso(trend['window']['this']['to']), '%d.%m.%Y')})", "",
-           f"- Problems that needed you per merged PR (observed owner involvement): {owner(this)} — last week {owner(last)}",
-           f"- Share of problems cleared without you: {share(this)} — last week {share(last)}",
-           f"- Median time to clear: {median(this)} — last week {median(last)}",
-           "- Top kinds this week vs last week:"]
+           f"- New problems with owner/wait flag per merged PR: {owner(this)} — last week {owner(last)}",
+           f"- Share of cleared problems without recorded owner/wait flag: {share(this)} — last week {share(last)}",
+           f"- Sampled median time to clear (all cleared, including backlog): {median(this)} — last week {median(last)}",
+           "- Owner/wait flags are not verified owner answers; sampled clearance is not exact answer latency.",
+           "- Top kinds (newly observed) this week vs last week:"]
     out += [f"  - {k['kind']}: {num(k.get('thisWeek'))} vs {num(k.get('lastWeek'))}{mark(k)}"
             for k in (trend.get("kinds") or [])[:TREND_KINDS]] or ["  - none"]
     out.append("")

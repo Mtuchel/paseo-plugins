@@ -339,7 +339,7 @@ export function coverage(history: History, source: Source, windows: Window[]): C
 type Evidence = "yes" | "no" | "unknown";
 export type Tally = { yes: number; no: number; unknown: number };
 export type KindWindow = {
-  count: number; stillOpen: number; clearedCount: number; medianHours: number | null; p90Hours: number | null;
+  count: number; stillOpen: number; clearedCount: number; backlogClearedCount: number; medianHours: number | null; p90Hours: number | null;
   owner: Tally; auto: Tally; hoursLost: number; examples: { key: string; ticket: string | null }[];
 };
 
@@ -383,6 +383,7 @@ export function kindWindow(occurrences: Occurrence[], window: Window, hosts: str
     count: counted.length,
     stillOpen: counted.filter((occurrence) => occurrence.clearedAt === null || occurrence.clearedAt >= window.to).length,
     clearedCount: cleared.length,
+    backlogClearedCount: cleared.filter((occurrence) => occurrence.first < window.from).length,
     medianHours: median === null ? null : round1(median),
     p90Hours: p90 === null ? null : round1(p90),
     owner: tally((occurrence) => ownerAt(occurrence, window.to)),
@@ -555,26 +556,30 @@ export function relapse(history: History, ticket: { completedAt: string }, kinds
 const num = (value: number | null, unit = "") => (value === null ? "unknown" : `${value}${unit}`);
 const tally = (value: Tally) => `${value.yes} / ${value.no} / ${value.unknown}`;
 const dataNote = (row: KindRow) => (row.coverage.complete ? (row.coverage.excluded.length ? `complete (${row.coverage.hosts!.join(", ")} only)` : "complete") : "not enough data");
+const samplingNote = "Counts are newly observed problems; still-open is that new cohort at window end. Clearance timing covers all problems cleared in the window, including older backlog, from first observation to sampled disappearance—not exact answer latency. Owner/wait flags record waiting or escalation evidence, not verified owner answers.";
 
 function kindTable(rows: KindRow[]): string[] {
   if (!rows.length) return ["- no problems in the last two weeks"];
   return [
-    "| Kind | Last 7 days | 7 days before | Still open | Median h to clear | p90 h | Needed the owner (yes / no / unknown) | Plugin acted (yes / no / unknown) | Hours open (all hosts) | Data |",
-    "| -- | -- | -- | -- | -- | -- | -- | -- | -- | -- |",
-    ...rows.map((row) => `| \`${row.kind}\` | ${row.this.count} | ${row.last.count} | ${row.this.stillOpen} | ${num(row.this.medianHours)} | ${num(row.this.p90Hours)} | ${tally(row.this.owner)} | ${tally(row.this.auto)} | ${row.all.hoursLost} | ${dataNote(row)} |`),
+    "| Kind | New (7 days) | New (7 days before) | New still open | Cleared (7 days) | Of cleared: backlog | Sampled median h to clear | Sampled p90 h | Owner/wait flag (yes / no / unknown) | Plugin acted (yes / no / unknown) | Hours open (all hosts) | Data |",
+    "| -- | -- | -- | -- | -- | -- | -- | -- | -- | -- | -- | -- |",
+    ...rows.map((row) => `| \`${row.kind}\` | ${row.this.count} | ${row.last.count} | ${row.this.stillOpen} | ${row.this.clearedCount} | ${row.this.backlogClearedCount} | ${num(row.this.medianHours)} | ${num(row.this.p90Hours)} | ${tally(row.this.owner)} | ${tally(row.this.auto)} | ${row.all.hoursLost} | ${dataNote(row)} |`),
+    "",
+    samplingNote,
   ];
 }
 
 function headlineLines(analysis: Analysis): string[] {
   const { this: now, last } = analysis.headline;
   const partial = (value: Headline) => (value.complete ? "" : " _(not enough data)_");
-  const perPr = (value: Headline) => `${num(value.ownerPerMergedPr)} (${value.ownerTrue} of ${num(value.mergedPrs)} merged PRs)${partial(value)}`;
-  const share = (value: Headline) => `${value.shareClearedWithoutOwner === null ? "unknown" : `${Math.round(value.shareClearedWithoutOwner * 100)} %`} (${value.clearedWithoutOwner} of ${value.clearedKnownOwner} with known owner, ${value.clearedUnknownOwner} unknown)${partial(value)}`;
+  const perPr = (value: Headline) => `${num(value.ownerPerMergedPr)} (${value.ownerTrue} flagged problems / ${num(value.mergedPrs)} merged PRs)${partial(value)}`;
+  const share = (value: Headline) => `${value.shareClearedWithoutOwner === null ? "unknown" : `${Math.round(value.shareClearedWithoutOwner * 100)} %`} (${value.clearedWithoutOwner} of ${value.clearedKnownOwner} with known flag, ${value.clearedUnknownOwner} unknown)${partial(value)}`;
   const median = (value: Headline) => `${num(value.medianHoursToClear, " h")}${partial(value)}`;
   return [
-    `- Problems that needed you per merged PR (observed owner involvement): ${perPr(now)} — last week ${perPr(last)}`,
-    `- Share of problems cleared without you: ${share(now)} — last week ${share(last)}`,
-    `- Median time to clear: ${median(now)} — last week ${median(last)}`,
+    `- New problems with owner/wait flag per merged PR: ${perPr(now)} — last week ${perPr(last)}`,
+    `- Share of cleared problems without recorded owner/wait flag: ${share(now)} — last week ${share(last)}`,
+    `- Sampled median time to clear (all cleared, including backlog): ${median(now)} — last week ${median(last)}`,
+    "- Owner/wait flags are not verified owner answers; sampled clearance is not exact answer latency.",
   ];
 }
 
@@ -587,12 +592,16 @@ export function ticketDescription(row: KindRow, analysis: Analysis): string {
     "",
     "| | Last 7 days | 7 days before |",
     "| -- | -- | -- |",
-    `| Problems ${pair((value) => String(value.count))}`,
-    `| Still open at the end ${pair((value) => String(value.stillOpen))}`,
-    `| Median / p90 hours to clear ${pair((value) => `${num(value.medianHours)} / ${num(value.p90Hours)}`)}`,
-    `| Needed the owner (yes / no / unknown) ${pair((value) => tally(value.owner))}`,
+    `| Newly observed problems ${pair((value) => String(value.count))}`,
+    `| Of new: still open at the end ${pair((value) => String(value.stillOpen))}`,
+    `| Cleared in the window ${pair((value) => String(value.clearedCount))}`,
+    `| Of cleared: older backlog ${pair((value) => String(value.backlogClearedCount))}`,
+    `| Sampled median / p90 hours to clear ${pair((value) => `${num(value.medianHours)} / ${num(value.p90Hours)}`)}`,
+    `| Owner/wait flag (yes / no / unknown) ${pair((value) => tally(value.owner))}`,
     `| The plugin acted on it (yes / no / unknown) ${pair((value) => tally(value.auto))}`,
     `| Hours open ${pair((value) => String(value.hoursLost))}`,
+    "",
+    samplingNote,
     "",
     `Data: ${dataNote(row)}${row.coverage.excluded.length ? `; not counted: ${row.coverage.excluded.join(", ")} (not read often enough)` : ""}. All hosts together: ${row.all.count} problems, ${row.all.hoursLost} hours open.`,
     "",

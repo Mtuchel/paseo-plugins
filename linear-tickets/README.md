@@ -4864,13 +4864,18 @@ node --import tsx scripts/ops-review.ts file             # do it (server087 only
 
 Options: `--now <iso>`, `--history <dir>` (default `$PASEO_HOME/ops-digest`), `--team <key>`
 (default `TUC`). Exits non-zero on any failure. Per kind of problem that needed attention, for
-the last 7 days against the 7 before: count, still open, median and p90 hours to clear, needed
-the owner (yes / no / unknown), the plugin acted on it (yes / no / unknown; acting is not proof
-it fixed anything), hours open, and whether the data is complete. Headline numbers: problems that
-needed the owner per merged tuchel-platform pull request (observed owner involvement, not every
-touch; merged counts GitHub's `is:merged` plus pull requests the Graphite queue landed and
-closed as `externally-merged`; unknown when `gh` fails), the share of cleared problems that
-cleared without the owner (unknowns shown apart), and the median time to clear.
+the last 7 days against the 7 before: newly observed count, that new cohort still open at window
+end, total cleared in the window and how many of those are older backlog, sampled median and
+p90 hours to clear, owner/wait flag (yes / no / unknown), plugin action (yes / no / unknown;
+acting is not proof it fixed anything), hours open, and data completeness. Clearance timing
+covers **all** problems cleared in the window, including older backlog—not just new problems.
+It runs from first observation to sampled disappearance; hourly snapshots do not measure exact
+question-answer latency. Owner/wait flags record waiting or escalation evidence, **not verified
+owner answers**. Headline numbers: new problems with that flag per merged tuchel-platform pull
+request (merged counts GitHub's `is:merged` plus pull requests the Graphite queue landed and
+closed as `externally-merged`; unknown when `gh` fails), the share of cleared problems without
+the recorded flag (unknowns shown apart), and sampled median clearance time including backlog.
+Historical trend field names and numerical definitions are unchanged.
 
 A kind **keeps coming back** at 3 or more problems in the last 7 days (`RECURRING_MIN`). Its
 ticket carries ``Marker: `ops-kind <kind>` `` on a line of its own: in the description of a
@@ -5384,6 +5389,11 @@ question to resolution (unanswered ones listed), owner answers and merged pull r
 per `--repo`) and a verdict: the live median under 15 minutes and fewer owner answers per merged
 pull request pass; no merged pull request or no comparable baseline is inconclusive. Each run is
 archived in `deputy/reports/`, so cases outlive the log's 60 days.
+First-resolution timestamps stay unchanged when a daemon answer echo arrives before the deputy's
+delivery confirmation. A matching echo is attributed to the deputy only with confirmation before
+the window ends and no explicit owner answer at or before that confirmation. A different earlier
+answer or an out-of-window confirmation does not reattribute the resolution; a later owner
+correction does not change who initially resolved it.
 
 **Recall access.** `deputy/recall.json` (`{ "url", "bank", "token" }`, `0600`), else omp's
 `hindsight.apiUrl` with bank `omp` and `HINDSIGHT_API_TOKEN` in the daemon's environment. The

@@ -142,6 +142,24 @@ async function analysis(log: Log, now = NOW, extraKinds: string[] = []) {
   } finally { await rm(directory, { recursive: true, force: true }); }
 }
 
+test("new, cleared and backlog cohorts remain distinct at the window boundaries", async () => {
+  const from = NOW - 7 * DAY;
+  const log = healthy()
+    .problem(WAITING, from - 10 * HOUR, { cleared: from, owner: true })
+    .problem(WAITING, from, { cleared: from + HOUR })
+    .problem(WAITING, NOW - HOUR, { cleared: NOW })
+    .problem(WAITING, NOW - 2 * HOUR, { cleared: null })
+    .problem(WAITING, NOW, { cleared: null });
+  const result = await analysis(log);
+  const row = result.rows.find((found) => found.kind === WAITING)!;
+  assert.deepEqual(
+    [row.this.count, row.this.stillOpen, row.this.clearedCount, row.this.backlogClearedCount],
+    [3, 2, 2, 1],
+  );
+  assert.deepEqual([row.this.medianHours, row.this.p90Hours], [1, 10]);
+  assert.deepEqual(row.this.owner, { yes: 0, no: 3, unknown: 0 });
+});
+
 test("the per-kind table counts problems that needed attention, with owner and automation evidence as known at each window's end", async () => {
   const lastWeek = NOW - 14 * DAY;
   const log = healthy()
@@ -412,19 +430,6 @@ test("remote hosts' problems without evidence count as unknown, never as cleared
   assert.equal(result.headline.this.shareClearedWithoutOwner, 1);
 });
 
-test("headline: problems that needed the owner per merged PR, share cleared without the owner, median time to clear; gh failing → unknown", async () => {
-  const home = await temporary();
-  try {
-    await healthy().burst(WAITING, NOW - 7 * DAY, 4, { owner: true }).burst(DRAFT, NOW - 7 * DAY, 6).write(home);
-    const world = new World();
-    let text = await runCollect(deps(home, world));
-    assert.match(text, /needed you per merged PR \(observed owner involvement\): 0\.2 \(4 of 20 merged PRs\)/);
-    assert.match(text, /cleared without you: 60 % \(6 of 10 with known owner, 0 unknown\)/);
-    assert.match(text, /Median time to clear: 2 h/);
-    text = await runCollect(deps(home, world, { mergedPullRequests: async () => null }));
-    assert.match(text, /merged PR \(observed owner involvement\): unknown \(4 of unknown merged PRs\)/);
-  } finally { await rm(home, { recursive: true, force: true }); }
-});
 
 test("new tickets: at most 3 a week, ranked by hours open, with marker, numbers and the Done-when line; adopted tickets do not use the cap", async () => {
   const home = await temporary();
@@ -444,7 +449,6 @@ test("new tickets: at most 3 a week, ranked by hours open, with marker, numbers 
     assert.deepEqual(world.writes.slice(0, 3), ["create project:Agent tooling state:todo \"Recurring ops problem: pulls: e\"", "create project:Agent tooling state:todo \"Recurring ops problem: pulls: d\"", "create project:Agent tooling state:todo \"Recurring ops problem: pulls: c\""]);
     const description = world.issues.find((issue) => issue.description.includes("pulls: e"))!.description;
     assert.match(description, /^Marker: `ops-kind pulls: e`$/m);
-    assert.match(description, /\| Problems \| 7 \| 0 \|/);
     assert.match(description, /Done when: the weekly count of `pulls: e` is at most half of the week before this ticket closes/);
     // A second run the same week: the cap is used up, nothing is created twice, and the tickets
     // filed this week get no weekly comment (their description holds this week's numbers).

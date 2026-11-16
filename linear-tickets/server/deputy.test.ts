@@ -1159,9 +1159,23 @@ test("waiting time counts every question asked in the window, unanswered ones li
   assert.deepEqual([live.questions, live.resolved, live.unresolved, live.medianMinutes, live.byDeputy, live.ownerAnswers, live.ownerAnswersPerMergedPullRequest], [3, 2, ["q3"], 18, 1, 1, 0.5]);
   const baseline = waitStats([], { since: "2026-09-30T00:00:00.000Z", until: "2026-10-01T00:00:00.000Z" }, 0);
   assert.equal(verdict(baseline, live).pass, null, "no comparable history is inconclusive, not a pass");
-  const report = renderReport({ entries, candidates: [], version: VERSION, now: "2026-10-07T00:00:00Z" });
-  assert.ok(report.includes(`Shadow evidence for ${VERSION}`));
-  assert.match(report, /Answered by the deputy: 1/);
+});
+
+test("report attribution follows confirmed deputy delivery despite daemon echo ordering, without changing first-resolution latency", () => {
+  const window = { since: "2026-10-01T00:00:00.000Z", until: "2026-10-02T00:00:00.000Z" };
+  const question: LogEntry = { kind: "question", id: "q1", at: window.since, identifier: "TUC-1", issueId: "i1", questions: [] };
+  const echo: LogEntry = { kind: "answer", id: "q1", at: "2026-10-01T00:05:00.000Z", answers: { Response: "A" } };
+  const deputy: LogEntry = { kind: "deputy-answer", id: "q1", at: "2026-10-01T00:05:00.083Z", identifier: "TUC-1", issueId: "i1", version: VERSION, key: "intent", answers: { Response: "A" }, citations: [] };
+  for (const events of [[echo, deputy], [deputy, echo]]) {
+    const stats = waitStats([question, ...events], window, 1);
+    assert.deepEqual([stats.resolved, stats.byDeputy, stats.ownerAnswers, stats.medianMinutes], [1, 1, 0, 5]);
+  }
+  const owner: LogEntry = { kind: "owner-answer", id: "q1", at: "2026-10-01T00:05:00.020Z", key: "owner", via: "menu-bar", userId: OWNER, answers: { Response: "A" } };
+  assert.equal(waitStats([question, echo, owner, deputy], window, 1).byDeputy, 0, "an explicit owner-first answer is not credited to the deputy");
+  assert.equal(waitStats([question, { ...echo, answers: { Response: "B" } }, deputy], window, 1).byDeputy, 0, "a different earlier resolution is not a deputy echo");
+  assert.equal(waitStats([question, echo, { ...deputy, at: window.until }], window, 1).byDeputy, 0, "confirmation outside the window cannot rewrite its attribution");
+  const override: LogEntry = { kind: "deputy-override", id: "q1", at: "2026-10-01T00:06:00.000Z", key: "override", via: "menu-bar", userId: OWNER, text: "Use B", disposition: "delivered" };
+  assert.equal(waitStats([question, echo, deputy, override], window, 1).byDeputy, 1, "a later correction does not change who initially resolved the question");
 });
 
 test("a journal outage after evaluation cannot strand the candidate or permit an unchecked prediction", async (t) => {
