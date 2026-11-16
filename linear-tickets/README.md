@@ -3296,6 +3296,18 @@ and their buttons are forwarded to it.
   in `$PASEO_HOME/linear-tickets/plannotator/push.json` (private); a subscription the push service
   drops is removed. Subscribe on one host's inbox: each host notifies its own subscribers.
 
+**Plan questions.** A plan is approved only once every `:::question` block in it is answered;
+a skipped question still waits. Answers are given on Plannotator's page, whose own Approve sends
+them along, so that is where a plan with open questions gets approved. Every other approval
+carries no answers and passes only when the agent settled each question with `[x]`: the inbox's
+**Approve** and the Linear panel's **Approve plan**, **Approve later** and **Split** refuse with
+the questions still waiting (HTTP 422 from the inbox), and the risk policy never auto-approves
+such a plan, it waits for you instead. The plugin reads the blocks with Plannotator's own parser
+(Bun, the installed `@plannotator/pi-extension`); when it cannot, it refuses those approvals
+rather than guess. Plannotator 0.28.6 does not refuse on its own page; until its release does,
+the hosts run a local patch (backups in `~/.omp/plugins/plannotator-0.28.6-backup/`), which
+`omp plugin update` replaces.
+
 With status write-back on, a ticket moves to its team's started state named **Planning**
 while an agent drafts the plan, to **Plan review** when the plan waits for you, to
 **Plan approved** once it is approved and to **In Progress** when the implementing agent starts
