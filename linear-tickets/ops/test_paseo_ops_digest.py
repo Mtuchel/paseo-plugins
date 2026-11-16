@@ -1448,17 +1448,35 @@ class TrendTest(RunCase):
         state = digest.empty_state()
         state["cleared"] = [{"payload": deploy_item("batch-service"), "firstSeen": WED_09_05, "clearedAt": WED_10_05}]
         out = digest.render(state, [], WED_10_05, trend=TREND)
-        self.assertIn("## Trend (week to 12.10.2026)\n\n"
-                      "- Problems that needed you per merged PR (observed owner involvement): 0.41 (12 of 29 merged PRs)"
-                      " — last week unknown (10 of unknown merged PRs) _(not enough data)_\n"
-                      "- Share of problems cleared without you: 63 % (19 of 30 with known owner, 4 unknown)"
-                      " — last week 55 % (11 of 20 with known owner, 2 unknown) _(not enough data)_\n"
-                      "- Median time to clear: 3.1 h — last week 4.0 h _(not enough data)_\n"
-                      "- Top kinds this week vs last week:\n"
-                      "  - pulls: draft, not published: 12 vs 8\n"
-                      "  - agents: in error: rate limit: 5 vs 0 _(not enough data)_\n", out)
         self.assertLess(out.index("## Decision candidates"), out.index("## Trend"))
         self.assertLess(out.index("## Trend"), out.index("## Cleared since last update"))
+
+    def test_trend_metrics_keep_current_previous_and_unknown_evidence_distinct(self):
+        out = digest.render(digest.empty_state(), [], WED_10_05, trend=TREND)
+        lines = out.splitlines()
+        per_pr = next(line for line in lines if line.startswith("- New problems with owner/wait flag per merged PR:"))
+        current, previous = per_pr.split(" — last week ")
+        self.assertIn("0.41 (12 flagged problems / 29 merged PRs)", current)
+        self.assertNotIn("not enough data", current)
+        self.assertIn("unknown (10 flagged problems / unknown merged PRs)", previous)
+        self.assertIn("not enough data", previous)
+        share = next(line for line in lines if line.startswith("- Share of cleared problems without recorded owner/wait flag:"))
+        current, previous = share.split(" — last week ")
+        self.assertIn("63 % (19 of 30 with known flag, 4 unknown)", current)
+        self.assertNotIn("not enough data", current)
+        self.assertIn("55 % (11 of 20 with known flag, 2 unknown)", previous)
+        self.assertIn("not enough data", previous)
+        median = next(line for line in lines if line.startswith("- Sampled median time to clear (all cleared, including backlog):"))
+        current, previous = median.split(" — last week ")
+        self.assertIn(": 3.1 h", current)
+        self.assertNotIn("not enough data", current)
+        self.assertIn("4.0 h", previous)
+        self.assertIn("not enough data", previous)
+        kinds = {line.strip().rsplit(": ", 1)[0]: line.rsplit(": ", 1)[1]
+                 for line in lines if line.startswith("  - pulls:") or line.startswith("  - agents:")}
+        self.assertEqual(kinds["- pulls: draft, not published"], "12 vs 8")
+        self.assertIn("5 vs 0", kinds["- agents: in error: rate limit"])
+        self.assertIn("not enough data", kinds["- agents: in error: rate limit"])
 
     def test_render_without_trend_says_not_computed_yet(self):  # AC-13
         out = digest.render(digest.empty_state(), [], WED_10_05)

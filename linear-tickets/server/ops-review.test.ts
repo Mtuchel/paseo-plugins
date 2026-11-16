@@ -142,6 +142,89 @@ async function analysis(log: Log, now = NOW, extraKinds: string[] = []) {
   } finally { await rm(directory, { recursive: true, force: true }); }
 }
 
+test("new, cleared and backlog cohorts remain distinct at the window boundaries", async () => {
+  const from = NOW - 7 * DAY;
+  const log = healthy()
+    .problem(WAITING, from - 10 * HOUR, { cleared: from, owner: true })
+    .problem(WAITING, from, { cleared: from + HOUR })
+    .problem(WAITING, NOW - HOUR, { cleared: NOW })
+    .problem(WAITING, NOW - 2 * HOUR, { cleared: null })
+    .problem(WAITING, NOW, { cleared: null });
+  const result = await analysis(log);
+  const row = result.rows.find((found) => found.kind === WAITING)!;
+  assert.deepEqual(
+    [row.this.count, row.this.stillOpen, row.this.clearedCount, row.this.backlogClearedCount],
+    [3, 2, 2, 1],
+  );
+  assert.deepEqual([row.this.medianHours, row.this.p90Hours], [1, 10]);
+  assert.deepEqual(row.this.owner, { yes: 0, no: 3, unknown: 0 });
+});
+
+test("collection and filed tickets attach clearance numbers to the correct cohorts", async () => {
+  const directory = await temporary();
+  try {
+    const from = NOW - 7 * DAY;
+    await healthy()
+      .problem(WAITING, from - 10 * HOUR, { cleared: from, owner: true })
+      .problem(WAITING, from, { cleared: from + HOUR })
+      .problem(WAITING, NOW - HOUR, { cleared: NOW })
+      .problem(WAITING, NOW - 2 * HOUR, { cleared: null })
+      .problem(WAITING, NOW, { cleared: null })
+      .write(directory);
+    const world = new World();
+    const input = deps(directory, world);
+    const output = await runCollect(input);
+    const cells = (line: string) => line.split("|").slice(1, -1).map((cell) => cell.trim());
+    const headings = cells(output.split("\n").find((line) => line.startsWith("| Kind |"))!);
+    const values = cells(output.split("\n").find((line) => line.startsWith(`| \`${WAITING}\` |`))!);
+    const row = Object.fromEntries(headings.map((heading, index) => [heading, values[index]]));
+    assert.equal(row["New (7 days)"], "3");
+    assert.equal(row["New (7 days before)"], "1");
+    assert.equal(row["New still open"], "2");
+    assert.equal(row["Cleared (7 days)"], "2");
+    assert.equal(row["Of cleared: backlog"], "1");
+    assert.equal(row["Sampled median h to clear"], "1");
+    assert.equal(row["Sampled p90 h"], "10");
+    assert.equal(row["Owner/wait flag (yes / no / unknown)"], "0 / 3 / 0");
+    assert.equal(row.Data, "complete");
+
+    await runFile(input);
+    assert.equal(world.issues.length, 1);
+    const filed = Object.fromEntries(world.issues[0].description.split("\n")
+      .filter((line) => line.startsWith("|")).map((line) => {
+        const [label, ...values] = cells(line);
+        return [label, values];
+      }));
+    assert.deepEqual(filed["Newly observed problems"], ["3", "1"]);
+    assert.deepEqual(filed["Of new: still open at the end"], ["2", "1"]);
+    assert.deepEqual(filed["Cleared in the window"], ["2", "0"]);
+    assert.deepEqual(filed["Of cleared: older backlog"], ["1", "0"]);
+    assert.deepEqual(filed["Sampled median / p90 hours to clear"], ["1 / 10", "unknown / unknown"]);
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("collected headline preserves unknown denominators and incomplete clearance evidence", async () => {
+  const directory = await temporary();
+  try {
+    await new Log().runs(NOW - 3 * DAY, NOW)
+      .problem(WAITING, NOW - DAY, { owner: true, cleared: NOW - DAY + 2 * HOUR })
+      .problem(WAITING, NOW - DAY, { owner: false, cleared: NOW - DAY + 4 * HOUR })
+      .problem(WAITING, NOW - DAY, { owner: null, cleared: NOW - DAY + 6 * HOUR })
+      .write(directory);
+    const output = await runCollect(deps(directory, new World(), {
+      mergedPullRequests: async (_from, to) => to === NOW ? 4 : null,
+    }));
+    const lines = output.split("\n");
+    const perPr = lines.find((line) => line.startsWith("- New problems with owner/wait flag per merged PR:"))!;
+    assert.match(perPr, /0\.25 \(1 flagged problems \/ 4 merged PRs\).*not enough data/);
+    assert.match(perPr, /last week unknown \(0 flagged problems \/ unknown merged PRs\).*not enough data/);
+    const share = lines.find((line) => line.startsWith("- Share of cleared problems without recorded owner/wait flag:"))!;
+    assert.match(share, /50 % \(1 of 2 with known flag, 1 unknown\).*not enough data/);
+    const median = lines.find((line) => line.startsWith("- Sampled median time to clear (all cleared, including backlog):"))!;
+    assert.match(median, /: 4 h.*not enough data.*last week unknown.*not enough data/);
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
 test("the per-kind table counts problems that needed attention, with owner and automation evidence as known at each window's end", async () => {
   const lastWeek = NOW - 14 * DAY;
   const log = healthy()
@@ -412,19 +495,6 @@ test("remote hosts' problems without evidence count as unknown, never as cleared
   assert.equal(result.headline.this.shareClearedWithoutOwner, 1);
 });
 
-test("headline: problems that needed the owner per merged PR, share cleared without the owner, median time to clear; gh failing → unknown", async () => {
-  const home = await temporary();
-  try {
-    await healthy().burst(WAITING, NOW - 7 * DAY, 4, { owner: true }).burst(DRAFT, NOW - 7 * DAY, 6).write(home);
-    const world = new World();
-    let text = await runCollect(deps(home, world));
-    assert.match(text, /needed you per merged PR \(observed owner involvement\): 0\.2 \(4 of 20 merged PRs\)/);
-    assert.match(text, /cleared without you: 60 % \(6 of 10 with known owner, 0 unknown\)/);
-    assert.match(text, /Median time to clear: 2 h/);
-    text = await runCollect(deps(home, world, { mergedPullRequests: async () => null }));
-    assert.match(text, /merged PR \(observed owner involvement\): unknown \(4 of unknown merged PRs\)/);
-  } finally { await rm(home, { recursive: true, force: true }); }
-});
 
 test("new tickets: at most 3 a week, ranked by hours open, with marker, numbers and the Done-when line; adopted tickets do not use the cap", async () => {
   const home = await temporary();
@@ -444,7 +514,6 @@ test("new tickets: at most 3 a week, ranked by hours open, with marker, numbers 
     assert.deepEqual(world.writes.slice(0, 3), ["create project:Agent tooling state:todo \"Recurring ops problem: pulls: e\"", "create project:Agent tooling state:todo \"Recurring ops problem: pulls: d\"", "create project:Agent tooling state:todo \"Recurring ops problem: pulls: c\""]);
     const description = world.issues.find((issue) => issue.description.includes("pulls: e"))!.description;
     assert.match(description, /^Marker: `ops-kind pulls: e`$/m);
-    assert.match(description, /\| Problems \| 7 \| 0 \|/);
     assert.match(description, /Done when: the weekly count of `pulls: e` is at most half of the week before this ticket closes/);
     // A second run the same week: the cap is used up, nothing is created twice, and the tickets
     // filed this week get no weekly comment (their description holds this week's numbers).

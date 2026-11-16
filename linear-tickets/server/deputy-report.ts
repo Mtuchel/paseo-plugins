@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from "node:util";
 import type { Candidate } from "./deputy";
 import { LIVE_MIN_AGREEMENT, LIVE_MIN_CASES, shadowEvidence, type Evidence } from "./deputy-evidence";
 import type { LogEntry } from "./owner-decisions";
@@ -35,7 +36,10 @@ function median(values: number[]): number | null {
 // window ends is listed, never left out of the count. Owner answers: every resolution the deputy
 // did not cause.
 export function waitStats(entries: LogEntry[], window: Window, mergedPullRequests: number | null): WaitStats {
-  const ends = new Map<string, { at: string; deputy: boolean }>();
+  type Resolution = Extract<LogEntry, { kind: "answer" | "owner-answer" | "deputy-answer" }>;
+  const ends = new Map<string, Resolution>();
+  const confirmations = new Map<string, Extract<Resolution, { kind: "deputy-answer" }>>();
+  const owners = new Map<string, string>();
   // The daemon echoes the initial Other response, not substantive completion.
   const continued = new Set(entries.flatMap(entry => entry.kind === "deputy-continuation" ? [entry.id] : []));
   for (const entry of entries) {
@@ -43,7 +47,9 @@ export function waitStats(entries: LogEntry[], window: Window, mergedPullRequest
     if (entry.answers?.Response === TECHNICAL_CONTINUATION) continue;
     if (continued.has(entry.id) && entry.kind !== "owner-answer") continue;
     const known = ends.get(entry.id);
-    if (!known || entry.at < known.at) ends.set(entry.id, { at: entry.at, deputy: entry.kind === "deputy-answer" });
+    if (!known || entry.at < known.at) ends.set(entry.id, entry);
+    if (entry.kind === "deputy-answer" && entry.at < (confirmations.get(entry.id)?.at ?? window.until)) confirmations.set(entry.id, entry);
+    if (entry.kind === "owner-answer" && entry.at < (owners.get(entry.id) ?? window.until)) owners.set(entry.id, entry.at);
   }
   const deputyAnswered = new Set(entries.flatMap((entry) => entry.kind === "deputy-answer" ? [entry.id] : []));
   const asked = new Map<string, string>();
@@ -55,7 +61,12 @@ export function waitStats(entries: LogEntry[], window: Window, mergedPullRequest
     const end = ends.get(id);
     if (!end || end.at < at || end.at >= window.until) { unresolved.push(id); continue; }
     waits.push((Date.parse(end.at) - Date.parse(at)) / 60_000);
-    if (end.deputy) byDeputy++;
+    // Delivery can be echoed before its confirmation is logged. Keep that first timestamp,
+    // but attribute a matching echo only with in-window confirmation and no owner-first answer.
+    const confirmation = confirmations.get(id);
+    if (end.kind === "deputy-answer" || (end.kind === "answer" && confirmation
+      && (owners.get(id) ?? window.until) > confirmation.at
+      && isDeepStrictEqual(end.answers, confirmation.answers))) byDeputy++;
   }
   const ownerAnswers = new Set(entries.flatMap((entry) => (entry.kind === "answer" || entry.kind === "owner-answer") && entry.answers?.Response !== TECHNICAL_CONTINUATION && inWindow(entry.at, window) && !deputyAnswered.has(entry.id) && (entry.kind === "owner-answer" || !continued.has(entry.id)) ? [entry.id] : [])).size;
   return {
