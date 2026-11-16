@@ -160,6 +160,71 @@ test("new, cleared and backlog cohorts remain distinct at the window boundaries"
   assert.deepEqual(row.this.owner, { yes: 0, no: 3, unknown: 0 });
 });
 
+test("collection and filed tickets attach clearance numbers to the correct cohorts", async () => {
+  const directory = await temporary();
+  try {
+    const from = NOW - 7 * DAY;
+    await healthy()
+      .problem(WAITING, from - 10 * HOUR, { cleared: from, owner: true })
+      .problem(WAITING, from, { cleared: from + HOUR })
+      .problem(WAITING, NOW - HOUR, { cleared: NOW })
+      .problem(WAITING, NOW - 2 * HOUR, { cleared: null })
+      .problem(WAITING, NOW, { cleared: null })
+      .write(directory);
+    const world = new World();
+    const input = deps(directory, world);
+    const output = await runCollect(input);
+    const cells = (line: string) => line.split("|").slice(1, -1).map((cell) => cell.trim());
+    const headings = cells(output.split("\n").find((line) => line.startsWith("| Kind |"))!);
+    const values = cells(output.split("\n").find((line) => line.startsWith(`| \`${WAITING}\` |`))!);
+    const row = Object.fromEntries(headings.map((heading, index) => [heading, values[index]]));
+    assert.equal(row["New (7 days)"], "3");
+    assert.equal(row["New (7 days before)"], "1");
+    assert.equal(row["New still open"], "2");
+    assert.equal(row["Cleared (7 days)"], "2");
+    assert.equal(row["Of cleared: backlog"], "1");
+    assert.equal(row["Sampled median h to clear"], "1");
+    assert.equal(row["Sampled p90 h"], "10");
+    assert.equal(row["Owner/wait flag (yes / no / unknown)"], "0 / 3 / 0");
+    assert.equal(row.Data, "complete");
+
+    await runFile(input);
+    assert.equal(world.issues.length, 1);
+    const filed = Object.fromEntries(world.issues[0].description.split("\n")
+      .filter((line) => line.startsWith("|")).map((line) => {
+        const [label, ...values] = cells(line);
+        return [label, values];
+      }));
+    assert.deepEqual(filed["Newly observed problems"], ["3", "1"]);
+    assert.deepEqual(filed["Of new: still open at the end"], ["2", "1"]);
+    assert.deepEqual(filed["Cleared in the window"], ["2", "0"]);
+    assert.deepEqual(filed["Of cleared: older backlog"], ["1", "0"]);
+    assert.deepEqual(filed["Sampled median / p90 hours to clear"], ["1 / 10", "unknown / unknown"]);
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("collected headline preserves unknown denominators and incomplete clearance evidence", async () => {
+  const directory = await temporary();
+  try {
+    await new Log().runs(NOW - 3 * DAY, NOW)
+      .problem(WAITING, NOW - DAY, { owner: true, cleared: NOW - DAY + 2 * HOUR })
+      .problem(WAITING, NOW - DAY, { owner: false, cleared: NOW - DAY + 4 * HOUR })
+      .problem(WAITING, NOW - DAY, { owner: null, cleared: NOW - DAY + 6 * HOUR })
+      .write(directory);
+    const output = await runCollect(deps(directory, new World(), {
+      mergedPullRequests: async (_from, to) => to === NOW ? 4 : null,
+    }));
+    const lines = output.split("\n");
+    const perPr = lines.find((line) => line.startsWith("- New problems with owner/wait flag per merged PR:"))!;
+    assert.match(perPr, /0\.25 \(1 flagged problems \/ 4 merged PRs\).*not enough data/);
+    assert.match(perPr, /last week unknown \(0 flagged problems \/ unknown merged PRs\).*not enough data/);
+    const share = lines.find((line) => line.startsWith("- Share of cleared problems without recorded owner/wait flag:"))!;
+    assert.match(share, /50 % \(1 of 2 with known flag, 1 unknown\).*not enough data/);
+    const median = lines.find((line) => line.startsWith("- Sampled median time to clear (all cleared, including backlog):"))!;
+    assert.match(median, /: 4 h.*not enough data.*last week unknown.*not enough data/);
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
 test("the per-kind table counts problems that needed attention, with owner and automation evidence as known at each window's end", async () => {
   const lastWeek = NOW - 14 * DAY;
   const log = healthy()
