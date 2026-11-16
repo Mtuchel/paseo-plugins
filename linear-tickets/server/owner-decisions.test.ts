@@ -183,7 +183,7 @@ test("a comment record that cannot be read refuses the deputy's evidence instead
     const directory = join(home, "agent-comments", "plugin", "folder.json");
     await mkdir(directory, { recursive: true });
     await assert.rejects(() => strictRecordProvenance(home), (error: unknown) => (error as NodeJS.ErrnoException).code === "EISDIR");
-    assert.deepEqual([...(await recordedComments(home))].sort(), ["by-agent", "key-written"], "the display path must not start failing on a damaged record");
+    assert.deepEqual([...(await recordedComments(home, NOW))].sort(), ["by-agent", "key-written"], "the display path must not start failing on a damaged record");
     await rm(directory, { recursive: true, force: true });
     assert.deepEqual(await strictRecordProvenance(home), { recorded: ["by-agent", "key-written"], recordsFrom: ago(3) });
     // Invalid JSON, and a record without the timestamp the format always carries, refuse the same way.
