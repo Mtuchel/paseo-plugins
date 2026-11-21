@@ -1,8 +1,8 @@
-import type { PluginLifecycleEvents } from "@getpaseo/plugin/server";
+import type { PluginTurnOutcome } from "@getpaseo/plugin/server";
+import type { Timeline, TimelineItem } from "./timeline";
 
-export type Timeline = PluginLifecycleEvents["agent.turn_ended"]["timeline"];
-export type TimelineItem = Timeline[number];
-export type TurnOutcome = PluginLifecycleEvents["agent.turn_ended"]["outcome"];
+export type { Timeline, TimelineItem } from "./timeline";
+export type TurnOutcome = PluginTurnOutcome;
 
 /** Every follow-up this plugin sends starts with this marker, and turns started by one are ignored. */
 export const NUDGE_PREFIX = "[ui-verify]";
@@ -79,8 +79,9 @@ export function triggeringUserMessage(timeline: Timeline): string {
 }
 
 /**
- * The items belonging to this turn: everything after the user message that started it. Paseo
- * hands turn-end hooks the agent's whole timeline, not the turn's slice.
+ * The items belonging to this turn: everything after the user message that started it. The
+ * timeline `readTurnTimeline` returns can reach back over earlier continuation turns to find
+ * that message.
  */
 export function turnItems(timeline: Timeline): TimelineItem[] {
   let start = 0;

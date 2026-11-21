@@ -22,7 +22,9 @@
     "test": "node --import tsx --test test/*.test.ts"
   },
   "devDependencies": {
-    "@getpaseo/plugin": "0.10.3",
+    "@getpaseo/client": "0.17.0",
+    "@getpaseo/plugin": "0.17.0",
+    "@getpaseo/protocol": "0.17.0",
     "@types/node": "^22.0.0",
     "tsx": "^4.20.0",
     "typescript": "^5.9.3"

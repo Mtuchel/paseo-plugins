@@ -13,12 +13,13 @@ import {
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { test, type TestContext } from "node:test";
-import type { PluginLifecycleEvents } from "@getpaseo/plugin/server";
+import type { PluginHookEvents } from "@getpaseo/plugin/server";
 import type { TimelineItem } from "../server/decision";
-import { createTurnMonitor, type TurnMonitor } from "../server/turn";
+import { createTurnMonitor, type TurnIo, type TurnMonitor } from "../server/turn";
 
-type Started = PluginLifecycleEvents["agent.turn_started"];
-type Ended = PluginLifecycleEvents["agent.turn_ended"];
+type Started = PluginHookEvents["agent.turn.before"];
+/** A finished turn together with the timeline Paseo returns when the plugin reads it. */
+type Ended = PluginHookEvents["agent.turn.after"] & { timeline: TimelineItem[] | null };
 
 function git(cwd: string, ...args: string[]): void {
   execFileSync("git", args, { cwd, stdio: "ignore" });
@@ -49,6 +50,8 @@ function agent(root: string): Started["agent"] {
     provider: "codex",
     cwd: root,
     title: "UI work",
+    background: false,
+    metadata: {},
   };
 }
 
@@ -71,14 +74,21 @@ function completedTurn(root: string, timeline: TimelineItem[], turnId = "turn-1"
   return { agent: agent(root), turnId, outcome: { kind: "completed" }, timeline };
 }
 
+function io(event: Ended, send: TurnIo["send"]): TurnIo {
+  return { send, readTimeline: async () => event.timeline };
+}
+
 async function deliver(
   monitor: TurnMonitor,
   event: Ended,
   sent: Array<{ agentId: string; text: string }>,
 ): Promise<void> {
-  await monitor.turnEnded(event, async (agentId, text) => {
-    sent.push({ agentId, text });
-  });
+  await monitor.turnEnded(
+    event,
+    io(event, async (agentId, text) => {
+      sent.push({ agentId, text });
+    }),
+  );
 }
 
 /** A git shim that delegates everything except `add`, which hangs until the monitor aborts it. */
@@ -264,11 +274,10 @@ test("a newer turn drops the previous turn's follow-up", async (t) => {
   await monitor.turnStarted({ agent: agent(root), turnId: "turn-1" });
   writeFileSync(join(root, "apps", "core-web", "src", "Page.tsx"), "export const Page = () => 6;\n");
 
-  const ending = monitor.turnEnded(
+  const ending = deliver(
+    monitor,
     completedTurn(root, [user("Change the page"), assistant("Done")], "turn-1"),
-    async (agentId, text) => {
-      sent.push({ agentId, text });
-    },
+    sent,
   );
   await monitor.turnStarted({ agent: agent(root), turnId: "turn-2" });
   await ending;
@@ -335,12 +344,53 @@ test("a failed send is logged and never rejects", async (t) => {
 
   await monitor.turnStarted({ agent: agent(root), turnId: "turn-1" });
   writeFileSync(join(root, "apps", "core-web", "src", "Page.tsx"), "export const Page = () => 5;\n");
+  const event = completedTurn(root, [user("Change"), assistant("Done")]);
   await assert.doesNotReject(
-    monitor.turnEnded(completedTurn(root, [user("Change"), assistant("Done")]), async () => {
-      throw new Error("daemon gone");
-    }),
+    monitor.turnEnded(
+      event,
+      io(event, async () => {
+        throw new Error("daemon gone");
+      }),
+    ),
   );
   assert.ok(logs.some((message) => message.includes("could not send")));
+});
+
+test("a turn whose timeline is no longer readable sends nothing", async (t) => {
+  const root = repository(t);
+  const logs: string[] = [];
+  const monitor = createTurnMonitor({ log: (message) => logs.push(message) });
+  const sent: Array<{ agentId: string; text: string }> = [];
+
+  await monitor.turnStarted({ agent: agent(root), turnId: "turn-1" });
+  writeFileSync(join(root, "apps", "core-web", "src", "Page.tsx"), "export const Page = () => 11;\n");
+  await deliver(monitor, { ...completedTurn(root, []), timeline: null }, sent);
+
+  assert.deepEqual(sent, []);
+  assert.ok(logs.some((message) => message.includes("no longer readable")));
+});
+
+test("a failed timeline read is logged, sends nothing and never rejects", async (t) => {
+  const root = repository(t);
+  const logs: string[] = [];
+  const monitor = createTurnMonitor({ log: (message) => logs.push(message) });
+  const sent: Array<{ agentId: string; text: string }> = [];
+
+  await monitor.turnStarted({ agent: agent(root), turnId: "turn-1" });
+  writeFileSync(join(root, "apps", "core-web", "src", "Page.tsx"), "export const Page = () => 12;\n");
+  await assert.doesNotReject(
+    monitor.turnEnded(completedTurn(root, []), {
+      send: async (agentId, text) => {
+        sent.push({ agentId, text });
+      },
+      readTimeline: async () => {
+        throw new Error("daemon gone");
+      },
+    }),
+  );
+
+  assert.deepEqual(sent, []);
+  assert.ok(logs.some((message) => message.includes("could not read the timeline")));
 });
 
 test("a git failure at turn end is logged and never rejects", async (t) => {
