@@ -51,21 +51,32 @@ The plugin also remembers the identity of the human user message that triggered 
 before sending. Autonomous continuation turns that add no new user message therefore cannot send
 the same reminder again, and two concurrent turn ends for one request send at most one.
 
+## Reading the turn
+
+Since Paseo 0.16 the `agent.turn.after` hook no longer carries the agent's timeline. When the
+turn changed at least one UI file, the plugin reads it through
+`paseo.agents.ref(agentId).timeline.refetch({ direction: "tail", limit: 1, wholeTurns: true })` and
+keeps the entries up to the end of this turn. An autonomous continuation turn starts without a user
+message, so the plugin pages back one whole turn at a time, at most 16 turns and never across a
+timeline epoch change, until it finds the user message that started the request. Turns that change
+no UI file skip the read.
+
 ## A newer turn
 
 Paseo's send API has no queue or skip-when-busy mode: a prompt sent while a turn is active
 interrupts that turn by default. The only other mode, `steer`, can fall back to replacing the turn
 on providers that do not support steering. The plugin therefore increments a per-agent turn
-generation on every `agent.turn_started` and drops the follow-up if a newer turn has started by the
-time the end-of-turn snapshot and decision finish. The check is best effort for the small window
-between that check and the daemon accepting the send; the plugin never deliberately interrupts a
-newer turn.
+generation on every `agent.turn.before` and drops the follow-up if a newer turn has started by the
+time the end-of-turn snapshot and decision finish. A turn that is no longer the latest one in the
+timeline when the plugin reads it is dropped the same way. The check is best effort for the small
+window between that check and the daemon accepting the send; the plugin never deliberately
+interrupts a newer turn.
 
 ## Failures
 
-Not being in a git repository, a git error, or a failed send is logged with a `[ui-verify]` prefix
-in the plugin logs and skipped. The plugin never throws into the agent lifecycle. If the turn-start
-snapshot fails, that turn gets no follow-up.
+Not being in a git repository, a git error, a failed timeline read, or a failed send is logged with
+a `[ui-verify]` prefix in the plugin logs and skipped. The plugin never throws into the agent
+lifecycle. If the turn-start snapshot fails, that turn gets no follow-up.
 
 On plugin shutdown the monitor aborts any in-flight git command and waits for its temporary index
 directory to be removed before the cleanup resolves. Paseo gives cleanup 2 seconds before it sends
@@ -73,7 +84,7 @@ directory to be removed before the cleanup resolves. Paseo gives cleanup 2 secon
 
 ## Install
 
-Requires Paseo 0.10.3 or newer and Node.js 22 or newer on the daemon host. The target repository
+Requires Paseo 0.16.0 or newer and Node.js 22 or newer on the daemon host. The target repository
 must document its browser check in `apps/core-web/docs/ui-check.md` and expose its web app through
 a `core-web` service in the worktree's Paseo setup.
 

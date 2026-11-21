@@ -1,5 +1,5 @@
-import type { PluginLifecycleEvents } from "@getpaseo/plugin/server";
-import { decide, triggeringUserMessageInfo } from "./decision";
+import type { PluginHookEvents } from "@getpaseo/plugin/server";
+import { changedUiFiles, decide, triggeringUserMessageInfo } from "./decision";
 import {
   changedFiles,
   coreWebRoot,
@@ -7,9 +7,10 @@ import {
   snapshotTree,
   type GitOptions,
 } from "./git-snapshot";
+import type { Timeline } from "./timeline";
 
-type TurnStarted = PluginLifecycleEvents["agent.turn_started"];
-type TurnEnded = PluginLifecycleEvents["agent.turn_ended"];
+type TurnStarted = PluginHookEvents["agent.turn.before"];
+type TurnEnded = PluginHookEvents["agent.turn.after"];
 
 interface Baseline {
   root: string;
@@ -35,12 +36,17 @@ export interface TurnMonitorOptions {
   gitBinary?: string;
 }
 
-/** Delivers a prompt to an agent, normally `paseo.agents.ref(agentId).send(text)`. */
-export type AgentSend = (agentId: string, text: string) => Promise<void>;
+/** What a finished turn needs from Paseo, normally backed by `paseo.agents.ref(agentId)`. */
+export interface TurnIo {
+  /** Delivers a prompt to the agent. */
+  send(agentId: string, text: string): Promise<void>;
+  /** The agent's timeline through turn `turnId` (see `readTurnTimeline`); null once it is unreadable. */
+  readTimeline(agentId: string, turnId: string | null): Promise<Timeline | null>;
+}
 
 export interface TurnMonitor {
   turnStarted(event: TurnStarted): Promise<void>;
-  turnEnded(event: TurnEnded, send: AgentSend): Promise<void>;
+  turnEnded(event: TurnEnded, io: TurnIo): Promise<void>;
   /** Aborts in-flight git commands and waits for their temporary directories to be removed. */
   close(): Promise<void>;
 }
@@ -129,7 +135,7 @@ export function createTurnMonitor(options: TurnMonitorOptions = {}): TurnMonitor
       await baseline;
     },
 
-    async turnEnded(event, send) {
+    async turnEnded(event, io) {
       if (closed) return;
       const state = states.get(event.agent.id);
       const turn = state?.turns.shift();
@@ -158,12 +164,27 @@ export function createTurnMonitor(options: TurnMonitorOptions = {}): TurnMonitor
         return;
       }
 
-      const trigger = triggeringUserMessageInfo(event.timeline);
+      // Most turns change no UI file; only those pay for the timeline read.
+      if (changedUiFiles(files).length === 0) return;
+
+      let timeline: Timeline | null;
+      try {
+        timeline = await io.readTimeline(event.agent.id, event.turnId);
+      } catch (error) {
+        log(`could not read the timeline of agent ${event.agent.id}`, error);
+        return;
+      }
+      if (!timeline) {
+        log(`dropped the follow-up for agent ${event.agent.id}: turn ${event.turnId} is no longer readable`);
+        return;
+      }
+
+      const trigger = triggeringUserMessageInfo(timeline);
       const decision = decide({
         coreWeb: true,
         outcome: event.outcome,
         trigger: trigger.text,
-        timeline: event.timeline,
+        timeline,
         changedFiles: files,
       });
       if (decision.kind === "skip") return;
@@ -181,7 +202,7 @@ export function createTurnMonitor(options: TurnMonitorOptions = {}): TurnMonitor
       }
 
       try {
-        await send(event.agent.id, decision.text);
+        await io.send(event.agent.id, decision.text);
       } catch (error) {
         log(`could not send the follow-up to agent ${event.agent.id}`, error);
       }

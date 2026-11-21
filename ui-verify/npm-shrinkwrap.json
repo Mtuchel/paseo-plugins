@@ -9,7 +9,9 @@
       "version": "0.1.0",
       "license": "MIT",
       "devDependencies": {
-        "@getpaseo/plugin": "0.10.3",
+        "@getpaseo/client": "0.17.0",
+        "@getpaseo/plugin": "0.17.0",
+        "@getpaseo/protocol": "0.17.0",
         "@types/node": "^22.0.0",
         "tsx": "^4.20.0",
         "typescript": "^5.9.3"
@@ -468,30 +470,33 @@
       }
     },
     "node_modules/@getpaseo/client": {
-      "version": "0.10.3",
-      "resolved": "https://registry.npmjs.org/@getpaseo/client/-/client-0.10.3.tgz",
-      "integrity": "sha512-As65uU9zPFueDwrWo+gR8mEomY2rRh/I+ggPSi3rQAcDJONReXvQiZaovl+jUpY01VJvLmwo5vuE4r6YBu94YA==",
+      "version": "0.17.0",
+      "resolved": "https://registry.npmjs.org/@getpaseo/client/-/client-0.17.0.tgz",
+      "integrity": "sha512-PY1AJKUy4Drg2B4m1BsWixYRdwmyJ7asqrPYL4PGc5ZHH3qcl+qGJzkyYt/gJfnMgtC5LTZWzfEUmO9zzPK3sw==",
       "dev": true,
-      "peer": true,
+      "license": "Apache-2.0",
       "dependencies": {
-        "@getpaseo/protocol": "0.10.3",
-        "@getpaseo/relay": "0.10.3",
+        "@getpaseo/protocol": "0.17.0",
+        "@getpaseo/relay": "0.17.0",
+        "ws": "^8.20.0",
         "zod": "^4.4.3"
       }
     },
     "node_modules/@getpaseo/plugin": {
-      "version": "0.10.3",
-      "resolved": "https://registry.npmjs.org/@getpaseo/plugin/-/plugin-0.10.3.tgz",
-      "integrity": "sha512-OUlrUlKwyzK4qvgt15mKjou1pY9ZYnBPjvuafLCY1KIGUK6efJ55cH8gpNUuvAmYlyFWzi9XliYLWqQNc+4akw==",
+      "version": "0.17.0",
+      "resolved": "https://registry.npmjs.org/@getpaseo/plugin/-/plugin-0.17.0.tgz",
+      "integrity": "sha512-hD3iDM8VSn9Waj5HFZEL6YDOtHtq3vW5bqjiU3vHfzrtrXbjkowc9bApa0SyoEN/ba01SzXXXu7Qrj5P+hHO5Q==",
       "dev": true,
+      "license": "Apache-2.0",
       "dependencies": {
         "@agentclientprotocol/sdk": "^1.4.0",
+        "i18next": "^26.3.0",
         "use-sync-external-store": "^1.6.0"
       },
       "peerDependencies": {
-        "@getpaseo/client": "0.10.3",
-        "@getpaseo/protocol": "0.10.3",
-        "react": "~19.1.0",
+        "@getpaseo/client": "0.17.0",
+        "@getpaseo/protocol": "0.17.0",
+        "react": ">=19.1.0 <20",
         "react-native": ">=0.81.5",
         "zod": "^4.4.3"
       },
@@ -502,26 +507,71 @@
       }
     },
     "node_modules/@getpaseo/protocol": {
-      "version": "0.10.3",
-      "resolved": "https://registry.npmjs.org/@getpaseo/protocol/-/protocol-0.10.3.tgz",
-      "integrity": "sha512-t9Ca9EbYgQMdKGNIFtHrYSJFQZdM/1YbSdCoevaklVGEhijN87PEgiQh+Po0rw6zEQ6uXs5l4GGLsnYEG7ecJQ==",
+      "version": "0.17.0",
+      "resolved": "https://registry.npmjs.org/@getpaseo/protocol/-/protocol-0.17.0.tgz",
+      "integrity": "sha512-CR60odgpSCZpYTz6Oglfj4nsz1eVEwcIORa49F+8buKnREJFVuuaLpWe7UjeRKcv9fJzssSLEA7TXMGOIGqpVA==",
       "dev": true,
-      "peer": true,
+      "license": "Apache-2.0",
       "dependencies": {
         "semver": "^7.8.5",
         "zod": "^4.4.3"
       }
     },
     "node_modules/@getpaseo/relay": {
-      "version": "0.10.3",
-      "resolved": "https://registry.npmjs.org/@getpaseo/relay/-/relay-0.10.3.tgz",
-      "integrity": "sha512-ACAcS6s4dDv26pfz+3V2dk7v6q7UAU2uapZMRn9smSem/tpcfQqvNWqEwn5b3Bz78zDvHnLvjcZxKbAtX8XrTg==",
+      "version": "0.17.0",
+      "resolved": "https://registry.npmjs.org/@getpaseo/relay/-/relay-0.17.0.tgz",
+      "integrity": "sha512-+lAmis8990FfN37i58/sIRCSto+stkGhtNE+2GnZKYm4O6bbaqNfzP9whwYZwBiYHgOLlB2woFugmWnMQw/YRQ==",
       "dev": true,
-      "peer": true,
+      "license": "Apache-2.0",
       "dependencies": {
+        "@noble/ciphers": "^2.4.0",
+        "@noble/curves": "^2.4.0",
+        "@noble/hashes": "^2.4.0",
         "base64-js": "^1.5.1",
         "tweetnacl": "^1.0.3",
         "ws": "^8.14.2"
+      }
+    },
+    "node_modules/@noble/ciphers": {
+      "version": "2.4.0",
+      "resolved": "https://registry.npmjs.org/@noble/ciphers/-/ciphers-2.4.0.tgz",
+      "integrity": "sha512-AnjFn0Jv92laAkvMrghlFZq4qQCIN/4DxFV/eooqtC2YTjB7kBeLMS2T9KJX4Dn+ZVXLOwK0lSgqDtx9gvxtiw==",
+      "dev": true,
+      "license": "MIT",
+      "engines": {
+        "node": ">= 20.19.0"
+      },
+      "funding": {
+        "url": "https://paulmillr.com/funding/"
+      }
+    },
+    "node_modules/@noble/curves": {
+      "version": "2.4.0",
+      "resolved": "https://registry.npmjs.org/@noble/curves/-/curves-2.4.0.tgz",
+      "integrity": "sha512-P4/62zrgfH33CneE3Dn4WhJVA22YUU0eR51wKIan4NVRvwsA0YnPTwWGpNbpuacSujmSFLvyzpyuR30+fbq2Ew==",
+      "dev": true,
+      "license": "MIT",
+      "dependencies": {
+        "@noble/hashes": "2.4.0"
+      },
+      "engines": {
+        "node": ">= 20.19.0"
+      },
+      "funding": {
+        "url": "https://paulmillr.com/funding/"
+      }
+    },
+    "node_modules/@noble/hashes": {
+      "version": "2.4.0",
+      "resolved": "https://registry.npmjs.org/@noble/hashes/-/hashes-2.4.0.tgz",
+      "integrity": "sha512-X5XaVWZIBCT7HHZGm5I7ZQXDwLG+bGXuSrMQAW+7Zvl87h1kmc1ZB1VSRJcpUfoUrGQp4Fkoxm5kZ+Ms+aW+eA==",
+      "dev": true,
+      "license": "MIT",
+      "engines": {
+        "node": ">= 20.19.0"
+      },
+      "funding": {
+        "url": "https://paulmillr.com/funding/"
       }
     },
     "node_modules/@types/node": {
@@ -553,8 +603,7 @@
           "url": "https://feross.org/support"
         }
       ],
-      "license": "MIT",
-      "peer": true
+      "license": "MIT"
     },
     "node_modules/esbuild": {
       "version": "0.28.2",
@@ -613,6 +662,35 @@
         "node": "^8.16.0 || ^10.6.0 || >=11.0.0"
       }
     },
+    "node_modules/i18next": {
+      "version": "26.7.2",
+      "resolved": "https://registry.npmjs.org/i18next/-/i18next-26.7.2.tgz",
+      "integrity": "sha512-RsOY3BeaCDdkk52NeJSFAXELQ2rQXBO/tOub6L8ue2ICPfR/FRDWDOfEDg4xMPd1SqO5goVYQ6i72qWEUB/PPw==",
+      "dev": true,
+      "funding": [
+        {
+          "type": "individual",
+          "url": "https://www.locize.com/i18next"
+        },
+        {
+          "type": "individual",
+          "url": "https://www.i18next.com/how-to/faq#i18next-is-awesome.-how-can-i-support-the-project"
+        },
+        {
+          "type": "individual",
+          "url": "https://www.locize.com"
+        }
+      ],
+      "license": "MIT",
+      "peerDependencies": {
+        "typescript": "^5 || ^6 || ^7"
+      },
+      "peerDependenciesMeta": {
+        "typescript": {
+          "optional": true
+        }
+      }
+    },
     "node_modules/react": {
       "version": "19.1.10",
       "resolved": "https://registry.npmjs.org/react/-/react-19.1.10.tgz",
@@ -625,12 +703,11 @@
       }
     },
     "node_modules/semver": {
-      "version": "7.8.5",
-      "resolved": "https://registry.npmjs.org/semver/-/semver-7.8.5.tgz",
-      "integrity": "sha512-Y7/KDsb8LjooZpwaqGyulO6DQlksgCncchHGk+sZIY4SBvUocMBEFH5Ur1fI4dV+Jvl0w6cjvucaIi40puRioA==",
+      "version": "7.8.6",
+      "resolved": "https://registry.npmjs.org/semver/-/semver-7.8.6.tgz",
+      "integrity": "sha512-9lpSSU4Mly3mrtruwLs1eLK6+gzbzqeBFwRNjIjE+9LuDpWdYctrQlQ3ej1Ilgi7gknpsTRnPoLP8DpCHqHIJw==",
       "dev": true,
       "license": "ISC",
-      "peer": true,
       "bin": {
         "semver": "bin/semver.js"
       },
@@ -662,8 +739,7 @@
       "resolved": "https://registry.npmjs.org/tweetnacl/-/tweetnacl-1.0.3.tgz",
       "integrity": "sha512-6rt+RN7aOi1nGMyC4Xa5DdYiukl2UWCbcJft7YhxReBGQD7OAM8Pbxw6YMo4r2diNEA8FEmu32YOn9rhaiE5yw==",
       "dev": true,
-      "license": "Unlicense",
-      "peer": true
+      "license": "Unlicense"
     },
     "node_modules/typescript": {
       "version": "5.9.3",
@@ -697,12 +773,11 @@
       }
     },
     "node_modules/ws": {
-      "version": "8.22.0",
-      "resolved": "https://registry.npmjs.org/ws/-/ws-8.22.0.tgz",
-      "integrity": "sha512-Ydggc987+RO0AnWtZ/7Wq9FtNvcrL1b/RO0ud9mWjUPgDrsAAwQSF51sm2hm1XofbU/4jkpGEsLFsZZxU+1DOg==",
+      "version": "8.23.0",
+      "resolved": "https://registry.npmjs.org/ws/-/ws-8.23.0.tgz",
+      "integrity": "sha512-wCkmX8QMOrKjgO8HW2WyDbTSGeqkocxgDzS9iR79rEAexty6/2qzilx3Ag8Tqf9ykop3irLKle0MtVn5qjVnoQ==",
       "dev": true,
       "license": "MIT",
-      "peer": true,
       "engines": {
         "node": ">=10.0.0"
       },
@@ -725,7 +800,6 @@
       "integrity": "sha512-g8W2D2kU6a8untc053fX1uVBKzM7yqAxW/3zwk83+6RyF2+SKOuV+c0wBDhUwzV1PaGapmZH+rmcUzPf+3CGwg==",
       "dev": true,
       "license": "MIT",
-      "peer": true,
       "funding": {
         "url": "https://github.com/sponsors/colinhacks"
       }
